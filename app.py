@@ -1959,6 +1959,41 @@ div[data-testid="stTabs"] > div:first-child > button {
     padding-top: 0.4rem !important;
     padding-bottom: 0.4rem !important;
 }
+
+/* ── Sidebar scroll fix ─────────────────────────────────────────────────
+   Force the sidebar to be fully scrollable with the mouse wheel no matter
+   how tall the content is. Without this, Streamlit sometimes traps scroll
+   events on buttons/dividers and only arrow keys can move the view. */
+section[data-testid="stSidebar"] {
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
+}
+section[data-testid="stSidebar"] > div:first-child {
+    height: 100vh !important;
+    max-height: 100vh !important;
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
+    padding-bottom: 3rem !important;   /* breathing room at the bottom */
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
+    scrollbar-color: #888 transparent;
+}
+section[data-testid="stSidebar"] > div:first-child::-webkit-scrollbar {
+    width: 8px;
+}
+section[data-testid="stSidebar"] > div:first-child::-webkit-scrollbar-thumb {
+    background: #888;
+    border-radius: 4px;
+}
+/* Make sidebar buttons slightly tighter so more fit on short screens */
+section[data-testid="stSidebar"] .stButton > button {
+    padding: 0.35rem 0.6rem !important;
+    min-height: 2rem !important;
+    font-size: 0.86rem !important;
+}
+section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
+    margin-bottom: 0.25rem !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
