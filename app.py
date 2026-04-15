@@ -5164,6 +5164,32 @@ if "calc_data" in st.session_state:
                 # (AI results kept in _ai for other uses, but not shown in the waterfall rows)
                 _ai_base_wdays = st.session_state.get('calc_data', {}).get('dict_workable_days', {}).get(0, 21)
 
+                # ── Scope HC report to cascade-selected PODs (multi_pod case) ──────
+                # When the cascade ran for a subset of PODs, the Overall waterfall must
+                # use only those PODs' employees from the HC report — not the full roster.
+                # When no POD filter is active (_dash_sel_pods empty) OR the Overall
+                # cascade was run, _hc['total'] / _hc['by_role'] are used as-is.
+                _hc_wf = _hc  # default: use full HC data
+                if _hc and _dash_sel_pods:
+                    _hbpr = _hc.get('by_pod_role', pd.DataFrame())
+                    if not _hbpr.empty:
+                        def _nhp_ov(s): return str(s).lower().replace(' ', '').strip()
+                        _sel_pods_norm = {_nhp_ov(p) for p in _dash_sel_pods}
+                        _hbpr_mask = _hbpr['POD'].apply(_nhp_ov).isin(_sel_pods_norm)
+                        _hbpr_filt = _hbpr[_hbpr_mask]
+                        _sc_by_role = _hbpr_filt.groupby('Capacity Role')['HC'].sum().to_dict()
+                        _sc_total   = sum(v for k, v in _sc_by_role.items() if k != 'Other')
+                        _sc_mgr_pd  = {
+                            k: v for k, v in _hc.get('mgr_by_pod', {}).items()
+                            if _nhp_ov(str(k)) in _sel_pods_norm
+                        }
+                        _sc_mgr_tot = sum(_sc_mgr_pd.values())
+                        # Build a lightweight "scoped HC" dict with the same keys
+                        _hc_wf = dict(_hc)   # shallow copy
+                        _hc_wf['by_role']   = _sc_by_role
+                        _hc_wf['total']     = _sc_total
+                        _hc_wf['mgr_total'] = _sc_mgr_tot
+
                 # ── Helper to format by metric type ─────────────────────────────────
                 def _fmt(val, kind):
                     if val is None: return "—"
@@ -5210,13 +5236,13 @@ if "calc_data" in st.session_state:
 
                         cap_prod = (prod_hrs_b / current_hrs * 100) if current_hrs > 0 else 0
 
-                        hc_total = _hc['total']           if _hc else None
-                        hc_acc1  = _hc['by_role'].get('Accountant I', 0)      if _hc else None
-                        hc_acc2  = _hc['by_role'].get('Accountant II', 0)     if _hc else None
-                        hc_gen   = _hc['by_role'].get('General Accountant', 0) if _hc else None
-                        hc_sr    = _hc['by_role'].get('Sr. Accountant', 0)    if _hc else None
-                        hc_other = _hc['by_role'].get('Other', 0)             if _hc else None
-                        hc_mgr   = _hc.get('mgr_total', 0)                    if _hc else None
+                        hc_total = _hc_wf['total']              if _hc_wf else None
+                        hc_acc1  = _hc_wf['by_role'].get('Accountant I', 0)      if _hc_wf else None
+                        hc_acc2  = _hc_wf['by_role'].get('Accountant II', 0)     if _hc_wf else None
+                        hc_gen   = _hc_wf['by_role'].get('General Accountant', 0) if _hc_wf else None
+                        hc_sr    = _hc_wf['by_role'].get('Sr. Accountant', 0)    if _hc_wf else None
+                        hc_other = _hc_wf['by_role'].get('Other', 0)             if _hc_wf else None
+                        hc_mgr   = _hc_wf.get('mgr_total', 0)                    if _hc_wf else None
 
                         act_hc_prod = (
                             (float(hc_acc1 or 0) * util_acc1 +
@@ -5365,6 +5391,7 @@ if "calc_data" in st.session_state:
                 _wf_cache_key = (
                     st.session_state.get('_fd_version', 0),
                     st.session_state.get('_hc_version', 0),
+                    tuple(sorted(_dash_sel_pods)),   # scoped HC depends on selected pods
                 )
                 if st.session_state.get('_wf_cache_key') != _wf_cache_key:
                     _df_wf_overall_full = _build_overall_wf()
@@ -6615,9 +6642,16 @@ if "calc_data" in st.session_state:
                 for _asns in _el_assign.values():
                     for _a in _asns:
                         if _a[4]: _el_pods_set.add(_a[4])
+                _el_pods_sorted = ["Overall"] + sorted(_el_pods_set)
+                # Auto-select the cascade POD when exactly one POD was filtered —
+                # initialises the key only once so the user can still change it later.
+                _el_cascade_pods = st.session_state.get('_dash_sel_pods', [])
+                if len(_el_cascade_pods) == 1 and _el_cascade_pods[0] in _el_pods_set:
+                    if 'el_pod_sel' not in st.session_state:
+                        st.session_state['el_pod_sel'] = _el_cascade_pods[0]
                 _el_pod = st.selectbox(
                     "Filter by POD (or Overall)",
-                    ["Overall"] + sorted(_el_pods_set),
+                    _el_pods_sorted,
                     key="el_pod_sel"
                 )
 
@@ -7129,14 +7163,19 @@ if (
                 .replace('', pd.NA).dropna().unique().tolist()
             )
         with st.expander("📍 Scope & Parameters", expanded=True):
-            # lista_pods is only populated inside `if uploaded_file:` — fall back to
-            # the version persisted in session state (populated the same render as Step 0).
-            _s4_lista_pods = lista_pods or st.session_state.get('_lista_pods', [])
-            # Also derive PODs from the dashboard data itself as a last resort
-            if not _s4_lista_pods:
-                _fd_pod_tmp = st.session_state.get('final_dashboards', {}).get('pod', pd.DataFrame())
-                if not _fd_pod_tmp.empty and 'POD' in _fd_pod_tmp.columns:
-                    _s4_lista_pods = sorted(_fd_pod_tmp['POD'].dropna().astype(str).unique().tolist())
+            # Always derive available PODs from the cascade result so the selector
+            # only shows PODs that were actually computed — respects the POD filter
+            # selected at Step 0.  Fall back to the full list only if no cascade data.
+            _fd_pod_tmp = st.session_state.get('final_dashboards', {}).get('pod', pd.DataFrame())
+            if not _fd_pod_tmp.empty and 'POD' in _fd_pod_tmp.columns:
+                _s4_lista_pods = sorted(
+                    _fd_pod_tmp['POD'].fillna('').astype(str).str.strip()
+                    .where(lambda s: ~s.str.lower().isin({'nan', 'none', ''}))
+                    .dropna().unique().tolist()
+                )
+            else:
+                # Fallback: full pod list (no cascade data yet)
+                _s4_lista_pods = lista_pods or st.session_state.get('_lista_pods', [])
 
             _scope = st.selectbox(
                 "📊 Scope",
