@@ -7763,22 +7763,27 @@ if (
             _scen_nums.setdefault("Capacity Cost ($)",           {})[_col] = _s4_cap_cost
             _scen_nums.setdefault("Capacity Margin (%)",         {})[_col] = _s4_cap_margin_pct if _s4_cap_margin_pct is not None else float('nan')
             # Step-3 baseline values for same month (from _exec / _rb_scope)
+            # NOTE: FTEs are recomputed from _s4_base_hrs_role / _d_fte_m — the SAME
+            # formula the scenario uses (minus Step-4 adjustments). This guarantees
+            # baseline ≡ scenario when no Step-4 changes are applied, eliminating
+            # rounding-boundary phantom Δs (e.g. 383.91 vs 383.90).
             if _scope == "Overall":
-                _b3_fte_a1  = float(_r.get("FTEs Accountant I", 0) or 0)
-                _b3_fte_a2  = float(_r.get("FTEs Accountant II", 0) or 0)
-                _b3_fte_gn  = float(_r.get("FTEs General Acc.", 0) or 0)
-                _b3_fte_sr  = float(_r.get("FTEs Sr. Accountant", 0) or 0)
+                _b3_fte_a1  = max(0.0, float(_s4_base_hrs_role.get('Accountant I',       [0.0]*6)[_i]) / _d_fte_m)
+                _b3_fte_a2  = max(0.0, float(_s4_base_hrs_role.get('Accountant II',      [0.0]*6)[_i]) / _d_fte_m)
+                _b3_fte_gn  = max(0.0, float(_s4_base_hrs_role.get('General Accountant', [0.0]*6)[_i]) / _d_fte_m)
+                _b3_fte_sr  = max(0.0, float(_s4_base_hrs_role.get('Sr. Accountant',     [0.0]*6)[_i]) / _d_fte_m)
+                _b3_fte_tot = _b3_fte_a1 + _b3_fte_a2 + _b3_fte_gn + _b3_fte_sr
                 _b3_mrr     = float(_r.get("Total MRR ($)", 0) or 0)
                 _base_nums.setdefault("Required Hours (Hrs)",    {})[_col] = float(_r.get("7. Total Required Hours (Final)", 0) or 0)
-                _base_nums.setdefault("Required HC (FTEs)",      {})[_col] = float(_r.get("Total FTEs", 0) or 0)
+                _base_nums.setdefault("Required HC (FTEs)",      {})[_col] = _b3_fte_tot
                 _base_nums.setdefault("  · Accountant I",        {})[_col] = _b3_fte_a1
                 _base_nums.setdefault("  · Accountant II",       {})[_col] = _b3_fte_a2
                 _base_nums.setdefault("  · General Accountant",  {})[_col] = _b3_fte_gn
                 _base_nums.setdefault("  · Sr. Accountant",      {})[_col] = _b3_fte_sr
                 _base_nums.setdefault("MRR ($)",                 {})[_col] = _b3_mrr
-                # HC Δ not directly in _exec; derive from Actual HC minus Required FTEs
+                # HC Δ derived from Actual HC minus baseline FTE total (matches scenario's formula)
                 _base_hc_tot_b3 = float(_base_hc_tot) if _base_hc_tot is not None else 0.0
-                _base_nums.setdefault("HC Δ (Actual − Required)", {})[_col] = round(_base_hc_tot_b3 - float(_r.get("Total FTEs", 0) or 0), 2)
+                _base_nums.setdefault("HC Δ (Actual − Required)", {})[_col] = round(_base_hc_tot_b3 - _b3_fte_tot, 2)
                 # Capacity Cost / Margin using Step-3 Required FTEs × role cost (PERF: cached)
                 _b3_cap_cost = (
                     _b3_fte_a1 * _c_a1 +
@@ -7801,16 +7806,23 @@ if (
                 _base_nums.setdefault("Capacity Margin (%)",     {})[_col] = _b3_cap_margin_pct
             else:
                 _cfin_b3   = f"M{_i+1} ({_ms}) - Final Hours"
-                _cfte_b3   = f"M{_i+1} ({_ms}) - Final FTEs"
-                # PERF: use pre-aggregated _rb_scope sums
-                _base_nums.setdefault("Required Hours (Hrs)",    {})[_col] = _rb_sum_cache.get(_cfin_b3, 0.0)
-                _base_nums.setdefault("Required HC (FTEs)",      {})[_col] = _rb_sum_cache.get(_cfte_b3, 0.0)
-                _b3_fte_by_role = {}
+                # Baseline FTEs recomputed from _s4_base_hrs_role / _d_fte_m
+                # (same formula as scenario → zero phantom Δ when no changes).
+                _b3_fte_by_role = {
+                    _brl: max(0.0, float(_s4_base_hrs_role.get(_brl, [0.0]*6)[_i]) / _d_fte_m)
+                    for _brl in roles_permitidos
+                }
+                _b3_fte_tot = sum(_b3_fte_by_role.values())
+                # Required Hours: mirror scenario's _b_curr exactly.
+                # Sr scope → sum of per-role base hours; POD scope → _rb_scope Final Hours sum.
+                if _scope_is_sr:
+                    _b3_req_hrs = sum(float(_s4_base_hrs_role.get(_rl, [0.0]*6)[_i]) for _rl in roles_permitidos)
+                else:
+                    _b3_req_hrs = _rb_sum_cache.get(_cfin_b3, 0.0)
+                _base_nums.setdefault("Required Hours (Hrs)",    {})[_col] = _b3_req_hrs
+                _base_nums.setdefault("Required HC (FTEs)",      {})[_col] = _b3_fte_tot
                 for _brl in roles_permitidos:
-                    _bkey = f"  · {_brl}"
-                    # PERF: use pre-grouped per-role FTE cache
-                    _b3_fte_by_role[_brl] = _rb_rolefte_cache.get((_i, _brl), 0.0)
-                    _base_nums.setdefault(_bkey, {})[_col] = _b3_fte_by_role[_brl]
+                    _base_nums.setdefault(f"  · {_brl}", {})[_col] = _b3_fte_by_role[_brl]
                 _base_nums.setdefault("HC Δ (Actual − Required)", {})[_col] = float('nan')
                 _base_nums.setdefault("MRR ($)",                 {})[_col] = _b_mrr
                 # Capacity Cost / Margin using scoped Step-3 Required FTEs × role cost (PERF: cached)
