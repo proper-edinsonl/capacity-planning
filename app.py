@@ -7455,6 +7455,74 @@ if (
         _base_nums = {}   # Step-3 baseline numeric values (same keys)
         _months    = []
 
+        # ── PERF: Pre-cache role costs/util and shrinkage once (was looked up
+        # dozens of times per month via _s4p.loc[role, ...] = slow DataFrame ops).
+        _cost_cache = {_rl: _s4_cost_val(_rl) for _rl in roles_permitidos}
+        _util_cache = {_rl: _s4_util(_rl)     for _rl in roles_permitidos}
+        _shrink_cache = {_rl: 2.0 - _util_cache[_rl] + absenteeism + attrition
+                         for _rl in roles_permitidos}
+        _c_a1 = _cost_cache['Accountant I']
+        _c_a2 = _cost_cache['Accountant II']
+        _c_gn = _cost_cache['General Accountant']
+        _c_sr = _cost_cache['Sr. Accountant']
+
+        # ── PERF: Pre-aggregate _rb_scope column sums per month (was summed
+        # 3-4 times per month inside the loop on the same column).
+        _rb_empty = _rb_scope.empty if hasattr(_rb_scope, 'empty') else True
+        _rb_cols  = set(_rb_scope.columns) if not _rb_empty else set()
+        _rb_sum_cache = {}
+        _rb_rolefte_cache = {}  # (month_idx, role) -> float
+        for _i_pc in range(len(meses_proyeccion)):
+            _ms_pc = meses_proyeccion[_i_pc]
+            for _suffix in ("Final Hours", "Base Hours", "Adjustments (+) Hrs",
+                             "Adjustments (-) Hrs", "Productive Hours", "Final FTEs"):
+                _c = f"M{_i_pc+1} ({_ms_pc}) - {_suffix}"
+                if (not _rb_empty) and _c in _rb_cols:
+                    _rb_sum_cache[_c] = float(_rb_scope[_c].sum())
+            # Per-role FTE sums (avoids repeated .loc + .sum inside the baseline block)
+            _cfte_pc = f"M{_i_pc+1} ({_ms_pc}) - Final FTEs"
+            if (not _rb_empty) and _cfte_pc in _rb_cols:
+                _gb_fte = _rb_scope.groupby('Required Role')[_cfte_pc].sum()
+                for _brl in roles_permitidos:
+                    _rb_rolefte_cache[(_i_pc, _brl)] = float(_gb_fte.get(_brl, 0.0))
+
+        # ── PERF: Pre-parse _duc date columns + pre-compute per-month MRR masks
+        # (was done every iteration via pd.to_datetime / date comparisons).
+        _duc_mrr_by_month = {}
+        if (not _duc.empty) and 'MRR' in _duc.columns:
+            _duc_gl  = pd.to_datetime(_duc.get('Go Live',            pd.Series(dtype='datetime64[ns]')), errors='coerce')
+            _duc_fsd = pd.to_datetime(_duc.get('Final Service Date', pd.Series(dtype='datetime64[ns]')), errors='coerce')
+            _duc_name_lower = _duc['client_name'].astype(str).str.strip().str.lower() if 'client_name' in _duc.columns else pd.Series([''] * len(_duc))
+            _duc_mrr_vals = pd.to_numeric(_duc['MRR'], errors='coerce').fillna(0.0)
+            _pod_clients_lower_set = set(_pod_clients_lower) if _pod_clients_lower else set()
+            for _i_pc in range(len(meses_proyeccion)):
+                _mdt_pc = today + relativedelta(months=_month_offsets[_i_pc])
+                _sm_pc  = pd.Timestamp(_mdt_pc.replace(day=1).date())
+                _em_pc  = pd.Timestamp((_sm_pc + relativedelta(months=1) - relativedelta(days=1)).date())
+                _active_pc = (_duc_gl.isna() | (_duc_gl <= _em_pc)) & (_duc_fsd.isna() | (_duc_fsd >= _sm_pc))
+                _duc_mrr_by_month[_i_pc] = (_sm_pc, _em_pc, _active_pc)
+
+        # ── PERF: Pre-parse _src_raw date columns + precompute active masks
+        # per month (for the AHT block — avoids pd.to_datetime on every iter).
+        _src_empty = _src_raw.empty if hasattr(_src_raw, 'empty') else True
+        if not _src_empty:
+            _src_gl_all  = pd.to_datetime(_src_raw.get('Go Live',            pd.Series(dtype='datetime64[ns]')), errors='coerce')
+            _src_fsd_all = pd.to_datetime(_src_raw.get('Final Service Date', pd.Series(dtype='datetime64[ns]')), errors='coerce')
+        else:
+            _src_gl_all  = pd.Series(dtype='datetime64[ns]')
+            _src_fsd_all = pd.Series(dtype='datetime64[ns]')
+        _src_active_by_month = {}
+        _src_sm_em_by_month  = {}
+        for _i_pc in range(len(meses_proyeccion)):
+            _sm_s4 = pd.Timestamp((today + relativedelta(months=_month_offsets[_i_pc])).replace(day=1).date())
+            _em_s4 = pd.Timestamp((_sm_s4 + relativedelta(months=1) - relativedelta(days=1)).date())
+            _src_sm_em_by_month[_i_pc] = (_sm_s4, _em_s4)
+            if not _src_empty:
+                _src_active_by_month[_i_pc] = (
+                    (_src_gl_all.isna()  | (_src_gl_all  <= _em_s4)) &
+                    (_src_fsd_all.isna() | (_src_fsd_all >= _sm_s4))
+                )
+
         for _i, _ms in enumerate(meses_proyeccion):
             if _i >= len(_exec): break
             _r   = _exec.iloc[_i]
@@ -7487,36 +7555,29 @@ if (
                 if _scope_is_sr:
                     # Sr. scope: sum Final Hours per role from pre-computed breakdown
                     _b_curr = sum(_s4_base_hrs_role.get(_rl, [0.0]*6)[_i] for _rl in roles_permitidos)
-                    _b_base = float(_rb_scope[_cbase].sum()) if (not _rb_scope.empty and _cbase in _rb_scope.columns) else _b_curr
+                    _b_base = _rb_sum_cache.get(_cbase, _b_curr)
                     _b_ap   = 0.0
                     _b_am   = 0.0
                 else:
                     # POD scope: use Final Hours from _rb_scope (post Step-2 + Step-3 adjusted)
-                    _b_curr = float(_rb_scope[_cfin].sum())  if (not _rb_scope.empty and _cfin  in _rb_scope.columns) else 0.0
-                    _b_base = float(_rb_scope[_cbase].sum()) if (not _rb_scope.empty and _cbase in _rb_scope.columns) else _b_curr
-                    _b_ap   = float(_rb_scope[_cplus].sum()) if (not _rb_scope.empty and _cplus in _rb_scope.columns) else 0.0
-                    _b_am   = float(_rb_scope[_cmins].sum()) if (not _rb_scope.empty and _cmins in _rb_scope.columns) else 0.0
+                    _b_curr = _rb_sum_cache.get(_cfin,  0.0)
+                    _b_base = _rb_sum_cache.get(_cbase, _b_curr)
+                    _b_ap   = _rb_sum_cache.get(_cplus, 0.0)
+                    _b_am   = _rb_sum_cache.get(_cmins, 0.0)
                 # Productive hours (no shrinkage) from scoped data
                 _cprod_s4 = f"M{_i+1} ({_ms}) - Productive Hours"
-                _b_prod = float(_rb_scope[_cprod_s4].sum()) if (
-                    not _rb_scope.empty and _cprod_s4 in _rb_scope.columns
-                ) else _b_curr
+                _b_prod = _rb_sum_cache.get(_cprod_s4, _b_curr)
                 _b_new  = _fd.get('pod_new_hrs',   {}).get(_ms, {}).get(_scope, 0.0)
                 _b_chrn = _fd.get('pod_churn',     {}).get(_ms, {}).get(_scope, 0.0)
                 _b_newm = _fd.get('pod_new_mrr',   {}).get(_ms, {}).get(_scope, 0.0)
                 _b_chnm = _fd.get('pod_churn_mrr', {}).get(_ms, {}).get(_scope, 0.0)
                 _b_wday = float(_wdays_d.get(_i, 21))
                 _b_mrr  = 0.0
-                if not _duc.empty and _pod_clients_lower and 'MRR' in _duc.columns:
-                    _mdt = today + relativedelta(months=_month_offsets[_i])
-                    _sm  = pd.Timestamp(_mdt.replace(day=1).date())
-                    _em  = pd.Timestamp((_sm + relativedelta(months=1) - relativedelta(days=1)).date())
-                    _mk  = (
-                        (_duc['Go Live'].isna() | (_duc['Go Live'] <= _em)) &
-                        (_duc['Final Service Date'].isna() | (_duc['Final Service Date'] >= _sm)) &
-                        (_duc['client_name'].astype(str).str.strip().str.lower().isin(_pod_clients_lower))
-                    )
-                    _b_mrr = float(_duc.loc[_mk, 'MRR'].sum())
+                # Use cached per-month date mask (date ops done once, above the loop)
+                if _i in _duc_mrr_by_month and _pod_clients_lower_set:
+                    _sm, _em, _active_mask = _duc_mrr_by_month[_i]
+                    _mk = _active_mask & _duc_name_lower.isin(_pod_clients_lower_set)
+                    _b_mrr = float(_duc_mrr_vals[_mk].sum())
 
             # ── FTEs from pre-auto base + Step-4 automation savings ──────────
             _d_fte_m = float(_dict_hrs_fte.get(_i, 157.5) or 157.5)
@@ -7536,10 +7597,11 @@ if (
                 _hrs_adj_by_role[_rl] = float(pd.to_numeric(
                     _rrow[_mc_key].values[0] if not _rrow.empty else 0, errors='coerce') or 0)
 
-            _shrink_a1 = 2.0 - _s4_util('Accountant I')       + absenteeism + attrition
-            _shrink_a2 = 2.0 - _s4_util('Accountant II')       + absenteeism + attrition
-            _shrink_gn = 2.0 - _s4_util('General Accountant')  + absenteeism + attrition
-            _shrink_sr = 2.0 - _s4_util('Sr. Accountant')       + absenteeism + attrition
+            # PERF: pre-cached shrinkage per role (computed once before the loop)
+            _shrink_a1 = _shrink_cache['Accountant I']
+            _shrink_a2 = _shrink_cache['Accountant II']
+            _shrink_gn = _shrink_cache['General Accountant']
+            _shrink_sr = _shrink_cache['Sr. Accountant']
 
             _adj_fte_a1 = (_hrs_adj_by_role.get('Accountant I',       0) * _shrink_a1) / _d_fte_m
             _adj_fte_a2 = (_hrs_adj_by_role.get('Accountant II',      0) * _shrink_a2) / _d_fte_m
@@ -7583,21 +7645,21 @@ if (
             _tgt    = (_b_prod / _b_base * 100) if _b_base > 0 else 0
             _hol    = holidays_per_month.get(_ms, 0)
 
-            # Capacity Cost = Required FTEs × cost per role
+            # Capacity Cost = Required FTEs × cost per role (PERF: cached costs)
             _s4_cap_cost = (
-                _new_req_a1 * _s4_cost_val('Accountant I')       +
-                _new_req_a2 * _s4_cost_val('Accountant II')      +
-                _new_req_gn * _s4_cost_val('General Accountant') +
-                _new_req_sr * _s4_cost_val('Sr. Accountant')
+                _new_req_a1 * _c_a1 +
+                _new_req_a2 * _c_a2 +
+                _new_req_gn * _c_gn +
+                _new_req_sr * _c_sr
             )
             _s4_cap_margin     = _m_mrr - _s4_cap_cost
             _s4_cap_margin_pct = (_s4_cap_margin / _m_mrr * 100) if _m_mrr and _m_mrr != 0 else None
-            # Expected Cost = Actual HC × cost per role
+            # Expected Cost = Actual HC × cost per role (PERF: cached costs)
             _s4_exp_cost = (
-                _m_acc1 * _s4_cost_val('Accountant I')       +
-                _m_acc2 * _s4_cost_val('Accountant II')      +
-                _m_gen  * _s4_cost_val('General Accountant') +
-                _m_sr   * _s4_cost_val('Sr. Accountant')
+                _m_acc1 * _c_a1 +
+                _m_acc2 * _c_a2 +
+                _m_gen  * _c_gn +
+                _m_sr   * _c_sr
             )
             _s4_exp_margin     = _m_mrr - _s4_exp_cost
             _s4_exp_margin_pct = (_s4_exp_margin / _m_mrr * 100) if _m_mrr and _m_mrr != 0 else None
@@ -7613,10 +7675,10 @@ if (
             _scen_rows.setdefault("(/) Capacity Productivity",  {})[_col] = _fmt(_tgt, '%')
             _scen_rows.setdefault("(/) Shrinkage (%)",          {})[_col] = _fmt(100 - _tgt if _new_b_fin > 0 else None, '%')
             _s4_act_hc_prod = (
-                (_m_acc1 * _s4_util('Accountant I')       +
-                 _m_acc2 * _s4_util('Accountant II')      +
-                 _m_gen  * _s4_util('General Accountant') +
-                 _m_sr   * _s4_util('Sr. Accountant'))
+                (_m_acc1 * _util_cache['Accountant I']       +
+                 _m_acc2 * _util_cache['Accountant II']      +
+                 _m_gen  * _util_cache['General Accountant'] +
+                 _m_sr   * _util_cache['Sr. Accountant'])
                 / _m_tot * 100
             ) if _m_tot and _m_tot > 0 else None
             _scen_rows.setdefault("(/) Actual HC Productivity", {})[_col] = _fmt(_s4_act_hc_prod, '%')
@@ -7650,17 +7712,10 @@ if (
             _scen_rows.setdefault("  Expected Margin ($)",       {})[_col] = _fmt(_s4_exp_margin, '$')
             _scen_rows.setdefault("  Expected Margin (%)",       {})[_col] = _fmt(_s4_exp_margin_pct, '%')
             # Per-month learning-curve-aware AHT and split ticket counts
-            # Filter to clients active in this month (Go Live ≤ end, FSD ≥ start or missing)
-            _s4aht_sm  = pd.Timestamp((today + relativedelta(months=_month_offsets[_i])).replace(day=1).date())
-            _s4aht_em  = pd.Timestamp((_s4aht_sm + relativedelta(months=1) - relativedelta(days=1)).date())
-            if not _src_raw.empty:
-                _s4aht_gl_all  = pd.to_datetime(_src_raw.get('Go Live',            pd.Series(dtype='datetime64[ns]')), errors='coerce')
-                _s4aht_fsd_all = pd.to_datetime(_src_raw.get('Final Service Date', pd.Series(dtype='datetime64[ns]')), errors='coerce')
-                _s4aht_active  = (
-                    (_s4aht_gl_all.isna()  | (_s4aht_gl_all  <= _s4aht_em)) &
-                    (_s4aht_fsd_all.isna() | (_s4aht_fsd_all >= _s4aht_sm))
-                )
-                _src_m = _src_raw[_s4aht_active].copy()
+            # (PERF: date columns parsed once above the loop; active masks cached.)
+            _s4aht_sm, _s4aht_em = _src_sm_em_by_month[_i]
+            if not _src_empty:
+                _src_m = _src_raw[_src_active_by_month[_i]].copy()
             else:
                 _src_m = _src_raw
             if not _src_m.empty and 'Go Live' in _src_m.columns:
@@ -7724,20 +7779,20 @@ if (
                 # HC Δ not directly in _exec; derive from Actual HC minus Required FTEs
                 _base_hc_tot_b3 = float(_base_hc_tot) if _base_hc_tot is not None else 0.0
                 _base_nums.setdefault("HC Δ (Actual − Required)", {})[_col] = round(_base_hc_tot_b3 - float(_r.get("Total FTEs", 0) or 0), 2)
-                # Capacity Cost / Margin using Step-3 Required FTEs × role cost
+                # Capacity Cost / Margin using Step-3 Required FTEs × role cost (PERF: cached)
                 _b3_cap_cost = (
-                    _b3_fte_a1 * _s4_cost_val('Accountant I')       +
-                    _b3_fte_a2 * _s4_cost_val('Accountant II')      +
-                    _b3_fte_gn * _s4_cost_val('General Accountant') +
-                    _b3_fte_sr * _s4_cost_val('Sr. Accountant')
+                    _b3_fte_a1 * _c_a1 +
+                    _b3_fte_a2 * _c_a2 +
+                    _b3_fte_gn * _c_gn +
+                    _b3_fte_sr * _c_sr
                 )
                 _b3_cap_margin_pct = ((_b3_mrr - _b3_cap_cost) / _b3_mrr * 100) if _b3_mrr else float('nan')
-                # Expected Cost / Margin using base Actual HC × role cost (MRR baseline = Step-3 MRR, no scenario add/sub)
+                # Expected Cost / Margin using base Actual HC × role cost (PERF: cached)
                 _b3_exp_cost = (
-                    float(_base_hc_by_role.get('Accountant I', 0) or 0)       * _s4_cost_val('Accountant I')       +
-                    float(_base_hc_by_role.get('Accountant II', 0) or 0)      * _s4_cost_val('Accountant II')      +
-                    float(_base_hc_by_role.get('General Accountant', 0) or 0) * _s4_cost_val('General Accountant') +
-                    float(_base_hc_by_role.get('Sr. Accountant', 0) or 0)     * _s4_cost_val('Sr. Accountant')
+                    float(_base_hc_by_role.get('Accountant I', 0) or 0)       * _c_a1 +
+                    float(_base_hc_by_role.get('Accountant II', 0) or 0)      * _c_a2 +
+                    float(_base_hc_by_role.get('General Accountant', 0) or 0) * _c_gn +
+                    float(_base_hc_by_role.get('Sr. Accountant', 0) or 0)     * _c_sr
                 )
                 _b3_exp_margin_pct = ((_b3_mrr - _b3_exp_cost) / _b3_mrr * 100) if _b3_mrr else float('nan')
                 _base_nums.setdefault("Expected Margin (%)",     {})[_col] = _b3_exp_margin_pct
@@ -7747,31 +7802,31 @@ if (
             else:
                 _cfin_b3   = f"M{_i+1} ({_ms}) - Final Hours"
                 _cfte_b3   = f"M{_i+1} ({_ms}) - Final FTEs"
-                _base_nums.setdefault("Required Hours (Hrs)",    {})[_col] = float(_rb_scope[_cfin_b3].sum())  if (not _rb_scope.empty and _cfin_b3  in _rb_scope.columns) else 0.0
-                _base_nums.setdefault("Required HC (FTEs)",      {})[_col] = float(_rb_scope[_cfte_b3].sum()) if (not _rb_scope.empty and _cfte_b3 in _rb_scope.columns) else 0.0
+                # PERF: use pre-aggregated _rb_scope sums
+                _base_nums.setdefault("Required Hours (Hrs)",    {})[_col] = _rb_sum_cache.get(_cfin_b3, 0.0)
+                _base_nums.setdefault("Required HC (FTEs)",      {})[_col] = _rb_sum_cache.get(_cfte_b3, 0.0)
                 _b3_fte_by_role = {}
                 for _brl in roles_permitidos:
                     _bkey = f"  · {_brl}"
-                    _b3_fte_by_role[_brl] = float(
-                        _rb_scope.loc[_rb_scope['Required Role'] == _brl, _cfte_b3].sum()
-                    ) if (not _rb_scope.empty and _cfte_b3 in _rb_scope.columns) else 0.0
+                    # PERF: use pre-grouped per-role FTE cache
+                    _b3_fte_by_role[_brl] = _rb_rolefte_cache.get((_i, _brl), 0.0)
                     _base_nums.setdefault(_bkey, {})[_col] = _b3_fte_by_role[_brl]
                 _base_nums.setdefault("HC Δ (Actual − Required)", {})[_col] = float('nan')
                 _base_nums.setdefault("MRR ($)",                 {})[_col] = _b_mrr
-                # Capacity Cost / Margin using scoped Step-3 Required FTEs × role cost
+                # Capacity Cost / Margin using scoped Step-3 Required FTEs × role cost (PERF: cached)
                 _b3_cap_cost = (
-                    _b3_fte_by_role.get('Accountant I', 0.0)       * _s4_cost_val('Accountant I')       +
-                    _b3_fte_by_role.get('Accountant II', 0.0)      * _s4_cost_val('Accountant II')      +
-                    _b3_fte_by_role.get('General Accountant', 0.0) * _s4_cost_val('General Accountant') +
-                    _b3_fte_by_role.get('Sr. Accountant', 0.0)     * _s4_cost_val('Sr. Accountant')
+                    _b3_fte_by_role.get('Accountant I', 0.0)       * _c_a1 +
+                    _b3_fte_by_role.get('Accountant II', 0.0)      * _c_a2 +
+                    _b3_fte_by_role.get('General Accountant', 0.0) * _c_gn +
+                    _b3_fte_by_role.get('Sr. Accountant', 0.0)     * _c_sr
                 )
                 _b3_cap_margin_pct = ((_b_mrr - _b3_cap_cost) / _b_mrr * 100) if _b_mrr else float('nan')
-                # Expected Cost / Margin using base Actual HC × role cost (scope HC)
+                # Expected Cost / Margin using base Actual HC × role cost (PERF: cached)
                 _b3_exp_cost = (
-                    float(_base_hc_by_role.get('Accountant I', 0) or 0)       * _s4_cost_val('Accountant I')       +
-                    float(_base_hc_by_role.get('Accountant II', 0) or 0)      * _s4_cost_val('Accountant II')      +
-                    float(_base_hc_by_role.get('General Accountant', 0) or 0) * _s4_cost_val('General Accountant') +
-                    float(_base_hc_by_role.get('Sr. Accountant', 0) or 0)     * _s4_cost_val('Sr. Accountant')
+                    float(_base_hc_by_role.get('Accountant I', 0) or 0)       * _c_a1 +
+                    float(_base_hc_by_role.get('Accountant II', 0) or 0)      * _c_a2 +
+                    float(_base_hc_by_role.get('General Accountant', 0) or 0) * _c_gn +
+                    float(_base_hc_by_role.get('Sr. Accountant', 0) or 0)     * _c_sr
                 )
                 _b3_exp_margin_pct = ((_b_mrr - _b3_exp_cost) / _b_mrr * 100) if _b_mrr else float('nan')
                 _base_nums.setdefault("Expected Margin (%)",     {})[_col] = _b3_exp_margin_pct

@@ -36,6 +36,12 @@ _splash_tmp.html
 capacity_online.html
 splash.html
 
+# Local backups / working copies
+app_backup_*.py
+backup_*.py
+app*.bak
+app - *.py
+
 # Icon / launcher (not needed for cloud)
 *.ico
 generate_html.py
