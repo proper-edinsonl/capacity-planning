@@ -7652,36 +7652,75 @@ if (
             _scen_nums.setdefault("Capacity Margin (%)",         {})[_col] = _s4_cap_margin_pct if _s4_cap_margin_pct is not None else float('nan')
             # Step-3 baseline values for same month (from _exec / _rb_scope)
             if _scope == "Overall":
+                _b3_fte_a1  = float(_r.get("FTEs Accountant I", 0) or 0)
+                _b3_fte_a2  = float(_r.get("FTEs Accountant II", 0) or 0)
+                _b3_fte_gn  = float(_r.get("FTEs General Acc.", 0) or 0)
+                _b3_fte_sr  = float(_r.get("FTEs Sr. Accountant", 0) or 0)
+                _b3_mrr     = float(_r.get("Total MRR ($)", 0) or 0)
                 _base_nums.setdefault("Required Hours (Hrs)",    {})[_col] = float(_r.get("7. Total Required Hours (Final)", 0) or 0)
                 _base_nums.setdefault("Required HC (FTEs)",      {})[_col] = float(_r.get("Total FTEs", 0) or 0)
-                _base_nums.setdefault("  · Accountant I",        {})[_col] = float(_r.get("FTEs Accountant I", 0) or 0)
-                _base_nums.setdefault("  · Accountant II",       {})[_col] = float(_r.get("FTEs Accountant II", 0) or 0)
-                _base_nums.setdefault("  · General Accountant",  {})[_col] = float(_r.get("FTEs General Acc.", 0) or 0)
-                _base_nums.setdefault("  · Sr. Accountant",      {})[_col] = float(_r.get("FTEs Sr. Accountant", 0) or 0)
-                _base_nums.setdefault("MRR ($)",                 {})[_col] = float(_r.get("Total MRR ($)", 0) or 0)
+                _base_nums.setdefault("  · Accountant I",        {})[_col] = _b3_fte_a1
+                _base_nums.setdefault("  · Accountant II",       {})[_col] = _b3_fte_a2
+                _base_nums.setdefault("  · General Accountant",  {})[_col] = _b3_fte_gn
+                _base_nums.setdefault("  · Sr. Accountant",      {})[_col] = _b3_fte_sr
+                _base_nums.setdefault("MRR ($)",                 {})[_col] = _b3_mrr
                 # HC Δ not directly in _exec; derive from Actual HC minus Required FTEs
                 _base_hc_tot_b3 = float(_base_hc_tot) if _base_hc_tot is not None else 0.0
                 _base_nums.setdefault("HC Δ (Actual − Required)", {})[_col] = round(_base_hc_tot_b3 - float(_r.get("Total FTEs", 0) or 0), 2)
-                _base_nums.setdefault("Expected Margin (%)",     {})[_col] = float('nan')  # not stored in _exec
-                _base_nums.setdefault("Expected Cost ($)",       {})[_col] = float('nan')
-                _base_nums.setdefault("Capacity Cost ($)",       {})[_col] = float('nan')
-                _base_nums.setdefault("Capacity Margin (%)",     {})[_col] = float('nan')
+                # Capacity Cost / Margin using Step-3 Required FTEs × role cost
+                _b3_cap_cost = (
+                    _b3_fte_a1 * _s4_cost_val('Accountant I')       +
+                    _b3_fte_a2 * _s4_cost_val('Accountant II')      +
+                    _b3_fte_gn * _s4_cost_val('General Accountant') +
+                    _b3_fte_sr * _s4_cost_val('Sr. Accountant')
+                )
+                _b3_cap_margin_pct = ((_b3_mrr - _b3_cap_cost) / _b3_mrr * 100) if _b3_mrr else float('nan')
+                # Expected Cost / Margin using base Actual HC × role cost (MRR baseline = Step-3 MRR, no scenario add/sub)
+                _b3_exp_cost = (
+                    float(_base_hc_by_role.get('Accountant I', 0) or 0)       * _s4_cost_val('Accountant I')       +
+                    float(_base_hc_by_role.get('Accountant II', 0) or 0)      * _s4_cost_val('Accountant II')      +
+                    float(_base_hc_by_role.get('General Accountant', 0) or 0) * _s4_cost_val('General Accountant') +
+                    float(_base_hc_by_role.get('Sr. Accountant', 0) or 0)     * _s4_cost_val('Sr. Accountant')
+                )
+                _b3_exp_margin_pct = ((_b3_mrr - _b3_exp_cost) / _b3_mrr * 100) if _b3_mrr else float('nan')
+                _base_nums.setdefault("Expected Margin (%)",     {})[_col] = _b3_exp_margin_pct
+                _base_nums.setdefault("Expected Cost ($)",       {})[_col] = _b3_exp_cost
+                _base_nums.setdefault("Capacity Cost ($)",       {})[_col] = _b3_cap_cost
+                _base_nums.setdefault("Capacity Margin (%)",     {})[_col] = _b3_cap_margin_pct
             else:
                 _cfin_b3   = f"M{_i+1} ({_ms}) - Final Hours"
                 _cfte_b3   = f"M{_i+1} ({_ms}) - Final FTEs"
                 _base_nums.setdefault("Required Hours (Hrs)",    {})[_col] = float(_rb_scope[_cfin_b3].sum())  if (not _rb_scope.empty and _cfin_b3  in _rb_scope.columns) else 0.0
                 _base_nums.setdefault("Required HC (FTEs)",      {})[_col] = float(_rb_scope[_cfte_b3].sum()) if (not _rb_scope.empty and _cfte_b3 in _rb_scope.columns) else 0.0
+                _b3_fte_by_role = {}
                 for _brl in roles_permitidos:
                     _bkey = f"  · {_brl}"
-                    _base_nums.setdefault(_bkey, {})[_col] = float(
+                    _b3_fte_by_role[_brl] = float(
                         _rb_scope.loc[_rb_scope['Required Role'] == _brl, _cfte_b3].sum()
                     ) if (not _rb_scope.empty and _cfte_b3 in _rb_scope.columns) else 0.0
+                    _base_nums.setdefault(_bkey, {})[_col] = _b3_fte_by_role[_brl]
                 _base_nums.setdefault("HC Δ (Actual − Required)", {})[_col] = float('nan')
                 _base_nums.setdefault("MRR ($)",                 {})[_col] = _b_mrr
-                _base_nums.setdefault("Expected Margin (%)",     {})[_col] = float('nan')
-                _base_nums.setdefault("Expected Cost ($)",       {})[_col] = float('nan')
-                _base_nums.setdefault("Capacity Cost ($)",       {})[_col] = float('nan')
-                _base_nums.setdefault("Capacity Margin (%)",     {})[_col] = float('nan')
+                # Capacity Cost / Margin using scoped Step-3 Required FTEs × role cost
+                _b3_cap_cost = (
+                    _b3_fte_by_role.get('Accountant I', 0.0)       * _s4_cost_val('Accountant I')       +
+                    _b3_fte_by_role.get('Accountant II', 0.0)      * _s4_cost_val('Accountant II')      +
+                    _b3_fte_by_role.get('General Accountant', 0.0) * _s4_cost_val('General Accountant') +
+                    _b3_fte_by_role.get('Sr. Accountant', 0.0)     * _s4_cost_val('Sr. Accountant')
+                )
+                _b3_cap_margin_pct = ((_b_mrr - _b3_cap_cost) / _b_mrr * 100) if _b_mrr else float('nan')
+                # Expected Cost / Margin using base Actual HC × role cost (scope HC)
+                _b3_exp_cost = (
+                    float(_base_hc_by_role.get('Accountant I', 0) or 0)       * _s4_cost_val('Accountant I')       +
+                    float(_base_hc_by_role.get('Accountant II', 0) or 0)      * _s4_cost_val('Accountant II')      +
+                    float(_base_hc_by_role.get('General Accountant', 0) or 0) * _s4_cost_val('General Accountant') +
+                    float(_base_hc_by_role.get('Sr. Accountant', 0) or 0)     * _s4_cost_val('Sr. Accountant')
+                )
+                _b3_exp_margin_pct = ((_b_mrr - _b3_exp_cost) / _b_mrr * 100) if _b_mrr else float('nan')
+                _base_nums.setdefault("Expected Margin (%)",     {})[_col] = _b3_exp_margin_pct
+                _base_nums.setdefault("Expected Cost ($)",       {})[_col] = _b3_exp_cost
+                _base_nums.setdefault("Capacity Cost ($)",       {})[_col] = _b3_cap_cost
+                _base_nums.setdefault("Capacity Margin (%)",     {})[_col] = _b3_cap_margin_pct
 
         if not _months:
             st.info("ℹ️ Run Steps 1–3 first to populate baseline data.")
