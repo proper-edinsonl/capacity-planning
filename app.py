@@ -1849,8 +1849,20 @@ def _process_hc_report(file_bytes: bytes):
     active_pods['POD'] = active_pods['Department unit'].astype(str).str.strip().str.title()
 
     _jt_lower = active_pods['Job title'].astype(str).str.lower().str.strip()
+    _mgr_mask   = (
+        _jt_lower.str.contains('accounting manager', na=False) |
+        _jt_lower.str.contains('assistant manager',  na=False)
+    )
     n_acct_mgr  = int((_jt_lower.str.contains('accounting manager',  na=False)).sum())
     n_asst_mgr  = int((_jt_lower.str.contains('assistant manager',   na=False)).sum())
+    n_mgr_total = int(_mgr_mask.sum())
+
+    # Managers per POD (Accounting + Assistant Managers combined)
+    _mgr_df = active_pods[_mgr_mask]
+    mgr_by_pod = (
+        _mgr_df.groupby('POD')['Full name'].count().to_dict()
+        if not _mgr_df.empty else {}
+    )
 
     by_role     = active_pods.groupby('Capacity Role')['Full name'].count().to_dict()
     by_pod_role = (active_pods.groupby(['POD', 'Capacity Role'])['Full name']
@@ -1885,6 +1897,12 @@ def _process_hc_report(file_bytes: bytes):
         _rpts     = _dr_df[_dr_df['_mgr_email_norm'] == _email]
         _dr_roles = _rpts['Capacity Role'].value_counts().to_dict()
         _dr_total = int((_rpts['Capacity Role'] != 'Other').sum())
+        # Managers among this Sr.'s direct reports (rare, but counted for display)
+        _rpts_jt  = _rpts['Job title'].astype(str).str.lower().str.strip()
+        _sr_mgrs  = int((
+            _rpts_jt.str.contains('accounting manager', na=False) |
+            _rpts_jt.str.contains('assistant manager',  na=False)
+        ).sum())
         # Sr. themselves counts as 1 under 'Sr. Accountant' — total = DRs + 1
         _sr_roles = dict(_dr_roles)
         _sr_roles['Sr. Accountant'] = 1          # always exactly 1 (themselves)
@@ -1893,6 +1911,7 @@ def _process_hc_report(file_bytes: bytes):
             'total':    _sr_total,
             'dr_total': _dr_total,               # direct reports only (no Sr.)
             'by_role':  _sr_roles,
+            'managers': _sr_mgrs,
             'email':    _email,
         }
         by_sr[_sn]                  = _sr_data
@@ -1908,6 +1927,8 @@ def _process_hc_report(file_bytes: bytes):
         'total':          total,
         'acct_managers':  n_acct_mgr,
         'asst_managers':  n_asst_mgr,
+        'mgr_total':      n_mgr_total,
+        'mgr_by_pod':     mgr_by_pod,
         'detail':         active_pods[['Full name', 'Work Email', 'Job title', 'Capacity Role', 'POD']],
     }
 
@@ -5118,6 +5139,7 @@ if "calc_data" in st.session_state:
                 _hc     = st.session_state.get('hc_data', None)
                 _ai     = st.session_state.get('ai_results', None)
                 _df_raw = st.session_state.get('df_clean', pd.DataFrame())
+                _duc    = st.session_state.get('df_clients_unique', pd.DataFrame())
 
                 # ── Aggregate metrics from raw data ─────────────────────────────────
                 def _safe_num(series):
@@ -5194,6 +5216,7 @@ if "calc_data" in st.session_state:
                         hc_gen   = _hc['by_role'].get('General Accountant', 0) if _hc else None
                         hc_sr    = _hc['by_role'].get('Sr. Accountant', 0)    if _hc else None
                         hc_other = _hc['by_role'].get('Other', 0)             if _hc else None
+                        hc_mgr   = _hc.get('mgr_total', 0)                    if _hc else None
 
                         act_hc_prod = (
                             (float(hc_acc1 or 0) * util_acc1 +
@@ -5259,7 +5282,7 @@ if "calc_data" in st.session_state:
                         rows.setdefault("  · Accountant II (actual)",     {})[col] = _fmt(hc_acc2, 'fte')
                         rows.setdefault("  · General Acc. (actual)",      {})[col] = _fmt(hc_gen, 'fte')
                         rows.setdefault("  · Sr. Accountant (actual)",    {})[col] = _fmt(hc_sr, 'fte')
-                        rows.setdefault("  · Other Roles (actual)",       {})[col] = _fmt(hc_other, 'fte')
+                        rows.setdefault("  · Managers (actual)",          {})[col] = _fmt(hc_mgr, 'fte')
                         rows.setdefault("━ HC Δ (Actual − Required)",     {})[col] = _fmt(d_total, 'dec')
                         rows.setdefault("  · Δ Accountant I",             {})[col] = _fmt(d_acc1, 'dec')
                         rows.setdefault("  · Δ Accountant II",            {})[col] = _fmt(d_acc2, 'dec')
@@ -5314,7 +5337,19 @@ if "calc_data" in st.session_state:
                             (_aht_ptix * _aht_paht * _aht_lc).sum() +
                             (_aht_rtix * _aht_raht * _aht_lc).sum()
                         ) / _aht_tot_tix if _aht_tot_tix > 0 else 0.0
+                        # Active client count for this month (Go Live ≤ month end
+                        # AND (FSD ≥ month start OR FSD missing)).
+                        _m_cli_count = 0
+                        if not _duc.empty and 'client_name' in _duc.columns:
+                            _duc_gl_o  = pd.to_datetime(_duc.get('Go Live',            pd.Series(dtype='datetime64[ns]')), errors='coerce')
+                            _duc_fsd_o = pd.to_datetime(_duc.get('Final Service Date', pd.Series(dtype='datetime64[ns]')), errors='coerce')
+                            _m_cli_mask = (
+                                (_duc_gl_o.isna()  | (_duc_gl_o  <= _aht_end_m)) &
+                                (_duc_fsd_o.isna() | (_duc_fsd_o >= _aht_start_m))
+                            )
+                            _m_cli_count = int(_m_cli_mask.sum())
                         rows.setdefault("━ Property Count",               {})[col] = _fmt(_prop_count, 'n')
+                        rows.setdefault("  Client Count",                 {})[col] = _fmt(_m_cli_count, 'n')
                         rows.setdefault("  Door Count Equivalent",        {})[col] = _fmt(_door_count, 'n')
                         rows.setdefault("  Tickets to Process",           {})[col] = _fmt(_aht_proc_tix, 'n')
                         rows.setdefault("  Tickets to Review",            {})[col] = _fmt(_aht_rev_tix,  'n')
@@ -5341,7 +5376,7 @@ if "calc_data" in st.session_state:
                 # Apply Actual HC row filter for display when client filters are active
                 _actual_hc_rows_to_hide = {
                     "━ Actual HC (Report)", "  · Accountant I (actual)", "  · Accountant II (actual)",
-                    "  · General Acc. (actual)", "  · Sr. Accountant (actual)", "  · Other Roles (actual)",
+                    "  · General Acc. (actual)", "  · Sr. Accountant (actual)", "  · Managers (actual)",
                     "━ HC Δ (Actual − Required)", "  · Δ Accountant I", "  · Δ Accountant II",
                     "  · Δ General Accountant", "  · Δ Sr. Accountant",
                     "(/) Actual HC Productivity", "  Expected Cost ($)", "  Expected Margin ($)",
@@ -5356,12 +5391,12 @@ if "calc_data" in st.session_state:
                 _ov_groups_full = {
                     "━ Required Hours":           ["  Current Customer Hours", "  Shrinkage (Hrs)", "  (+) New Customer Hours", "  (-) Confirmed Churn (Hrs)", "  (-) Automations", "  (+) Manual Adjustments"],
                     "━ Required HC (FTEs)":       ["  · Accountant I", "  · Accountant II", "  · General Accountant", "  · Sr. Accountant"],
-                    "━ Actual HC (Report)":       ["  · Accountant I (actual)", "  · Accountant II (actual)", "  · General Acc. (actual)", "  · Sr. Accountant (actual)", "  · Other Roles (actual)"],
+                    "━ Actual HC (Report)":       ["  · Accountant I (actual)", "  · Accountant II (actual)", "  · General Acc. (actual)", "  · Sr. Accountant (actual)", "  · Managers (actual)"],
                     "━ HC Δ (Actual − Required)": ["  · Δ Accountant I", "  · Δ Accountant II", "  · Δ General Accountant", "  · Δ Sr. Accountant"],
                     "━ MRR ($)":                  ["  (+) New MRR ($)", "  (-) Churn MRR ($)", "  Revenue / HC ($)"],
                     "━ Cost & Margin":            ["  Capacity Cost ($)", "  Capacity Margin ($)", "  Capacity Margin (%)",
                                                    "  Expected Cost ($)", "  Expected Margin ($)", "  Expected Margin (%)"],
-                    "━ Property Count":           ["  Door Count Equivalent"],
+                    "━ Property Count":           ["  Client Count", "  Door Count Equivalent"],
                     "━ Working Days":             ["  Holidays"],
                 }
                 _ov_groups_nohc = {
@@ -5369,7 +5404,7 @@ if "calc_data" in st.session_state:
                     "━ Required HC (FTEs)":       ["  · Accountant I", "  · Accountant II", "  · General Accountant", "  · Sr. Accountant"],
                     "━ MRR ($)":                  ["  (+) New MRR ($)", "  (-) Churn MRR ($)"],
                     "━ Cost & Margin":            ["  Capacity Cost ($)", "  Capacity Margin ($)", "  Capacity Margin (%)"],
-                    "━ Property Count":           ["  Door Count Equivalent"],
+                    "━ Property Count":           ["  Client Count", "  Door Count Equivalent"],
                     "━ Working Days":             ["  Holidays"],
                 }
                 _ov_groups = _ov_groups_nohc if _hide_actual_hc else _ov_groups_full
@@ -5551,11 +5586,25 @@ if "calc_data" in st.session_state:
                                         _r = _proles[_proles['Required Role'] == role_name]
                                         return float(_r[c_fte_col].sum()) if c_fte_col in _r.columns else 0
 
-                                    hc_p_tot  = sum(_pod_hc.values()) or None
+                                    # Total HC only counts the 4 productive roles
+                                    # (Accountant I/II, General Acc., Sr. Acc.) — managers
+                                    # live in 'Other' and are surfaced in their own row.
+                                    hc_p_tot  = sum(
+                                        v for k, v in _pod_hc.items() if k != 'Other'
+                                    ) or None
                                     hc_p_acc1 = _pod_hc.get('Accountant I')
                                     hc_p_acc2 = _pod_hc.get('Accountant II')
                                     hc_p_gen  = _pod_hc.get('General Accountant')
                                     hc_p_sr   = _pod_hc.get('Sr. Accountant')
+                                    # Manager count for this POD (normalized lookup)
+                                    _p_mgr_by_pod = _hc.get('mgr_by_pod', {}) if _hc else {}
+                                    _p_mgr_norm   = {
+                                        str(k).lower().replace(' ', '').strip(): int(v)
+                                        for k, v in _p_mgr_by_pod.items()
+                                    }
+                                    hc_p_mgr  = _p_mgr_norm.get(
+                                        str(_pod_name).lower().replace(' ', '').strip(), 0
+                                    )
                                     d_pod     = round(hc_p_tot - p_fte, 2) if hc_p_tot is not None else None
                                     d_p_acc1  = round(hc_p_acc1 - _prole_fte('Accountant I'),       2) if hc_p_acc1 is not None else None
                                     d_p_acc2  = round(hc_p_acc2 - _prole_fte('Accountant II'),      2) if hc_p_acc2 is not None else None
@@ -5655,6 +5704,7 @@ if "calc_data" in st.session_state:
                                     _pod_rows.setdefault("  · Accountant II (actual)",     {})[col] = _fmt(hc_p_acc2, 'fte')
                                     _pod_rows.setdefault("  · General Acc. (actual)",      {})[col] = _fmt(hc_p_gen, 'fte')
                                     _pod_rows.setdefault("  · Sr. Accountant (actual)",    {})[col] = _fmt(hc_p_sr, 'fte')
+                                    _pod_rows.setdefault("  · Managers (actual)",          {})[col] = _fmt(hc_p_mgr if _hc else None, 'fte')
                                     _pod_rows.setdefault("━ HC Δ (Actual − Required)",     {})[col] = _fmt(d_pod, 'dec')
                                     _pod_rows.setdefault("  · Δ Accountant I",             {})[col] = _fmt(d_p_acc1, 'dec')
                                     _pod_rows.setdefault("  · Δ Accountant II",            {})[col] = _fmt(d_p_acc2, 'dec')
@@ -5708,7 +5758,19 @@ if "calc_data" in st.session_state:
                                         (_paht_ptix * _paht_pa * _paht_lc).sum() +
                                         (_paht_rtix * _paht_ra * _paht_lc).sum()
                                     ) / _p_tot_tix2 if _p_tot_tix2 > 0 else 0.0
+                                    # Active client count for this POD this month
+                                    _p_cli_count = 0
+                                    if not _duc.empty and _pod_clients_lower and 'client_name' in _duc.columns:
+                                        _pcl_gl  = pd.to_datetime(_duc.get('Go Live',            pd.Series(dtype='datetime64[ns]')), errors='coerce')
+                                        _pcl_fsd = pd.to_datetime(_duc.get('Final Service Date', pd.Series(dtype='datetime64[ns]')), errors='coerce')
+                                        _pcl_mask = (
+                                            (_pcl_gl.isna()  | (_pcl_gl  <= _paht_em)) &
+                                            (_pcl_fsd.isna() | (_pcl_fsd >= _paht_sm)) &
+                                            (_duc['client_name'].astype(str).str.strip().str.lower().isin(_pod_clients_lower))
+                                        )
+                                        _p_cli_count = int(_pcl_mask.sum())
                                     _pod_rows.setdefault("━ Property Count",               {})[col] = _fmt(_p_prop_count, 'n')
+                                    _pod_rows.setdefault("  Client Count",                 {})[col] = _fmt(_p_cli_count, 'n')
                                     _pod_rows.setdefault("  Door Count Equivalent",        {})[col] = _fmt(_p_door_count, 'n')
                                     _pod_rows.setdefault("  Tickets to Process",           {})[col] = _fmt(_p_proc_tix, 'n')
                                     _pod_rows.setdefault("  Tickets to Review",            {})[col] = _fmt(_p_rev_tix,  'n')
@@ -5724,12 +5786,12 @@ if "calc_data" in st.session_state:
                                 _pod_grp_defs = {
                                     "━ Required Hours":           ["  Current Customer Hours", "  Shrinkage (Hrs)", "  (+) New Customer Hours", "  (-) Confirmed Churn (Hrs)", "  (-) Automations", "  (+) Manual Adjustments"],
                                     "━ Required HC (FTEs)":       ["  · Accountant I", "  · Accountant II", "  · General Accountant", "  · Sr. Accountant"],
-                                    "━ Actual HC (Report)":       ["  · Accountant I (actual)", "  · Accountant II (actual)", "  · General Acc. (actual)", "  · Sr. Accountant (actual)"],
+                                    "━ Actual HC (Report)":       ["  · Accountant I (actual)", "  · Accountant II (actual)", "  · General Acc. (actual)", "  · Sr. Accountant (actual)", "  · Managers (actual)"],
                                     "━ HC Δ (Actual − Required)": ["  · Δ Accountant I", "  · Δ Accountant II", "  · Δ General Accountant", "  · Δ Sr. Accountant"],
                                     "━ MRR ($)":                  ["  (+) New MRR ($)", "  (-) Churn MRR ($)", "  Revenue / HC ($)"],
                                     "━ Cost & Margin":            ["  Capacity Cost ($)", "  Capacity Margin ($)", "  Capacity Margin (%)",
                                                                    "  Expected Cost ($)", "  Expected Margin ($)", "  Expected Margin (%)"],
-                                    "━ Property Count":           ["  Door Count Equivalent"],
+                                    "━ Property Count":           ["  Client Count", "  Door Count Equivalent"],
                                     "━ Working Days":             ["  Holidays"],
                                 }
                                 for _gh in _pod_grp_defs:
@@ -5811,6 +5873,7 @@ if "calc_data" in st.session_state:
                                 )
                             hc_sr_tot  = _sr_hc_data.get('total', None) or None
                             _sr_by_role = _sr_hc_data.get('by_role', {})
+                            hc_sr_mgr   = int(_sr_hc_data.get('managers', 0) or 0) if _sr_hc_data else None
 
                             # ── Direct reports label + debug table ────────────────────────
                             if _sr_hc_data:
@@ -6001,6 +6064,7 @@ if "calc_data" in st.session_state:
                                 _sr_rows.setdefault("  · Accountant II (actual)",     {})[col] = _fmt(hc_sr_acc2, 'fte')
                                 _sr_rows.setdefault("  · General Acc. (actual)",      {})[col] = _fmt(hc_sr_gen, 'fte')
                                 _sr_rows.setdefault("  · Sr. Accountant (actual)",    {})[col] = _fmt(hc_sr_sr, 'fte')
+                                _sr_rows.setdefault("  · Managers (actual)",          {})[col] = _fmt(hc_sr_mgr, 'fte')
                                 _sr_rows.setdefault("━ HC Δ (Actual − Required)",     {})[col] = _fmt(d_sr_tot, 'dec')
                                 _sr_rows.setdefault("  · Δ Accountant I",             {})[col] = _fmt(d_sr_acc1, 'dec')
                                 _sr_rows.setdefault("  · Δ Accountant II",            {})[col] = _fmt(d_sr_acc2, 'dec')
@@ -6054,7 +6118,19 @@ if "calc_data" in st.session_state:
                                     (_saht_ptix * _saht_pa * _saht_lc).sum() +
                                     (_saht_rtix * _saht_ra * _saht_lc).sum()
                                 ) / _sr_tot_tix2 if _sr_tot_tix2 > 0 else 0.0
+                                # Active client count for this Sr. this month
+                                _sr_cli_count = 0
+                                if not _duc.empty and _sr_clients_set and 'client_name' in _duc.columns:
+                                    _sc_gl  = pd.to_datetime(_duc.get('Go Live',            pd.Series(dtype='datetime64[ns]')), errors='coerce')
+                                    _sc_fsd = pd.to_datetime(_duc.get('Final Service Date', pd.Series(dtype='datetime64[ns]')), errors='coerce')
+                                    _sc_mask = (
+                                        (_sc_gl.isna()  | (_sc_gl  <= _saht_em)) &
+                                        (_sc_fsd.isna() | (_sc_fsd >= _saht_sm)) &
+                                        (_duc['client_name'].isin(_sr_clients_set))
+                                    )
+                                    _sr_cli_count = int(_sc_mask.sum())
                                 _sr_rows.setdefault("━ Property Count",               {})[col] = _fmt(_srp_count, 'n')
+                                _sr_rows.setdefault("  Client Count",                 {})[col] = _fmt(_sr_cli_count, 'n')
                                 _sr_rows.setdefault("  Door Count Equivalent",        {})[col] = _fmt(_srd_count, 'n')
                                 _sr_rows.setdefault("  Tickets to Process",           {})[col] = _fmt(_sr_proc_tix, 'n')
                                 _sr_rows.setdefault("  Tickets to Review",            {})[col] = _fmt(_sr_rev_tix,  'n')
@@ -6084,12 +6160,12 @@ if "calc_data" in st.session_state:
                                 _sr_grp_defs = {
                                     "━ Required Hours":           ["  Current Customer Hours", "  Shrinkage (Hrs)", "  (+) New Customer Hours", "  (-) Confirmed Churn (Hrs)", "  (-) Automations", "  (+) Manual Adjustments"],
                                     "━ Required HC (FTEs)":       ["  · Accountant I", "  · Accountant II", "  · General Accountant", "  · Sr. Accountant"],
-                                    "━ Actual HC (Report)":       ["  · Accountant I (actual)", "  · Accountant II (actual)", "  · General Acc. (actual)", "  · Sr. Accountant (actual)"],
+                                    "━ Actual HC (Report)":       ["  · Accountant I (actual)", "  · Accountant II (actual)", "  · General Acc. (actual)", "  · Sr. Accountant (actual)", "  · Managers (actual)"],
                                     "━ HC Δ (Actual − Required)": ["  · Δ Accountant I", "  · Δ Accountant II", "  · Δ General Accountant", "  · Δ Sr. Accountant"],
                                     "━ MRR ($)":                  ["  (+) New MRR ($)", "  (-) Churn MRR ($)", "  Revenue / HC ($)"],
                                     "━ Cost & Margin":            ["  Capacity Cost ($)", "  Capacity Margin ($)", "  Capacity Margin (%)",
                                                                    "  Expected Cost ($)", "  Expected Margin ($)", "  Expected Margin (%)"],
-                                    "━ Property Count":           ["  Door Count Equivalent"],
+                                    "━ Property Count":           ["  Client Count", "  Door Count Equivalent"],
                                     "━ Working Days":             ["  Holidays"],
                                 }
                                 # Client rows are also collapsible
@@ -7143,6 +7219,7 @@ if (
             _base_hc_tot = None
             _base_hc_by_role = {_rl: None for _rl in roles_permitidos}
             _base_hc_other = None
+            _base_hc_mgr   = None
         elif _scope == "Overall":
             _base_hc_tot = _hc.get('total')
             _by_r = _hc.get('by_role', {})
@@ -7153,6 +7230,7 @@ if (
                 'Sr. Accountant':     float(_by_r.get('Sr. Accountant', 0) or 0),
             }
             _base_hc_other = float(_by_r.get('Other', 0) or 0)
+            _base_hc_mgr   = float(_hc.get('mgr_total', 0) or 0)
         elif _scope_is_sr:
             _sr_hc_s4 = (
                 (
@@ -7172,6 +7250,7 @@ if (
                 'Sr. Accountant':     float(_sr_roles_s4.get('Sr. Accountant', 0)),
             }
             _base_hc_other = None
+            _base_hc_mgr   = float(_sr_hc_s4.get('managers', 0) or 0)
         else:
             _pod_hc_raw = {}
             _hbp = _hc.get('by_pod_role', pd.DataFrame()) if isinstance(_hc, dict) else pd.DataFrame()
@@ -7180,7 +7259,11 @@ if (
                 _hbp_pnorm = _hbp['POD'].apply(_nhp)
                 for _, _hr in _hbp[_hbp_pnorm == _nhp(_scope)].iterrows():
                     _pod_hc_raw[_hr['Capacity Role']] = int(_hr.get('HC', 0))
-            _base_hc_tot = sum(_pod_hc_raw.values()) or None
+            # Total HC must count only productive roles (exclude 'Other' — managers
+            # are tracked separately in their own row).
+            _base_hc_tot = sum(
+                v for k, v in _pod_hc_raw.items() if k != 'Other'
+            ) or None
             _base_hc_by_role = {
                 'Accountant I':       float(_pod_hc_raw.get('Accountant I', 0)),
                 'Accountant II':      float(_pod_hc_raw.get('Accountant II', 0)),
@@ -7188,6 +7271,13 @@ if (
                 'Sr. Accountant':     float(_pod_hc_raw.get('Sr. Accountant', 0)),
             }
             _base_hc_other = None
+            # Manager count for this POD (key-matching same normalization as by_pod_role lookup)
+            _mgr_by_pod_raw = _hc.get('mgr_by_pod', {}) if isinstance(_hc, dict) else {}
+            _mgr_norm_map = {
+                str(k).lower().replace(' ', '').strip(): int(v)
+                for k, v in _mgr_by_pod_raw.items()
+            }
+            _base_hc_mgr = float(_mgr_norm_map.get(str(_scope).lower().replace(' ', '').strip(), 0))
 
         # ── Scope-specific setup (POD or Sr. Accountant) ─────────────────────
         _pod_clients_lower = set()
@@ -7633,7 +7723,7 @@ if (
             _m_acc2 = float(_base_hc_by_role.get('Accountant II', 0) or 0)      + _net_adj_by_role.get('Accountant II', 0)
             _m_gen  = float(_base_hc_by_role.get('General Accountant', 0) or 0) + _net_adj_by_role.get('General Accountant', 0)
             _m_sr   = float(_base_hc_by_role.get('Sr. Accountant', 0) or 0)     + _net_adj_by_role.get('Sr. Accountant', 0)
-            _m_oth  = float(_base_hc_other or 0)
+            _m_mgr  = float(_base_hc_mgr) if _base_hc_mgr is not None else None
             _m_mrr  = _b_mrr + _mi_new_mrr - _mi_chrn_mrr
 
             _d_tot  = round(_m_tot  - _new_req_tot, 2) if _m_tot  is not None else None
@@ -7692,7 +7782,7 @@ if (
             _scen_rows.setdefault("  · Accountant II (actual)",  {})[_col] = _fmt(_m_acc2, 'fte')
             _scen_rows.setdefault("  · General Acc. (actual)",   {})[_col] = _fmt(_m_gen,  'fte')
             _scen_rows.setdefault("  · Sr. Accountant (actual)", {})[_col] = _fmt(_m_sr,   'fte')
-            _scen_rows.setdefault("  · Other Roles (actual)",    {})[_col] = _fmt(_m_oth,  'fte')
+            _scen_rows.setdefault("  · Managers (actual)",       {})[_col] = _fmt(_m_mgr,  'fte')
             _scen_rows.setdefault("━ HC Δ (Actual − Required)",  {})[_col] = _fmt(_d_tot,  'dec')
             _scen_rows.setdefault("  · Δ Accountant I",          {})[_col] = _fmt(_d_acc1, 'dec')
             _scen_rows.setdefault("  · Δ Accountant II",         {})[_col] = _fmt(_d_acc2, 'dec')
@@ -7741,7 +7831,16 @@ if (
                 (_s4_ptix * _s4_paht * _s4aht_lc).sum() +
                 (_s4_rtix * _s4_raht * _s4aht_lc).sum()
             ) / _s4_tot_tix if _s4_tot_tix > 0 else 0.0
+            # Active client count for this scope this month (PERF: reuse cached masks)
+            _s4_cli_count = 0
+            if _i in _duc_mrr_by_month and not _duc.empty:
+                _sm_c, _em_c, _active_c = _duc_mrr_by_month[_i]
+                if _scope == "Overall":
+                    _s4_cli_count = int(_active_c.sum())
+                elif _pod_clients_lower_set:
+                    _s4_cli_count = int((_active_c & _duc_name_lower.isin(_pod_clients_lower_set)).sum())
             _scen_rows.setdefault("━ Property Count",            {})[_col] = _fmt(_s_prop, 'n')
+            _scen_rows.setdefault("  Client Count",              {})[_col] = _fmt(_s4_cli_count, 'n')
             _scen_rows.setdefault("  Door Count Equivalent",     {})[_col] = _fmt(_s_door, 'n')
             _scen_rows.setdefault("  Tickets to Process",        {})[_col] = _fmt(_s4_proc_tix, 'n')
             _scen_rows.setdefault("  Tickets to Review",         {})[_col] = _fmt(_s4_rev_tix,  'n')
@@ -7857,12 +7956,12 @@ if (
         _s4_groups = {
             "━ Required Hours":           ["  Current Customer Hours", "  Shrinkage (Hrs)", "  (+) New Customer Hours", "  (-) Confirmed Churn (Hrs)", "  (-) Automations", "  (+) Manual Adjustments"],
             "━ Required HC (FTEs)":       ["  · Accountant I", "  · Accountant II", "  · General Accountant", "  · Sr. Accountant"],
-            "━ Actual HC (Report)":       ["  · Accountant I (actual)", "  · Accountant II (actual)", "  · General Acc. (actual)", "  · Sr. Accountant (actual)", "  · Other Roles (actual)"],
+            "━ Actual HC (Report)":       ["  · Accountant I (actual)", "  · Accountant II (actual)", "  · General Acc. (actual)", "  · Sr. Accountant (actual)", "  · Managers (actual)"],
             "━ HC Δ (Actual − Required)": ["  · Δ Accountant I", "  · Δ Accountant II", "  · Δ General Accountant", "  · Δ Sr. Accountant"],
             "━ MRR ($)":                  ["  (+) New MRR ($)", "  (-) Churn MRR ($)", "  Revenue / HC ($)"],
             "━ Cost & Margin":            ["  Capacity Cost ($)", "  Capacity Margin ($)", "  Capacity Margin (%)",
                                            "  Expected Cost ($)", "  Expected Margin ($)", "  Expected Margin (%)"],
-            "━ Property Count":           ["  Door Count Equivalent"],
+            "━ Property Count":           ["  Client Count", "  Door Count Equivalent"],
             "━ Working Days":             ["  Holidays"],
         }
         for _gh in _s4_groups:
