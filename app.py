@@ -2274,6 +2274,63 @@ with st.sidebar.expander("📦 Scenario Manager", expanded=False):
     if "active_scenario" in st.session_state:
         st.caption(f"Active: **{st.session_state.active_scenario['name']}**")
 
+# ── Sidebar scroll forwarder (JS) ────────────────────────────────────────────
+# CSS alone does not fix the "wheel gets trapped on buttons/dividers" issue —
+# we attach a capture-phase wheel listener on the sidebar that manually scrolls
+# the inner container, bypassing any child element that stops propagation.
+import streamlit.components.v1 as _stc_sb_scroll
+_stc_sb_scroll.html("""
+<script>
+(function(){
+    var doc = window.parent.document;
+    if (doc.__capSidebarScrollInit) return;
+
+    function findScrollableAncestor(el, stopAt) {
+        while (el && el !== stopAt) {
+            var cs = window.getComputedStyle(el);
+            if ((cs.overflowY === 'auto' || cs.overflowY === 'scroll')
+                && el.scrollHeight > el.clientHeight + 1) {
+                return el;
+            }
+            el = el.parentElement;
+        }
+        return null;
+    }
+
+    function attach() {
+        var sb = doc.querySelector('section[data-testid="stSidebar"]');
+        if (!sb) { setTimeout(attach, 300); return; }
+        doc.__capSidebarScrollInit = true;
+
+        // Pick the inner scroll container
+        var container = sb.querySelector('[data-testid="stSidebarContent"]')
+                     || sb.querySelector('[data-testid="stSidebarUserContent"]')
+                     || sb.firstElementChild;
+        if (container) {
+            container.style.overflowY = 'auto';
+            container.style.overscrollBehavior = 'contain';
+        }
+
+        sb.addEventListener('wheel', function(ev){
+            var c = doc.querySelector('section[data-testid="stSidebar"] [data-testid="stSidebarContent"]')
+                 || doc.querySelector('section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"]')
+                 || (doc.querySelector('section[data-testid="stSidebar"]') || {}).firstElementChild;
+            // If the wheel originated inside a nested scrollable (e.g. a table),
+            // let the browser handle it normally.
+            var nested = findScrollableAncestor(ev.target, c);
+            if (nested && nested !== c) return;
+            if (c && c.scrollHeight > c.clientHeight + 1) {
+                c.scrollTop += ev.deltaY;
+                ev.preventDefault();
+                ev.stopPropagation();
+            }
+        }, { passive: false, capture: true });
+    }
+    attach();
+})();
+</script>
+""", height=0)
+
 
 # ==========================================
 # INITIAL CONFIGURATION TABS
