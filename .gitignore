@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+*.egg
+
+# Local EXE builds — too large for GitHub
+Local Capacity/
+Local Capacity No Install/
+build/
+dist/
+*.spec
+
+# User data — don't commit personal data
+scenarios/
+params_configs/
+
+# Streamlit cache
+.streamlit/cache/
+
+# IDE / OS
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+# Claude Code internal
+.claude/
+
+# Generated files
+*.html
+_splash_tmp.html
+capacity_online.html
+splash.html
+
+# Icon / launcher (not needed for cloud)
+*.ico
+generate_html.py
+create_icon.py
+build_exe.bat
+launcher.py
+flux_capacitor.spec
+capacity_online.spec
+make_icon.py

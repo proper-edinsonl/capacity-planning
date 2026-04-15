@@ -1,0 +1,8 @@
+streamlit==1.46.1
+pandas
+numpy
+openpyxl
+python-dateutil
+scikit-learn
+xlsxwriter
+Pillow
