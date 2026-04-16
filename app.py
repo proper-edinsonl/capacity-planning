@@ -3007,40 +3007,19 @@ with tab1:
                             f"⚠️ **{_n_ob_w_data} of these client(s)** already have hours in the input file. "
                             "Select below to queue them for AI prediction (their existing hours are shown for reference)."
                         )
-                        _prev_rep          = st.session_state.get('_ob_replace_set', set())
-                        _clients_w_data_l  = _ob_disp_df[_has_data_m]['Client'].tolist()
-                        _all_sel_now       = (
-                            len(_clients_w_data_l) > 0 and
-                            all(c in _prev_rep for c in _clients_w_data_l)
+                        _clients_w_data_l = _ob_disp_df[_has_data_m]['Client'].tolist()
+                        # Use multiselect — avoids per-render session_state writes
+                        # that caused React error #185 (infinite update loop)
+                        _cur_rep_list = st.multiselect(
+                            "🔄 Select clients to replace with AI Prediction:",
+                            options=_clients_w_data_l,
+                            default=_clients_w_data_l,
+                            key="_ob_replace_multiselect",
                         )
-
-                        # ── Select All checkbox ───────────────────────────────────────
-                        _chk_all = st.checkbox(
-                            f"☑️ Select All ({len(_clients_w_data_l)} clients)",
-                            value=_all_sel_now,
-                            key="_ob_select_all_chk",
-                        )
-                        # When Select All is toggled, force all individual checkbox states
-                        if _chk_all != _all_sel_now:
-                            for _c in _clients_w_data_l:
-                                st.session_state[f"_ob_rep_{abs(hash(_c)) % 999983}"] = _chk_all
-                            st.session_state['_ob_replace_set'] = (
-                                set(_clients_w_data_l) if _chk_all else set()
-                            )
-
-                        st.divider()
-                        _cur_rep = set()
-                        for _, _ob_r in _ob_disp_df[_has_data_m].iterrows():
-                            _cn2 = _ob_r['Client']
-                            if st.checkbox(
-                                f"🔄 Replace **{_cn2}** — current data: "
-                                f"{_ob_r['Proc Hrs']:.1f} proc hrs + {_ob_r['Rev Hrs']:.1f} rev hrs "
-                                f"= **{_ob_r['Total Hrs']:.1f} total hrs**",
-                                key=f"_ob_rep_{abs(hash(_cn2)) % 999983}",
-                                value=(_cn2 in _prev_rep),
-                            ):
-                                _cur_rep.add(_cn2)
-                        st.session_state['_ob_replace_set'] = _cur_rep
+                        _cur_rep = set(_cur_rep_list)
+                        # Keep _ob_replace_set in sync (only write when value changes)
+                        if _cur_rep != st.session_state.get('_ob_replace_set', set()):
+                            st.session_state['_ob_replace_set'] = _cur_rep
 
                         if _cur_rep:
                             if st.button(
