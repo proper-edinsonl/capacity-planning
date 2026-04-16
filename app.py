@@ -2058,6 +2058,200 @@ section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
 st.title("📊 Capacity Planning & FTE Projections")
 st.markdown("Operational projection integrating learning curves, automations, financial savings, and cascade adjustments.")
 
+# ── GLOSSARY OVERLAY ──────────────────────────────────────────────────────────
+if st.session_state.get('_show_glossary', False):
+    # ── Define all glossary entries ──────────────────────────────────────────
+    _GLOSSARY = [
+        # ── GENERAL ──────────────────────────────────────────────────────────
+        ("General", "Network Days",
+         "Working days in the selected period (Mon–Fri, excluding configured holidays).",
+         "=NETWORKDAYS(start, end) − holidays"),
+        ("General", "Base Month",
+         "The reference month from which projections are calculated.",
+         "User-selected in Global Parameters"),
+        ("General", "FTE (Full-Time Equivalent)",
+         "Represents one full-time employee's monthly workload.",
+         "Final Hours ÷ (Network Days × 7.5 hrs/day)"),
+        ("General", "AHT (Average Handle Time)",
+         "Average minutes to process or review one ticket/task.",
+         "Σ(time per closed ticket) ÷ count of closed tickets"),
+        ("General", "MRR (Monthly Recurring Revenue)",
+         "Monthly revenue collected from a client.",
+         "From volume file / HubSpot CRM"),
+
+        # ── HEADCOUNT ────────────────────────────────────────────────────────
+        ("Headcount (HC)", "Active HC",
+         "Employees with Worker Status = 'Active' in the HC Weekly Report.",
+         "HC file: Worker Status == 'Active'"),
+        ("Headcount (HC)", "Productive Roles",
+         "Roles counted toward billable/productive capacity: Accountant I, II, General Accountant, Sr. Accountant.",
+         "Excludes Assistant Manager and Accounting Manager"),
+        ("Headcount (HC)", "Manager Roles",
+         "Assistant Manager and Accounting Manager — tracked separately, not in productive headcount.",
+         "HC file: Job Title contains 'Manager'"),
+        ("Headcount (HC)", "Direct Reports",
+         "Active productive employees whose Manager Email = Sr. Accountant's Work Email.",
+         "HC file: COUNT WHERE Manager Email = Sr. Email AND Worker Status = 'Active'"),
+        ("Headcount (HC)", "Attrited",
+         "Employees no longer active. Shown in Employee Level tab with '- Alert Relocate' suffix.",
+         "HC file: Worker Status ≠ 'Active'"),
+        ("Headcount (HC)", "Tenure",
+         "Time elapsed since the employee's Start Date in the HC file.",
+         "TODAY() − Start Date → formatted as X Yrs, X Mo, X Days"),
+
+        # ── CAPACITY ─────────────────────────────────────────────────────────
+        ("Capacity", "Capacity Processing Hours",
+         "Hours assigned to processing tasks for a client in the volume file.",
+         "Volume file column: 'Capacity Processing Hours'  (processor = employee email, col D)"),
+        ("Capacity", "Capacity Reviewing Hours",
+         "Hours assigned to reviewing / QA tasks for a client in the volume file.",
+         "Volume file column: 'Capacity reviewing hours'  (reviewer = employee email, col F)"),
+        ("Capacity", "Productive Hours",
+         "Total billable client-facing hours for an employee or client.",
+         "= Capacity Processing Hours + Capacity Reviewing Hours"),
+        ("Capacity", "Base Hours",
+         "Projected required hours before any cascade adjustments are applied.",
+         "= (Closed Tickets × AHT) ÷ 60  ×  shrinkage factor"),
+        ("Capacity", "Shrinkage",
+         "Difference between Base Hours and Productive Hours — accounts for non-billable activity within capacity.",
+         "= Base Hours − Productive Hours"),
+        ("Capacity", "Final Hours",
+         "Net required hours after all cascade adjustments (automations, new clients, churn, manual).",
+         "= Base Hours − Auto Savings − Churn + New Clients + Adj(+) − Adj(−)"),
+        ("Capacity", "Final FTEs",
+         "Number of full-time equivalents needed to cover Final Hours.",
+         "= Final Hours ÷ (Network Days × 7.5)"),
+
+        # ── WATERFALL / CASCADE ───────────────────────────────────────────────
+        ("Waterfall", "Automation Savings (Hrs)",
+         "Hours eliminated through confirmed process automations.",
+         "= Base Hours × automation reduction %  (confirmed rows only)"),
+        ("Waterfall", "New Customer Hours",
+         "Additional hours for clients whose Go Live date falls in the projection month.",
+         "= Σ Base Hours of clients with Go Live in month M"),
+        ("Waterfall", "Confirmed Churn (Hrs)",
+         "Hours removed for clients whose Final Service Date falls in the projection month.",
+         "= Σ Base Hours of clients with FSD in month M"),
+        ("Waterfall", "Manual Adjustments (+/−)",
+         "Ad-hoc hour additions or reductions confirmed by the user in Step 2.",
+         "User-entered and confirmed in Step 2 — Efficiency Initiatives"),
+        ("Waterfall", "Cost Saving ($)",
+         "Dollar value of hours saved through automations.",
+         "= (Auto Saving Hrs ÷ FTE Hours) × Role Monthly Cost"),
+
+        # ── SR. RATIOS ────────────────────────────────────────────────────────
+        ("Sr. Ratios", "Total Hours",
+         "Gross available hours for the Sr. Accountant in the period.",
+         "= 7.5 hrs/day × Network Days"),
+        ("Sr. Ratios", "Ops Rhythm Hours",
+         "Hours consumed by operational activities (meetings, 1:1s, SOP reviews, etc.).",
+         "= (35.0 fixed + 1.5 × Direct Reports) × (Network Days ÷ 20)\n"
+         "Fixed (35 hrs/month base): Morning dashboard (8.3) + EOD review (5.0) + "
+         "Weekly metrics (5.3) + Weekly team meeting (8.0) + Bi-weekly AM review (8.0) + Quarterly QBR (0.3)\n"
+         "Variable: 1:1 per DR = 0.5 hr/DR/month · SOP review per DR = 1.0 hr/DR/month"),
+        ("Sr. Ratios", "Productive Capacity",
+         "Hours available for client work after ops rhythm obligations are subtracted.",
+         "= Total Hours − Ops Rhythm Hours"),
+        ("Sr. Ratios", "Remaining Hours",
+         "Unused productive capacity after actual client hours are accounted for.",
+         "= Productive Capacity − Productive Hours"),
+        ("Sr. Ratios", "% Remaining",
+         "Proportion of productive capacity still available.",
+         "= (Remaining Hours ÷ Productive Capacity) × 100"),
+        ("Sr. Ratios", "Status — 🟢 Available",
+         "Sr. has meaningful capacity headroom.",
+         "% Remaining > +7%"),
+        ("Sr. Ratios", "Status — ✅ On Track",
+         "Sr. is within the healthy utilisation band.",
+         "−7% ≤ % Remaining ≤ +7%"),
+        ("Sr. Ratios", "Status — 🔴 Potential Burnout",
+         "Client hours exceed productive capacity — Sr. lacks time to cover all activities.",
+         "% Remaining < −7%"),
+        ("Sr. Ratios", "Ideal Direct Reports",
+         "Target range for healthy team span-of-control.",
+         "7 – 9 direct reports"),
+        ("Sr. Ratios", "Ideal Clients Assigned",
+         "Target range for manageable client portfolio per Sr.",
+         "3 – 5 clients"),
+
+        # ── RECONCILIATION ────────────────────────────────────────────────────
+        ("Reconciliation", "In Both",
+         "Client exists in both the volume file and HubSpot — data is reconciled.",
+         "MATCH on normalised client name (lowercase, trimmed whitespace)"),
+        ("Reconciliation", "Only in HubSpot",
+         "Client found in HubSpot CRM but absent from the volume file.",
+         "Active lifecycle + has POD + not in volume file baseline"),
+        ("Reconciliation", "Only in Volume",
+         "Client found in the volume file but absent from HubSpot.",
+         "In volume baseline + not matched to any active HubSpot record"),
+        ("Reconciliation", "Lifecycle Status",
+         "HubSpot field indicating client relationship stage (Client, Onboarding, etc.). "
+         "Churn/blank/NA statuses are excluded from reconciliation.",
+         "HubSpot CRM export field"),
+
+        # ── FINANCIAL ────────────────────────────────────────────────────────
+        ("Financial", "Margin ($)",
+         "Revenue minus team cost for a client or Sr. portfolio.",
+         "= MRR − (Σ Role FTEs × Role Monthly Cost)"),
+        ("Financial", "Margin (%)",
+         "Margin as a percentage of MRR.",
+         "= (Margin $ ÷ MRR) × 100"),
+        ("Financial", "Revenue per FTE",
+         "MRR divided by total FTEs serving that client / Sr. portfolio.",
+         "= MRR ÷ Total FTEs"),
+    ]
+
+    _gl_df = pd.DataFrame(_GLOSSARY, columns=["Section", "Term", "Definition", "Formula / Source"])
+
+    with st.expander("❓ Help & Glossary — All Terms, Formulas & Calculations", expanded=True):
+        # Section filter
+        _gl_sections = ["All"] + sorted(_gl_df["Section"].unique().tolist())
+        _gl_sec_sel  = st.selectbox("Filter by section", _gl_sections, key="_gl_sec_sel")
+        _gl_view     = _gl_df if _gl_sec_sel == "All" else _gl_df[_gl_df["Section"] == _gl_sec_sel]
+
+        st.dataframe(
+            _gl_view,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Section":         st.column_config.TextColumn("Section",          width="small"),
+                "Term":            st.column_config.TextColumn("Term",             width="medium"),
+                "Definition":      st.column_config.TextColumn("Definition",       width="large"),
+                "Formula / Source":st.column_config.TextColumn("Formula / Source", width="large"),
+            }
+        )
+
+        # ── Export to Excel ──────────────────────────────────────────────────
+        _gl_buf = BytesIO()
+        with pd.ExcelWriter(_gl_buf, engine='openpyxl') as _gl_xw:
+            _gl_df.to_excel(_gl_xw, sheet_name='Glossary', index=False)
+            _ws = _gl_xw.sheets['Glossary']
+            # Column widths
+            for _col, _w in zip(['A','B','C','D'], [18, 28, 60, 60]):
+                _ws.column_dimensions[_col].width = _w
+            # Header bold
+            from openpyxl.styles import Font, PatternFill, Alignment
+            _hdr_fill = PatternFill("solid", fgColor="1F3864")
+            for _cell in _ws[1]:
+                _cell.font      = Font(bold=True, color="FFFFFF")
+                _cell.fill      = _hdr_fill
+                _cell.alignment = Alignment(wrap_text=True)
+            # Body wrap
+            for _row in _ws.iter_rows(min_row=2):
+                for _cell in _row:
+                    _cell.alignment = Alignment(wrap_text=True, vertical='top')
+
+        st.download_button(
+            label="📥 Download Glossary (.xlsx)",
+            data=_gl_buf.getvalue(),
+            file_name="Capacity_Planning_Glossary.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="_gl_download",
+        )
+        if st.button("✕ Close", key="_gl_close"):
+            st.session_state['_show_glossary'] = False
+            st.rerun()
+
 # ── Sidebar — quick-jump navigation ───────────────────────────────────────────
 with st.sidebar:
     st.markdown("## Navigation")
@@ -2315,6 +2509,11 @@ holidays_per_month = {mes: 0 for mes in meses_proyeccion}
 if st.sidebar.button("🔄 Start Over", use_container_width=True, key="start_over_btn"):
     st.session_state.clear()
     st.rerun()
+
+# ── HELP / GLOSSARY ──────────────────────────────────────────────────────────
+st.sidebar.divider()
+if st.sidebar.button("❓ Help & Glossary", use_container_width=True, key="_help_btn"):
+    st.session_state['_show_glossary'] = not st.session_state.get('_show_glossary', False)
 
 # ── SIDEBAR COLLAPSE HINT ────────────────────────────────────────────────────
 st.sidebar.markdown(
