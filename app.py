@@ -7616,11 +7616,31 @@ if (
                 # Fallback: full pod list (no cascade data yet)
                 _s4_lista_pods = lista_pods or st.session_state.get('_lista_pods', [])
 
+            # ── Respect sidebar POD / Sr. filters ───────────────────────────
+            # When a POD or Sr. filter is active from Data Load & Filters,
+            # "Overall" is not meaningful — only show the matching scope(s).
+            _s4_filt_pods = st.session_state.get('_filt_pods', [])
+            _s4_filt_srs  = st.session_state.get('_filt_srs',  [])
+            if _s4_filt_pods:
+                _s4_scope_opts = [p for p in _s4_lista_pods if p in _s4_filt_pods] or _s4_lista_pods
+                _s4_scope_hint = "Filtered to selected POD(s) from sidebar"
+            elif _s4_filt_srs:
+                _s4_scope_opts = [s for s in _lista_srs_s4 if s in _s4_filt_srs] or _lista_srs_s4
+                _s4_scope_hint = "Filtered to selected Sr. Accountant(s) from sidebar"
+            else:
+                _s4_scope_opts = ["Overall"] + _s4_lista_pods + (_lista_srs_s4 if _lista_srs_s4 else [])
+                _s4_scope_hint = "Select Overall, a specific POD, or a Sr. Accountant to scope the scenario"
+
+            # If the previously stored scope is no longer valid (e.g. filter changed), reset it
+            _s4_cur_scope = st.session_state.get('s4v2_scope', _s4_scope_opts[0])
+            if _s4_cur_scope not in _s4_scope_opts:
+                st.session_state['s4v2_scope'] = _s4_scope_opts[0]
+
             _scope = st.selectbox(
                 "📊 Scope",
-                ["Overall"] + _s4_lista_pods + (_lista_srs_s4 if _lista_srs_s4 else []),
+                _s4_scope_opts,
                 key="s4v2_scope",
-                help="Select Overall, a specific POD, or a Sr. Accountant to scope the scenario"
+                help=_s4_scope_hint,
             )
             # Determine scope type
             _scope_is_pod = _scope in _s4_lista_pods
@@ -8132,9 +8152,23 @@ if (
                     _b_base = _rb_sum_cache.get(_cbase, _b_curr)
                     _b_ap   = _rb_sum_cache.get(_cplus, 0.0)
                     _b_am   = _rb_sum_cache.get(_cmins, 0.0)
-                # Productive hours (no shrinkage) from scoped data
+                # Productive hours (no shrinkage) from scoped data.
+                # If the column doesn't exist in _cli_df, derive from base hours ÷ shrinkage
+                # so productivity reads the correct utilization target instead of 100%.
                 _cprod_s4 = f"M{_i+1} ({_ms}) - Productive Hours"
-                _b_prod = _rb_sum_cache.get(_cprod_s4, _b_curr)
+                _b_prod_raw = _rb_sum_cache.get(_cprod_s4)
+                if _b_prod_raw is not None:
+                    _b_prod = _b_prod_raw
+                else:
+                    # productive_hrs = base_hrs / shrink_factor  (shrink = 2-util+abs+att)
+                    _b_prod = sum(
+                        _s4_base_hrs_role.get(_rl, [0.0]*6)[_i] / max(_shrink_cache.get(_rl, 1.0), 0.01)
+                        for _rl in roles_permitidos
+                    )
+                # Recalculate _b_base from role breakdown to keep consistent with _b_prod
+                _b_base_from_roles = sum(_s4_base_hrs_role.get(_rl, [0.0]*6)[_i] for _rl in roles_permitidos)
+                if _b_base_from_roles > 0:
+                    _b_base = _b_base_from_roles
                 _b_new  = _fd.get('pod_new_hrs',   {}).get(_ms, {}).get(_scope, 0.0)
                 _b_chrn = _fd.get('pod_churn',     {}).get(_ms, {}).get(_scope, 0.0)
                 _b_newm = _fd.get('pod_new_mrr',   {}).get(_ms, {}).get(_scope, 0.0)
