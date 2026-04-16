@@ -8229,6 +8229,20 @@ if "calc_data" in st.session_state:
                         .sort_values(_fte_id_cols)
                         .reset_index(drop=True)
                     )
+                    # Inject current MRR from client_master_map (includes HubSpot overrides)
+                    _cmap_exp = st.session_state.get('client_master_map', pd.DataFrame())
+                    _mrr_lkp  = {}
+                    if not _cmap_exp.empty and 'client_name' in _cmap_exp.columns and 'mrr' in _cmap_exp.columns:
+                        _mrr_lkp = dict(zip(
+                            _cmap_exp['client_name'].astype(str).str.lower().str.strip(),
+                            pd.to_numeric(_cmap_exp['mrr'], errors='coerce').fillna(0.0)
+                        ))
+                    if 'Client' in _cli_fte_df.columns:
+                        _cli_fte_df.insert(
+                            _cli_fte_df.columns.get_loc('Client') + 1,
+                            'MRR ($)',
+                            _cli_fte_df['Client'].astype(str).str.lower().str.strip().map(_mrr_lkp).fillna(0.0)
+                        )
                     # Rename columns: "M1 (Jan 2026) - Final FTEs" → "M1 FTEs", etc.
                     _fte_rename = {}
                     for _c in _fte_m_cols:
@@ -10222,6 +10236,12 @@ if (
                         _cfte_s4 = (_cli_fte_s4[_fte_id_s4 + _fte_mc_s4 + _fte_hc_s4]
                                     .groupby(_fte_id_s4, as_index=False)[_fte_mc_s4 + _fte_hc_s4].sum()
                                     .sort_values(_fte_id_s4).reset_index(drop=True))
+                        _cmap_s4 = st.session_state.get('client_master_map', pd.DataFrame())
+                        _mrr_s4  = {}
+                        if not _cmap_s4.empty and 'client_name' in _cmap_s4.columns and 'mrr' in _cmap_s4.columns:
+                            _mrr_s4 = dict(zip(_cmap_s4['client_name'].astype(str).str.lower().str.strip(), pd.to_numeric(_cmap_s4['mrr'], errors='coerce').fillna(0.0)))
+                        if 'Client' in _cfte_s4.columns:
+                            _cfte_s4.insert(_cfte_s4.columns.get_loc('Client') + 1, 'MRR ($)', _cfte_s4['Client'].astype(str).str.lower().str.strip().map(_mrr_s4).fillna(0.0))
                         _cfte_s4.rename(columns={c: c.replace('- Final FTEs', 'FTEs').replace('- Final Hours', 'Hrs') for c in _fte_mc_s4 + _fte_hc_s4}, inplace=True)
                         _cfte_s4.to_excel(_xw, sheet_name='Client_FTEs_by_Month', index=False)
                 # Scenario inputs
@@ -10291,6 +10311,12 @@ if (
                         _cfte_all = (_cli_fte_all[_fte_id_all + _fte_mc_all + _fte_hc_all]
                                      .groupby(_fte_id_all, as_index=False)[_fte_mc_all + _fte_hc_all].sum()
                                      .sort_values(_fte_id_all).reset_index(drop=True))
+                        _cmap_all = st.session_state.get('client_master_map', pd.DataFrame())
+                        _mrr_all  = {}
+                        if not _cmap_all.empty and 'client_name' in _cmap_all.columns and 'mrr' in _cmap_all.columns:
+                            _mrr_all = dict(zip(_cmap_all['client_name'].astype(str).str.lower().str.strip(), pd.to_numeric(_cmap_all['mrr'], errors='coerce').fillna(0.0)))
+                        if 'Client' in _cfte_all.columns:
+                            _cfte_all.insert(_cfte_all.columns.get_loc('Client') + 1, 'MRR ($)', _cfte_all['Client'].astype(str).str.lower().str.strip().map(_mrr_all).fillna(0.0))
                         _cfte_all.rename(columns={c: c.replace('- Final FTEs', 'FTEs').replace('- Final Hours', 'Hrs') for c in _fte_mc_all + _fte_hc_all}, inplace=True)
                         _cfte_all.to_excel(_xw_all, sheet_name='3_Client_FTEs_by_Month', index=False)
                 # ── Step 2 inputs ─────────────────────────────────────────────
