@@ -3773,10 +3773,12 @@ if "calc_data" in st.session_state:
 
         # ── D. Onboarding New Clients ─────────────────────────────────────
         # Any HubSpot client not in baseline — exclude Churn and blank lifecycle
-        _ob_lc_excl = {'churn', 'churned', '—', '', 'none', 'nan'}
+        _ob_lc_blank = {'—', '', 'none', 'nan'}
+        _ob_lc_norm  = _df_hs_view['_lifecycle'].astype(str).str.lower().str.strip()
         _df_onboard = _df_hs_view[
             ~_df_hs_view['client_name'].str.lower().str.strip().isin(_baseline_clients) &
-            ~_df_hs_view['_lifecycle'].astype(str).str.lower().str.strip().isin(_ob_lc_excl) &
+            ~_ob_lc_norm.str.startswith('churn') &
+            ~_ob_lc_norm.isin(_ob_lc_blank) &
             _df_hs_view['_lifecycle'].astype(str).str.strip().ne('')
         ].copy()
 
