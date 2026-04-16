@@ -2939,11 +2939,12 @@ with tab1:
             # is active before deciding to add / replace these clients.
             _today_ts   = pd.Timestamp.today().normalize()
             _ci_m       = {c.strip().lower(): c for c in df_temp.columns}
-            _st_col_r   = _ci_m.get('status')
-            _gl_col_r   = _ci_m.get('go live')
-            _pod_col_r  = _ci_m.get('pod')
-            _pms_col_r  = _ci_m.get('pms')
-            _mrr_col_r  = _ci_m.get('mrr')
+            # Use substring match (like the pipeline) so columns like "Client Status" are found
+            _st_col_r   = _ci_m.get('status') or next((v for k, v in _ci_m.items() if 'status' in k), None)
+            _gl_col_r   = _ci_m.get('go live') or next((v for k, v in _ci_m.items() if 'go live' in k), None)
+            _pod_col_r  = _ci_m.get('pod')     or next((v for k, v in _ci_m.items() if k.startswith('pod')), None)
+            _pms_col_r  = _ci_m.get('pms')     or next((v for k, v in _ci_m.items() if 'pms' in k), None)
+            _mrr_col_r  = _ci_m.get('mrr')     or next((v for k, v in _ci_m.items() if 'mrr' in k), None)
 
             _ob_grp_agg = {}
             for _oc in [_st_col_r, _gl_col_r, _pod_col_r, _pms_col_r, _mrr_col_r]:
@@ -2996,6 +2997,14 @@ with tab1:
                     _rev  = float(_r['Capacity reviewing hours'])  if 'Capacity reviewing hours'  in _r.index and pd.notna(_r['Capacity reviewing hours'])  else 0.0
                     _tot  = _proc + _rev
                     _st_v = str(_r[_st_col_r] or '') if _st_col_r and pd.notna(_r.get(_st_col_r)) else ''
+                    # If still blank, try HubSpot lifecycle; fallback to 'Onboarding'
+                    if not _st_v or _st_v.lower() in ('nan', 'none', '—'):
+                        _hs_p = st.session_state.get('hs_parsed')
+                        if _hs_p is not None and not _hs_p.empty and '_lifecycle' in _hs_p.columns:
+                            _hs_m = _hs_p[_hs_p['client_name'].astype(str).str.lower().str.strip() == _cn.lower().strip()]
+                            _st_v = str(_hs_m.iloc[0]['_lifecycle']) if not _hs_m.empty else 'Onboarding'
+                        else:
+                            _st_v = 'Onboarding'
                     _gl_v = _r[_gl_col_r] if _gl_col_r else pd.NaT
                     _gl_s = pd.to_datetime(_gl_v, errors='coerce')
                     _gl_str = _gl_s.strftime('%Y-%m-%d') if pd.notna(_gl_s) else '—'
