@@ -3564,101 +3564,114 @@ if "calc_data" in st.session_state:
                 st.dataframe(_term_disp, use_container_width=True, hide_index=True)
 
         # ── C. Reconciliation Table ───────────────────────────────────────
-        _baseline_clients = set(c.lower() for c in st.session_state.calc_data.get('clientes_validos', []))
-        _hs_clients_lower = _df_hs['client_name'].str.lower().str.strip()
+        # Normalize helper: lower + collapse all internal whitespace
+        def _norm_name(n):
+            return ' '.join(str(n).lower().split())
+
+        _baseline_clients_raw = st.session_state.calc_data.get('clientes_validos', [])
+        # Build normalized → original name map for volume clients
+        _vol_norm_map = {_norm_name(c): c for c in _baseline_clients_raw}
+        _baseline_clients = set(_vol_norm_map.keys())   # normalized keys
+
+        # Filter HubSpot to active clients only:
+        # - lifecycle must not start with 'churn'
+        # - lifecycle must not be blank / none / nan / —
+        # - must have a POD assigned
+        _hs_lc_norm = _df_hs['_lifecycle'].astype(str).str.lower().str.strip()
+        _hs_active_mask = (
+            ~_hs_lc_norm.str.startswith('churn') &
+            ~_hs_lc_norm.isin({'', 'none', 'nan', '—'}) &
+            _df_hs['_pod'].astype(str).str.strip().ne('') &
+            ~_df_hs['_pod'].astype(str).str.strip().isin({'nan', 'None', '—'})
+        )
+        _df_hs_active = _df_hs[_hs_active_mask].copy()
+        _df_hs_active['_name_norm'] = _df_hs_active['client_name'].apply(_norm_name)
+
+        # Build normalized name set for active HubSpot clients
+        _hs_norm_set = set(_df_hs_active['_name_norm'].values)
 
         # Get current client data from session state
         _df_curr = st.session_state.get('df_clients_unique', pd.DataFrame())
         _curr_map = {}
         if not _df_curr.empty and 'client_name' in _df_curr.columns:
             for _, _cr in _df_curr.iterrows():
-                _curr_map[str(_cr['client_name']).lower().strip()] = _cr
+                _curr_map[_norm_name(_cr['client_name'])] = _cr
 
         # Build reconciliation rows
         if st.session_state.get('hs_recon_df') is None:
             _recon_rows = []
-            for _, _hr in _df_hs.iterrows():
-                _hname_low = _hr['client_name'].lower().strip()
-                if _hname_low in _baseline_clients:
-                    _cur = _curr_map.get(_hname_low, {})
-                    _cur_mrr   = float(_cur.get('MRR', 0)) if hasattr(_cur, 'get') else 0.0
-                    _cur_gl    = _cur.get('Go Live', pd.NaT)    if hasattr(_cur, 'get') else pd.NaT
-                    _cur_fsd   = _cur.get('Final Service Date', pd.NaT) if hasattr(_cur, 'get') else pd.NaT
-                    # POD: current from master map, new from HubSpot
-                    _cmap_now  = st.session_state.get('client_master_map', pd.DataFrame())
-                    _cur_pod   = ''
-                    if not _cmap_now.empty:
-                        _pm = _cmap_now[_cmap_now['client_key'] == _hname_low]
-                        _cur_pod = str(_pm['pod'].iloc[0]).strip() if not _pm.empty else ''
-                    if not _cur_pod or _cur_pod.lower() in ('nan', 'none', ''):
-                        _cur_pod = str(_cur.get('POD', '') or '').strip() if hasattr(_cur, 'get') else ''
-                    _hs_pod    = str(_hr.get('_pod', '') or '').strip()
-                    _new_mrr   = float(_hr['_mrr']) if pd.notna(_hr['_mrr']) else _cur_mrr
-                    _new_gl    = _hr['_start_date'].strftime('%Y-%m-%d') if pd.notna(_hr['_start_date']) else (
-                                     _cur_gl.strftime('%Y-%m-%d') if pd.notna(_cur_gl) else '')
-                    _new_fsd   = _hr['_fsd'].strftime('%Y-%m-%d') if pd.notna(_hr['_fsd']) else ''
-                    _pod_diff  = bool(_hs_pod) and _hs_pod.lower() != _cur_pod.lower()
-                    _has_diff  = abs(_new_mrr - _cur_mrr) > 0.01 or (
-                                     pd.notna(_hr['_start_date']) and pd.notna(_cur_gl) and
-                                     _hr['_start_date'].date() != pd.Timestamp(_cur_gl).date()
-                                 ) or bool(_new_fsd) or _pod_diff
-                    _recon_rows.append({
-                        'Apply':           _has_diff,
-                        'Client':          _hr['client_name'],
-                        'Current POD':     _cur_pod or '—',
-                        'New POD':         _hs_pod or _cur_pod or '',
-                        'Status':          'Matched',
-                        'Lifecycle':       _hr['_lifecycle'],
-                        'Terminating':     bool(_hr['_is_terminating']),
-                        'Current MRR ($)': _cur_mrr,
-                        'New MRR ($)':     _new_mrr,
-                        'Current Start Date': str(_cur_gl.date()) if pd.notna(_cur_gl) else '',
-                        'New Start Date':  _new_gl,
-                        'Final Svc Date':  _new_fsd,
-                    })
-            # Baseline clients not in HubSpot
-            for _bc in st.session_state.calc_data.get('clientes_validos', []):
-                if _bc.lower().strip() not in set(_hs_clients_lower.values):
-                    _bc_cur = _curr_map.get(_bc.lower().strip(), {})
+            _recon_seen = set()   # track normalized names already added
+
+            # ── Pass 1: all active HubSpot clients ───────────────────────
+            for _, _hr in _df_hs_active.iterrows():
+                _hname_norm = _hr['_name_norm']
+                _recon_seen.add(_hname_norm)
+                _in_vol = _hname_norm in _baseline_clients
+                _status = 'In Both' if _in_vol else 'Only in HubSpot'
+
+                _cur     = _curr_map.get(_hname_norm, {})
+                _cur_mrr = float(_cur.get('MRR', 0)) if hasattr(_cur, 'get') else 0.0
+                _cur_gl  = _cur.get('Go Live', pd.NaT) if hasattr(_cur, 'get') else pd.NaT
+                _cur_fsd = _cur.get('Final Service Date', pd.NaT) if hasattr(_cur, 'get') else pd.NaT
+
+                _cmap_now = st.session_state.get('client_master_map', pd.DataFrame())
+                _cur_pod  = ''
+                if not _cmap_now.empty:
+                    _pm = _cmap_now[_cmap_now['client_key'] == _hname_norm]
+                    _cur_pod = str(_pm['pod'].iloc[0]).strip() if not _pm.empty else ''
+                if not _cur_pod or _cur_pod.lower() in ('nan', 'none', ''):
+                    _cur_pod = str(_cur.get('POD', '') or '').strip() if hasattr(_cur, 'get') else ''
+
+                _hs_pod  = str(_hr.get('_pod', '') or '').strip()
+                _new_mrr = float(_hr['_mrr']) if pd.notna(_hr['_mrr']) else _cur_mrr
+                _new_gl  = _hr['_start_date'].strftime('%Y-%m-%d') if pd.notna(_hr['_start_date']) else (
+                               _cur_gl.strftime('%Y-%m-%d') if pd.notna(_cur_gl) else '')
+                _new_fsd = _hr['_fsd'].strftime('%Y-%m-%d') if pd.notna(_hr['_fsd']) else ''
+                _pod_diff = bool(_hs_pod) and _hs_pod.lower() != _cur_pod.lower()
+                _has_diff = (_status != 'In Both') or abs(_new_mrr - _cur_mrr) > 0.01 or (
+                                pd.notna(_hr['_start_date']) and pd.notna(_cur_gl) and
+                                _hr['_start_date'].date() != pd.Timestamp(_cur_gl).date()
+                            ) or bool(_new_fsd) or _pod_diff
+
+                _recon_rows.append({
+                    'Apply':              _has_diff,
+                    'Client':             _hr['client_name'],
+                    'Current POD':        _cur_pod or '—',
+                    'New POD':            _hs_pod or _cur_pod or '',
+                    'Status':             _status,
+                    'Lifecycle':          _hr['_lifecycle'],
+                    'Terminating':        bool(_hr['_is_terminating']),
+                    'Current MRR ($)':    _cur_mrr,
+                    'New MRR ($)':        _new_mrr,
+                    'Current Start Date': str(_cur_gl.date()) if pd.notna(_cur_gl) else '',
+                    'New Start Date':     _new_gl,
+                    'Final Svc Date':     _new_fsd,
+                })
+
+            # ── Pass 2: volume clients not in active HubSpot ─────────────
+            for _bc in _baseline_clients_raw:
+                _bc_norm = _norm_name(_bc)
+                if _bc_norm not in _recon_seen:
+                    _bc_cur = _curr_map.get(_bc_norm, {})
                     _bc_pod = str(_bc_cur.get('POD', '') or '').strip() if hasattr(_bc_cur, 'get') else ''
+                    _bc_mrr = float(_bc_cur.get('MRR', 0)) if hasattr(_bc_cur, 'get') else 0.0
+                    _bc_gl  = _bc_cur.get('Go Live', pd.NaT) if hasattr(_bc_cur, 'get') else pd.NaT
+                    _bc_fsd = _bc_cur.get('Final Service Date', pd.NaT) if hasattr(_bc_cur, 'get') else pd.NaT
                     _recon_rows.append({
-                        'Apply':           False,
-                        'Client':          _bc,
-                        'Current POD':     _bc_pod or '—',
-                        'New POD':         _bc_pod or '',
-                        'Status':          'Not in HubSpot',
-                        'Lifecycle':       '—',
-                        'Terminating':     False,
-                        'Current MRR ($)': float(_bc_cur.get('MRR', 0)) if hasattr(_bc_cur, 'get') else 0.0,
-                        'New MRR ($)':     float(_bc_cur.get('MRR', 0)) if hasattr(_bc_cur, 'get') else 0.0,
-                        'Current Start Date': '',
-                        'New Start Date':  '',
-                        'Final Svc Date':  '',
+                        'Apply':              False,
+                        'Client':             _bc,
+                        'Current POD':        _bc_pod or '—',
+                        'New POD':            _bc_pod or '',
+                        'Status':             'Only in Volume',
+                        'Lifecycle':          '—',
+                        'Terminating':        False,
+                        'Current MRR ($)':    _bc_mrr,
+                        'New MRR ($)':        _bc_mrr,
+                        'Current Start Date': str(_bc_gl.date()) if pd.notna(_bc_gl) else '',
+                        'New Start Date':     '',
+                        'Final Svc Date':     str(_bc_fsd.date()) if pd.notna(_bc_fsd) else '',
                     })
-            # HubSpot clients not in baseline at all — show as "New in HubSpot"
-            # These are clients that exist in HubSpot but were never in the master DB/upload.
-            # Vertus-type case: lifecycle = "Client" but not yet in baseline.
-            for _, _hr in _df_hs.iterrows():
-                _hname_low = _hr['client_name'].lower().strip()
-                if _hname_low not in _baseline_clients:
-                    _hs_pod  = str(_hr.get('_pod', '') or '').strip()
-                    _hs_mrr  = float(_hr['_mrr']) if pd.notna(_hr['_mrr']) else 0.0
-                    _new_gl  = _hr['_start_date'].strftime('%Y-%m-%d') if pd.notna(_hr['_start_date']) else ''
-                    _new_fsd = _hr['_fsd'].strftime('%Y-%m-%d') if pd.notna(_hr['_fsd']) else ''
-                    _recon_rows.append({
-                        'Apply':           False,
-                        'Client':          _hr['client_name'],
-                        'Current POD':     '—',
-                        'New POD':         _hs_pod or '',
-                        'Status':          'New in HubSpot',
-                        'Lifecycle':       _hr['_lifecycle'],
-                        'Terminating':     bool(_hr['_is_terminating']),
-                        'Current MRR ($)': 0.0,
-                        'New MRR ($)':     _hs_mrr,
-                        'Current Start Date': '',
-                        'New Start Date':  _new_gl,
-                        'Final Svc Date':  _new_fsd,
-                    })
+
             st.session_state.hs_recon_df = pd.DataFrame(_recon_rows) if _recon_rows else pd.DataFrame()
 
         with st.expander("📋 Client Reconciliation", expanded=True):
