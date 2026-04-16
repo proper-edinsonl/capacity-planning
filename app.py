@@ -8267,6 +8267,27 @@ if "calc_data" in st.session_state:
                 _rb_mec  = _cd_sr.get(_rb_key, pd.DataFrame())
                 _mec_by_email = {}
 
+                # Build client → Sr. email map from final_dashboards['cliente']
+                _name_to_email_mec = {
+                    str(k).strip().lower(): str(v.get('email', '')).strip().lower()
+                    for k, v in _hc_sr.get('by_sr', {}).items()
+                }
+                _fd_cli_mec = _fd_sr.get('cliente', pd.DataFrame())
+                _client_to_sr_email = {}
+                if ('Sr. Accountant' in _fd_cli_mec.columns
+                        and 'Client' in _fd_cli_mec.columns):
+                    _fd_cli_mec_w = _fd_cli_mec.copy()
+                    _fd_cli_mec_w['_sr_email'] = (
+                        _fd_cli_mec_w['Sr. Accountant']
+                        .astype(str).str.strip().str.lower()
+                        .map(_name_to_email_mec).fillna('')
+                    )
+                    _client_to_sr_email = (
+                        _fd_cli_mec_w[_fd_cli_mec_w['_sr_email'].ne('')]
+                        .groupby(_fd_cli_mec_w['Client'].astype(str).str.lower().str.strip())
+                        ['_sr_email'].first().to_dict()
+                    )
+
                 if (not _rb_mec.empty and 'Client' in _rb_mec.columns
                         and 'Required Role' in _rb_mec.columns
                         and _sr_prod_col in _rb_mec.columns
