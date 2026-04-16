@@ -7292,9 +7292,9 @@ if "calc_data" in st.session_state:
                             _filtered_em.add(_em)
                     _all_em = _filtered_em
 
-                # Role → utilization goal lookup — strips " Att" and " - No Active" suffixes
+                # Role → utilization goal lookup — strips " Att" and " - Alert Relocate" suffixes
                 def _role_util(_r):
-                    _rk = (_r or '').replace(' Att', '').replace(' - No Active', '').strip()
+                    _rk = (_r or '').replace(' Att', '').replace(' - Alert Relocate', '').strip()
                     return utilization_map.get(_rk, util_acc1)
 
                 _el_emp_rows = []
@@ -7316,7 +7316,7 @@ if "calc_data" in st.session_state:
                         # derive role from assignments (most common role used)
                         _asn_roles = [a[2] for a in _asns if a[2]]
                         _base_role = max(set(_asn_roles), key=_asn_roles.count) if _asn_roles else 'Unknown'
-                        _role  = f"{_base_role} - No Active"
+                        _role  = f"{_base_role} - Alert Relocate"
                         _pod_d = _asns[0][4] if _asns else ''
                         _no_active = True
 
