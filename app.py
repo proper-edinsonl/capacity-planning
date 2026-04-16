@@ -3458,10 +3458,23 @@ if "calc_data" in st.session_state:
             st.warning(f"⚠️ Column **'{_pod_sel}'** found but all POD values are empty. "
                        "Check that this is the right column.")
 
+        # ── POD filter for summary / onboarding sections ─────────────────
+        # The reconciliation table always shows all clients; the three summary
+        # sections (Lifecycle Stage, At-Risk, New Onboarding) respect the POD
+        # filter chosen in the sidebar (Data Load & Filters).
+        _hs_filt_pods = st.session_state.get('_filt_pods', [])
+        if _hs_filt_pods and _pod_filled > 0:
+            _df_hs_view = _df_hs[
+                _df_hs['_pod'].astype(str).str.strip().isin(_hs_filt_pods)
+            ].copy()
+            st.caption(f"🔍 Filtered to POD: **{', '.join(_hs_filt_pods)}** — {len(_df_hs_view)} client(s) shown.")
+        else:
+            _df_hs_view = _df_hs
+
         # ── A. Lifecycle Stage Summary ────────────────────────────────────
         with st.expander("📊 Lifecycle Stage Summary", expanded=True):
             _lc_summary = (
-                _df_hs.groupby('_lifecycle')
+                _df_hs_view.groupby('_lifecycle')
                 .agg(Clients=('client_name', 'count'))
                 .reset_index()
                 .rename(columns={'_lifecycle': 'Lifecycle Stage'})
@@ -3475,7 +3488,7 @@ if "calc_data" in st.session_state:
                 st.dataframe(_lc_summary, use_container_width=True, hide_index=True)
 
         # ── B. Termination / At-Risk Clients ─────────────────────────────
-        _df_term = _df_hs[_df_hs['_is_terminating']].copy()
+        _df_term = _df_hs_view[_df_hs_view['_is_terminating']].copy()
         if not _df_term.empty:
             with st.expander(f"⚠️ Terminating / At-Risk Clients ({len(_df_term)})", expanded=True):
                 st.warning(
@@ -3669,9 +3682,9 @@ if "calc_data" in st.session_state:
 
         # ── D. Onboarding New Clients ─────────────────────────────────────
         _onboarding_lcs = {'onboarding', 'customer', 'new client'}
-        _df_onboard = _df_hs[
-            _df_hs['_lifecycle'].str.lower().isin(_onboarding_lcs) &
-            ~_df_hs['client_name'].str.lower().str.strip().isin(_baseline_clients)
+        _df_onboard = _df_hs_view[
+            _df_hs_view['_lifecycle'].str.lower().isin(_onboarding_lcs) &
+            ~_df_hs_view['client_name'].str.lower().str.strip().isin(_baseline_clients)
         ].copy()
 
         if not _df_onboard.empty:
