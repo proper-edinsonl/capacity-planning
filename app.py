@@ -2973,21 +2973,8 @@ with tab1:
                 # Within 20 days of today in either direction (recently started or starting soon)
                 _ob_mask |= _gl_ser.notna() & (_gl_diff >= -20) & (_gl_diff <= 20)
 
-            # ── Apply active filter so only relevant clients appear ────────────
-            # If a POD/Sr./Client filter is selected, restrict the onboarding list
-            # to clients that fall within that scope.
-            _ob_scope_mask = pd.Series(True, index=_ob_grp.index)
-            if selected_clients_final and 'client_name' in _ob_grp.columns:
-                _ob_scope_mask &= _ob_grp['client_name'].isin(selected_clients_final)
-            else:
-                if selected_pods and _pod_col_r:
-                    _ob_scope_mask &= _ob_grp[_pod_col_r].astype(str).str.strip().isin(selected_pods)
-                if selected_srs:
-                    _sr_col_r = _ci_m.get('sr. accountant') or _ci_m.get('sr accountant') or _ci_m.get('senior accountant')
-                    if _sr_col_r:
-                        _ob_scope_mask &= _ob_grp[_sr_col_r].astype(str).str.strip().isin(selected_srs)
-
-            _ob_sel = _ob_grp[_ob_mask & _ob_scope_mask].copy()
+            # View always shows ALL onboarding clients — filters only affect the queue action
+            _ob_sel = _ob_grp[_ob_mask].copy()
 
             if not _ob_sel.empty:
                 _ob_rows = []
@@ -3044,14 +3031,33 @@ with tab1:
                             "Click below to queue them for AI prediction — their existing hours will be replaced."
                         )
 
-                    if st.button(
-                        f"🤖 Queue All {_n_ob_total} Client(s) for AI Prediction",
-                        key="btn_ob_queue_all", type="primary"
-                    ):
-                        st.session_state['_ob_replace_set'] = set(_ob_disp_df[_has_data_m]['Client'].tolist())
+                    # Determine which clients fall within the active POD/Sr. filter (for queue only)
+                    _queue_df = _ob_disp_df.copy()
+                    if selected_clients_final:
+                        _queue_df = _queue_df[_queue_df['Client'].isin(selected_clients_final)]
+                    else:
+                        if selected_pods:
+                            _queue_df = _queue_df[_queue_df['POD'].astype(str).str.strip().isin(selected_pods)]
+                        if selected_srs:
+                            _sr_col_r = _ci_m.get('sr. accountant') or _ci_m.get('sr accountant') or next(
+                                (v for k, v in _ci_m.items() if 'sr' in k and 'accountant' in k), None)
+                            if _sr_col_r and _sr_col_r in _ob_sel.columns:
+                                _sr_vals = _ob_sel.set_index('client_name')[_sr_col_r].to_dict()
+                                _queue_df = _queue_df[_queue_df['Client'].map(
+                                    lambda c: str(_sr_vals.get(c, '')).strip()).isin(selected_srs)]
+
+                    _n_queue = len(_queue_df)
+                    _queue_label = (
+                        f"🤖 Queue {_n_queue} Client(s) for POD {', '.join(selected_pods)}"
+                        if selected_pods and not selected_clients_final else
+                        f"🤖 Queue All {_n_ob_total} Client(s) for AI Prediction"
+                    )
+
+                    if st.button(_queue_label, key="btn_ob_queue_all", type="primary"):
+                        st.session_state['_ob_replace_set'] = set(_queue_df[_queue_df['Total Hrs'] > 0]['Client'].tolist())
                         _existing_ai2 = st.session_state.get('ai_manual_clients', pd.DataFrame())
                         _new_ai_rows2 = []
-                        for _, _ob_r in _ob_disp_df.iterrows():
+                        for _, _ob_r in _queue_df.iterrows():
                             _gl_ai_s = pd.to_datetime(_ob_r['_gl_raw'], errors='coerce')
                             _new_ai_rows2.append({
                                 'Company Name':    _ob_r['Client'],
