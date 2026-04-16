@@ -1870,7 +1870,7 @@ def _process_hc_report(file_bytes: bytes):
     by_pod_role = (active_pods[active_pods['Capacity Role'].isin(_productive_roles)]
                    .groupby(['POD', 'Capacity Role'])['Full name']
                    .count().reset_index().rename(columns={'Full name': 'HC'}))
-    total       = int(active_pods['Capacity Role'].ne('Other').sum())  # count only mapped roles
+    total       = int(active_pods['Capacity Role'].isin(_productive_roles).sum())  # productive roles only (no managers)
 
     # ── Sr. Accountant → direct reports mapping (via Manager email — encoding-safe) ──
     _sr_jt_lower  = active_pods['Job title'].astype(str).str.lower().str.strip()
@@ -2729,7 +2729,13 @@ st.markdown("""<script>
             _barTimer = setTimeout(function(){
                 restoreScroll();
                 hideBar();
-            }, 120);
+                /* Jiggle ±1px after content settles to unstick the browser's
+                   scroll engine — fixes the "arrow keys work but wheel/drag don't" issue */
+                setTimeout(function(){
+                    var m = getMain();
+                    if(m){ var t = m.scrollTop; m.scrollTop = t + 1; m.scrollTop = t; }
+                }, 80);
+            }, 250);
         });
         _mut.observe(main, { childList: true, subtree: true });
     }
@@ -3278,6 +3284,9 @@ with tab1:
             # is active before deciding to add / replace these clients.
             _today_ts   = pd.Timestamp.today().normalize()
             _ci_m       = {c.strip().lower(): c for c in df_temp.columns}
+            # Resolve client_name column case-insensitively (may be 'client_name', 'Client Name', etc.)
+            _cn_col_r   = (_ci_m.get('client_name')
+                           or next((v for k, v in _ci_m.items() if k.replace(' ', '_') == 'client_name'), None))
             # Use substring match (like the pipeline) so columns like "Client Status" are found
             _st_col_r   = _ci_m.get('status') or next((v for k, v in _ci_m.items() if 'status' in k), None)
             _gl_col_r   = _ci_m.get('go live') or next((v for k, v in _ci_m.items() if 'go live' in k), None)
@@ -3293,11 +3302,17 @@ with tab1:
                 if _hc in df_temp.columns:
                     _ob_grp_agg[_hc] = 'sum'
 
-            _ob_grp = (
-                df_temp.groupby('client_name', as_index=False).agg(_ob_grp_agg)
-                if _ob_grp_agg else
-                df_temp[['client_name']].drop_duplicates()
-            )
+            if _cn_col_r:
+                _ob_grp = (
+                    df_temp.groupby(_cn_col_r, as_index=False).agg(_ob_grp_agg)
+                    if _ob_grp_agg else
+                    df_temp[[_cn_col_r]].drop_duplicates()
+                )
+                # Normalise to 'client_name' so downstream code stays unchanged
+                if _cn_col_r != 'client_name':
+                    _ob_grp = _ob_grp.rename(columns={_cn_col_r: 'client_name'})
+            else:
+                _ob_grp = pd.DataFrame(columns=['client_name'])
 
             _ob_mask = pd.Series(False, index=_ob_grp.index)
             # Match: lifecycle/status = Onboarding (or similar)
@@ -3778,6 +3793,9 @@ if "calc_data" in st.session_state:
                 _df_hs = _parse_hubspot_file(_hs_file)
                 st.session_state.hs_parsed = _df_hs
                 st.session_state.hs_recon_df = None   # force rebuild
+                # Invalidate cascade results — HubSpot data changed, Step 3 must re-run
+                st.session_state.pop('final_dashboards', None)
+                st.session_state.pop('_s2_proceed', None)
                 _build_client_master_map()   # re-sync POD/Sr./Vol maps with HubSpot data
                 st.rerun(scope="fragment")
             except Exception as _e:
@@ -7510,7 +7528,7 @@ if "calc_data" in st.session_state:
             elif _ov_cascade_srs:
                 _ov_scope_label = f"Sr. · {', '.join(_ov_cascade_srs)}"
 
-            if not _el_gen.empty:
+            if not _el_gen.empty and not _ov_cascade_pods:
                 st.markdown(f"#### 📋 Overall Role Summary — {_ov_scope_label}")
                 st.caption(
                     "Matches the Required HC breakdown shown in the Capacity Overview. "
