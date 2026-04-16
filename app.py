@@ -7768,12 +7768,6 @@ if "calc_data" in st.session_state:
             elif not _wdays_sr or _fd_sr is None:
                 st.info("ℹ️ Run **Step 1** and generate reports first.")
             else:
-                # ── Data from final_dashboards['cliente'] ─────────────────────
-                # This DF already has Client, POD, Sr. Accountant, and per-month
-                # Productive Hours — no secondary joins needed.
-                _fd_cli = _fd_sr.get('cliente', pd.DataFrame())
-                _has_sr_col = 'Sr. Accountant' in _fd_cli.columns and 'Client' in _fd_cli.columns
-
                 # Month selector
                 _sr_month_opts = [f"M{i+1} — {m}" for i, m in enumerate(_meses_sr)]
                 _sr_sel_label  = st.selectbox("Period", _sr_month_opts, key="_sr_ratios_month")
@@ -7797,39 +7791,62 @@ if "calc_data" in st.session_state:
                     except Exception:
                         return '—'
 
-                # Client count per Sr. — from final_dashboards (already has Sr. Accountant)
-                _sr_cli_count = {}
-                if _has_sr_col:
-                    _sr_cli_count = (
-                        _fd_cli[_fd_cli['Sr. Accountant'].astype(str).str.strip().ne('')]
-                        .groupby('Sr. Accountant')['Client'].nunique()
-                        .to_dict()
-                    )
-
-                # Productive hours per Sr. — from final_dashboards (already has Productive Hrs cols)
-                _sr_prod_hrs_map = {}
-                if _has_sr_col and _sr_prod_col in _fd_cli.columns:
-                    _sr_prod_hrs_map = (
-                        _fd_cli[_fd_cli['Sr. Accountant'].astype(str).str.strip().ne('')]
-                        .groupby('Sr. Accountant')[_sr_prod_col].sum()
-                        .to_dict()
-                    )
-
-                # Build email → display name lookup
-                _email_to_name = {
-                    v.get('email', ''): k
+                # ── Build name→email map from HC (email is the reliable key) ──
+                # by_sr is keyed by full name; each value has 'email'
+                _name_to_email = {
+                    k.strip().lower(): v.get('email', '').strip().lower()
                     for k, v in _hc_sr.get('by_sr', {}).items()
                 }
 
-                # Build table rows
+                # ── final_dashboards['cliente'] has Sr. Accountant (name) + Client ──
+                # Use it to: (a) count clients per Sr. email, (b) build client→email map
+                _fd_cli = _fd_sr.get('cliente', pd.DataFrame())
+                _sr_cli_count_by_email   = {}   # email → unique client count
+                _client_to_sr_email      = {}   # client_lower → sr_email
+                if 'Sr. Accountant' in _fd_cli.columns and 'Client' in _fd_cli.columns:
+                    _fd_cli_w = _fd_cli[_fd_cli['Sr. Accountant'].astype(str).str.strip().ne('')].copy()
+                    _fd_cli_w['_sr_email'] = (
+                        _fd_cli_w['Sr. Accountant'].astype(str).str.strip().str.lower()
+                        .map(_name_to_email).fillna('')
+                    )
+                    # client count per email
+                    _sr_cli_count_by_email = (
+                        _fd_cli_w[_fd_cli_w['_sr_email'].ne('')]
+                        .groupby('_sr_email')['Client'].nunique()
+                        .to_dict()
+                    )
+                    # client→email lookup for productive hours join
+                    _client_to_sr_email = (
+                        _fd_cli_w[_fd_cli_w['_sr_email'].ne('')]
+                        .groupby(_fd_cli_w['Client'].astype(str).str.lower().str.strip())['_sr_email']
+                        .first().to_dict()
+                    )
+
+                # ── Productive hours from df_resumen_base (Productive Hrs NOT dropped there) ──
+                # df_resumen_base has: POD, Client, Required Role, M{n} - Productive Hours
+                _df_rb_sr   = _cd_sr.get('df_resumen_base', pd.DataFrame())
+                _sr_prod_hrs_by_email = {}
+                if (not _df_rb_sr.empty and 'Client' in _df_rb_sr.columns
+                        and _sr_prod_col in _df_rb_sr.columns and _client_to_sr_email):
+                    _rb_w = _df_rb_sr.copy()
+                    _rb_w['_sr_email'] = (
+                        _rb_w['Client'].astype(str).str.lower().str.strip()
+                        .map(_client_to_sr_email).fillna('')
+                    )
+                    _sr_prod_hrs_by_email = (
+                        _rb_w[_rb_w['_sr_email'].ne('')]
+                        .groupby('_sr_email')[_sr_prod_col].sum()
+                        .to_dict()
+                    )
+
+                # Build table rows — keyed entirely by email
                 _sr_table_rows = []
                 for _sr_em, _sr_inf in _hc_sr.get('by_sr_email', {}).items():
-                    _sr_nm    = _email_to_name.get(_sr_em, _sr_em)
                     _dr_cnt   = int(_sr_inf.get('dr_total', 0))
                     _pod_v    = str(_sr_inf.get('pod', ''))
                     _start_dt = _sr_inf.get('start_date', pd.NaT)
-                    _cli_cnt  = int(_sr_cli_count.get(_sr_nm, 0))
-                    _prod_hrs = float(_sr_prod_hrs_map.get(_sr_nm, 0.0))
+                    _cli_cnt  = int(_sr_cli_count_by_email.get(_sr_em, 0))
+                    _prod_hrs = float(_sr_prod_hrs_by_email.get(_sr_em, 0.0))
 
                     # Capacity math
                     _scale    = _sr_net_days / _SR_OPS_BASE_DAYS
@@ -7853,7 +7870,7 @@ if "calc_data" in st.session_state:
 
                     _sr_table_rows.append({
                         'POD':                 _pod_v,
-                        'Sr. Accountant':      _sr_nm,
+                        'Sr. Accountant':      _sr_em,   # email — reliable key
                         'Hire Date':           pd.Timestamp(_start_dt).strftime('%Y-%m-%d') if pd.notna(_start_dt) else '—',
                         'Tenure':              _sr_tenure(_start_dt),
                         'Direct Reports':      f"{_dr_cnt} {_dr_flag}",
@@ -7870,7 +7887,7 @@ if "calc_data" in st.session_state:
                 if _sr_table_rows:
                     _sr_df = (
                         pd.DataFrame(_sr_table_rows)
-                        .sort_values(['POD', 'Sr. Accountant'])
+                        .sort_values(['POD', 'Sr. Accountant'])   # sorts by POD then email
                         .reset_index(drop=True)
                     )
                     st.dataframe(
