@@ -5484,17 +5484,16 @@ if "calc_data" in st.session_state:
                         c: 'first' for c in ['Res Prop','Commercial Properties','Res doors','Commercial Doors','SQFT Commercial']
                         if c in _df_raw.columns
                     })
-                    _prop_count  = int(
-                        _safe_num(_client_snap.get('Res Prop', 0)).sum() +
-                        _safe_num(_client_snap.get('Commercial Properties', 0)).sum()
-                    )
-                    _door_count  = int(
-                        _safe_num(_client_snap.get('Res doors', 0)).sum() +
-                        _safe_num(_client_snap.get('Commercial Doors', 0)).sum()
-                    )
-                    _sqft_count  = int(_safe_num(_client_snap.get('SQFT Commercial', 0)).sum())
+                    _res_prop_count  = int(_safe_num(_client_snap.get('Res Prop', 0)).sum())
+                    _comm_prop_count = int(_safe_num(_client_snap.get('Commercial Properties', 0)).sum())
+                    _prop_count      = _res_prop_count + _comm_prop_count
+                    _res_door_count  = int(_safe_num(_client_snap.get('Res doors', 0)).sum())
+                    _comm_door_count = int(_safe_num(_client_snap.get('Commercial Doors', 0)).sum())
+                    _door_count      = _res_door_count + _comm_door_count
+                    _sqft_count      = int(_safe_num(_client_snap.get('SQFT Commercial', 0)).sum())
                 else:
-                    _prop_count = _door_count = _sqft_count = 0
+                    _res_prop_count = _comm_prop_count = _prop_count = 0
+                    _res_door_count = _comm_door_count = _door_count = _sqft_count = 0
 
                 # (AI results kept in _ai for other uses, but not shown in the waterfall rows)
                 _ai_base_wdays = st.session_state.get('calc_data', {}).get('dict_workable_days', {}).get(0, 21)
@@ -5710,8 +5709,11 @@ if "calc_data" in st.session_state:
                             )
                             _m_cli_count = int(_m_cli_mask.sum())
                         rows.setdefault("━ Property Count",               {})[col] = _fmt(_prop_count, 'n')
+                        rows.setdefault("  Res Properties",               {})[col] = _fmt(_res_prop_count if _res_prop_count else None, 'n')
+                        rows.setdefault("  Comm Properties",              {})[col] = _fmt(_comm_prop_count if _comm_prop_count else None, 'n')
                         rows.setdefault("  Client Count",                 {})[col] = _fmt(_m_cli_count, 'n')
-                        rows.setdefault("  Doors",                        {})[col] = _fmt(_door_count, 'n')
+                        rows.setdefault("  Res Doors",                    {})[col] = _fmt(_res_door_count if _res_door_count else None, 'n')
+                        rows.setdefault("  Comm Doors",                   {})[col] = _fmt(_comm_door_count if _comm_door_count else None, 'n')
                         rows.setdefault("  SQFT (Comm)",                  {})[col] = _fmt(_sqft_count if _sqft_count else None, 'n')
                         rows.setdefault("  Tickets to Process",           {})[col] = _fmt(_aht_proc_tix, 'n')
                         rows.setdefault("  Tickets to Review",            {})[col] = _fmt(_aht_rev_tix,  'n')
@@ -5759,7 +5761,7 @@ if "calc_data" in st.session_state:
                     "━ MRR ($)":                  ["  (+) New MRR ($)", "  (-) Churn MRR ($)", "  Revenue / HC ($)"],
                     "━ Cost & Margin":            ["  Capacity Cost ($)", "  Capacity Margin ($)", "  Capacity Margin (%)",
                                                    "  Expected Cost ($)", "  Expected Margin ($)", "  Expected Margin (%)"],
-                    "━ Property Count":           ["  Client Count", "  Doors", "  SQFT (Comm)"],
+                    "━ Property Count":           ["  Res Properties", "  Comm Properties", "  Client Count", "  Res Doors", "  Comm Doors", "  SQFT (Comm)"],
                     "━ Working Days":             ["  Holidays"],
                 }
                 _ov_groups_nohc = {
@@ -5767,7 +5769,7 @@ if "calc_data" in st.session_state:
                     "━ Required HC (FTEs)":       ["  · Accountant I", "  · Accountant II", "  · General Accountant", "  · Sr. Accountant"],
                     "━ MRR ($)":                  ["  (+) New MRR ($)", "  (-) Churn MRR ($)"],
                     "━ Cost & Margin":            ["  Capacity Cost ($)", "  Capacity Margin ($)", "  Capacity Margin (%)"],
-                    "━ Property Count":           ["  Client Count", "  Doors", "  SQFT (Comm)"],
+                    "━ Property Count":           ["  Res Properties", "  Comm Properties", "  Client Count", "  Res Doors", "  Comm Doors", "  SQFT (Comm)"],
                     "━ Working Days":             ["  Holidays"],
                 }
                 _ov_groups = _ov_groups_nohc if _hide_actual_hc else _ov_groups_full
@@ -5910,17 +5912,16 @@ if "calc_data" in st.session_state:
                                         c: 'first' for c in ['Res Prop','Commercial Properties','Res doors','Commercial Doors','SQFT Commercial']
                                         if c in _pdf_raw.columns
                                     })
-                                    _p_prop_count = int(
-                                        _safe_num(_p_client_snap.get('Res Prop', 0)).sum() +
-                                        _safe_num(_p_client_snap.get('Commercial Properties', 0)).sum()
-                                    )
-                                    _p_door_count = int(
-                                        _safe_num(_p_client_snap.get('Res doors', 0)).sum() +
-                                        _safe_num(_p_client_snap.get('Commercial Doors', 0)).sum()
-                                    )
-                                    _p_sqft_count = int(_safe_num(_p_client_snap.get('SQFT Commercial', 0)).sum())
+                                    _p_res_prop_count  = int(_safe_num(_p_client_snap.get('Res Prop', 0)).sum())
+                                    _p_comm_prop_count = int(_safe_num(_p_client_snap.get('Commercial Properties', 0)).sum())
+                                    _p_prop_count      = _p_res_prop_count + _p_comm_prop_count
+                                    _p_res_door_count  = int(_safe_num(_p_client_snap.get('Res doors', 0)).sum())
+                                    _p_comm_door_count = int(_safe_num(_p_client_snap.get('Commercial Doors', 0)).sum())
+                                    _p_door_count      = _p_res_door_count + _p_comm_door_count
+                                    _p_sqft_count      = int(_safe_num(_p_client_snap.get('SQFT Commercial', 0)).sum())
                                 else:
-                                    _p_prop_count = _p_door_count = _p_sqft_count = 0
+                                    _p_res_prop_count = _p_comm_prop_count = _p_prop_count = 0
+                                    _p_res_door_count = _p_comm_door_count = _p_door_count = _p_sqft_count = 0
 
                                 _pm_all  = _pod_df[(_pod_df['POD'] == _pod_name) & (_pod_df['Required Role'] == '>>> POD TOTAL')]
                                 _proles_all = _pod_df[(_pod_df['POD'] == _pod_name) & (_pod_df['Required Role'] != '>>> POD TOTAL')]
@@ -6134,8 +6135,11 @@ if "calc_data" in st.session_state:
                                         )
                                         _p_cli_count = int(_pcl_mask.sum())
                                     _pod_rows.setdefault("━ Property Count",               {})[col] = _fmt(_p_prop_count, 'n')
+                                    _pod_rows.setdefault("  Res Properties",               {})[col] = _fmt(_p_res_prop_count if _p_res_prop_count else None, 'n')
+                                    _pod_rows.setdefault("  Comm Properties",              {})[col] = _fmt(_p_comm_prop_count if _p_comm_prop_count else None, 'n')
                                     _pod_rows.setdefault("  Client Count",                 {})[col] = _fmt(_p_cli_count, 'n')
-                                    _pod_rows.setdefault("  Doors",                        {})[col] = _fmt(_p_door_count, 'n')
+                                    _pod_rows.setdefault("  Res Doors",                    {})[col] = _fmt(_p_res_door_count if _p_res_door_count else None, 'n')
+                                    _pod_rows.setdefault("  Comm Doors",                   {})[col] = _fmt(_p_comm_door_count if _p_comm_door_count else None, 'n')
                                     _pod_rows.setdefault("  SQFT (Comm)",                  {})[col] = _fmt(_p_sqft_count if _p_sqft_count else None, 'n')
                                     _pod_rows.setdefault("  Tickets to Process",           {})[col] = _fmt(_p_proc_tix, 'n')
                                     _pod_rows.setdefault("  Tickets to Review",            {})[col] = _fmt(_p_rev_tix,  'n')
@@ -6156,7 +6160,7 @@ if "calc_data" in st.session_state:
                                     "━ MRR ($)":                  ["  (+) New MRR ($)", "  (-) Churn MRR ($)", "  Revenue / HC ($)"],
                                     "━ Cost & Margin":            ["  Capacity Cost ($)", "  Capacity Margin ($)", "  Capacity Margin (%)",
                                                                    "  Expected Cost ($)", "  Expected Margin ($)", "  Expected Margin (%)"],
-                                    "━ Property Count":           ["  Client Count", "  Doors", "  SQFT (Comm)"],
+                                    "━ Property Count":           ["  Res Properties", "  Comm Properties", "  Client Count", "  Res Doors", "  Comm Doors", "  SQFT (Comm)"],
                                     "━ Working Days":             ["  Holidays"],
                                 }
                                 for _gh in _pod_grp_defs:
@@ -6300,13 +6304,16 @@ if "calc_data" in st.session_state:
                                     c: 'first' for c in ['Res Prop','Commercial Properties','Res doors','Commercial Doors','SQFT Commercial']
                                     if c in _sr_raw.columns
                                 })
-                                _srp_count = int(_safe_num(_sr_snap.get('Res Prop', 0)).sum() +
-                                                 _safe_num(_sr_snap.get('Commercial Properties', 0)).sum())
-                                _srd_count = int(_safe_num(_sr_snap.get('Res doors', 0)).sum() +
-                                                 _safe_num(_sr_snap.get('Commercial Doors', 0)).sum())
-                                _srs_count = int(_safe_num(_sr_snap.get('SQFT Commercial', 0)).sum())
+                                _sr_res_prop_count  = int(_safe_num(_sr_snap.get('Res Prop', 0)).sum())
+                                _sr_comm_prop_count = int(_safe_num(_sr_snap.get('Commercial Properties', 0)).sum())
+                                _srp_count          = _sr_res_prop_count + _sr_comm_prop_count
+                                _sr_res_door_count  = int(_safe_num(_sr_snap.get('Res doors', 0)).sum())
+                                _sr_comm_door_count = int(_safe_num(_sr_snap.get('Commercial Doors', 0)).sum())
+                                _srd_count          = _sr_res_door_count + _sr_comm_door_count
+                                _srs_count          = int(_safe_num(_sr_snap.get('SQFT Commercial', 0)).sum())
                             else:
-                                _srp_count = _srd_count = _srs_count = 0
+                                _sr_res_prop_count = _sr_comm_prop_count = _srp_count = 0
+                                _sr_res_door_count = _sr_comm_door_count = _srd_count = _srs_count = 0
 
                             _duc = st.session_state.get('df_clients_unique', pd.DataFrame())
 
@@ -6496,8 +6503,11 @@ if "calc_data" in st.session_state:
                                     )
                                     _sr_cli_count = int(_sc_mask.sum())
                                 _sr_rows.setdefault("━ Property Count",               {})[col] = _fmt(_srp_count, 'n')
+                                _sr_rows.setdefault("  Res Properties",               {})[col] = _fmt(_sr_res_prop_count if _sr_res_prop_count else None, 'n')
+                                _sr_rows.setdefault("  Comm Properties",              {})[col] = _fmt(_sr_comm_prop_count if _sr_comm_prop_count else None, 'n')
                                 _sr_rows.setdefault("  Client Count",                 {})[col] = _fmt(_sr_cli_count, 'n')
-                                _sr_rows.setdefault("  Doors",                        {})[col] = _fmt(_srd_count, 'n')
+                                _sr_rows.setdefault("  Res Doors",                    {})[col] = _fmt(_sr_res_door_count if _sr_res_door_count else None, 'n')
+                                _sr_rows.setdefault("  Comm Doors",                   {})[col] = _fmt(_sr_comm_door_count if _sr_comm_door_count else None, 'n')
                                 _sr_rows.setdefault("  SQFT (Comm)",                  {})[col] = _fmt(_srs_count if _srs_count else None, 'n')
                                 _sr_rows.setdefault("  Tickets to Process",           {})[col] = _fmt(_sr_proc_tix, 'n')
                                 _sr_rows.setdefault("  Tickets to Review",            {})[col] = _fmt(_sr_rev_tix,  'n')
@@ -6532,7 +6542,7 @@ if "calc_data" in st.session_state:
                                     "━ MRR ($)":                  ["  (+) New MRR ($)", "  (-) Churn MRR ($)", "  Revenue / HC ($)"],
                                     "━ Cost & Margin":            ["  Capacity Cost ($)", "  Capacity Margin ($)", "  Capacity Margin (%)",
                                                                    "  Expected Cost ($)", "  Expected Margin ($)", "  Expected Margin (%)"],
-                                    "━ Property Count":           ["  Client Count", "  Doors", "  SQFT (Comm)"],
+                                    "━ Property Count":           ["  Res Properties", "  Comm Properties", "  Client Count", "  Res Doors", "  Comm Doors", "  SQFT (Comm)"],
                                     "━ Working Days":             ["  Holidays"],
                                 }
                                 # Client rows are also collapsible
@@ -7828,11 +7838,15 @@ if (
                 if c in _src_raw.columns
             })
             def _safe_num_s4(s): return pd.to_numeric(s, errors='coerce').fillna(0)
-            _s_prop = int(_safe_num_s4(_csn.get('Res Prop', 0)).sum()  + _safe_num_s4(_csn.get('Commercial Properties', 0)).sum())
-            _s_door = int(_safe_num_s4(_csn.get('Res doors', 0)).sum() + _safe_num_s4(_csn.get('Commercial Doors', 0)).sum())
-            _s_sqft = int(_safe_num_s4(_csn.get('SQFT Commercial', 0)).sum())
+            _s_res_prop  = int(_safe_num_s4(_csn.get('Res Prop', 0)).sum())
+            _s_comm_prop = int(_safe_num_s4(_csn.get('Commercial Properties', 0)).sum())
+            _s_prop      = _s_res_prop + _s_comm_prop
+            _s_res_door  = int(_safe_num_s4(_csn.get('Res doors', 0)).sum())
+            _s_comm_door = int(_safe_num_s4(_csn.get('Commercial Doors', 0)).sum())
+            _s_door      = _s_res_door + _s_comm_door
+            _s_sqft      = int(_safe_num_s4(_csn.get('SQFT Commercial', 0)).sum())
         else:
-            _s_prop = _s_door = _s_sqft = 0; _s_aht = 0.0
+            _s_res_prop = _s_comm_prop = _s_prop = _s_res_door = _s_comm_door = _s_door = _s_sqft = 0; _s_aht = 0.0
 
         # ── Read adjustments (only confirmed rows) ───────────────────────────
         _hc_adj_df  = st.session_state.s4v2_hc_adj_df
@@ -8464,8 +8478,11 @@ if (
                 elif _pod_clients_lower_set:
                     _s4_cli_count = int((_active_c & _duc_name_lower.isin(_pod_clients_lower_set)).sum())
             _scen_rows.setdefault("━ Property Count",            {})[_col] = _fmt(_s_prop, 'n')
+            _scen_rows.setdefault("  Res Properties",            {})[_col] = _fmt(_s_res_prop if _s_res_prop else None, 'n')
+            _scen_rows.setdefault("  Comm Properties",           {})[_col] = _fmt(_s_comm_prop if _s_comm_prop else None, 'n')
             _scen_rows.setdefault("  Client Count",              {})[_col] = _fmt(_s4_cli_count, 'n')
-            _scen_rows.setdefault("  Doors",                     {})[_col] = _fmt(_s_door, 'n')
+            _scen_rows.setdefault("  Res Doors",                 {})[_col] = _fmt(_s_res_door if _s_res_door else None, 'n')
+            _scen_rows.setdefault("  Comm Doors",                {})[_col] = _fmt(_s_comm_door if _s_comm_door else None, 'n')
             _scen_rows.setdefault("  SQFT (Comm)",               {})[_col] = _fmt(_s_sqft if _s_sqft else None, 'n')
             _scen_rows.setdefault("  Tickets to Process",        {})[_col] = _fmt(_s4_proc_tix, 'n')
             _scen_rows.setdefault("  Tickets to Review",         {})[_col] = _fmt(_s4_rev_tix,  'n')
@@ -8586,7 +8603,7 @@ if (
             "━ MRR ($)":                  ["  (+) New MRR ($)", "  (-) Churn MRR ($)", "  Revenue / HC ($)"],
             "━ Cost & Margin":            ["  Capacity Cost ($)", "  Capacity Margin ($)", "  Capacity Margin (%)",
                                            "  Expected Cost ($)", "  Expected Margin ($)", "  Expected Margin (%)"],
-            "━ Property Count":           ["  Client Count", "  Doors", "  SQFT (Comm)"],
+            "━ Property Count":           ["  Res Properties", "  Comm Properties", "  Client Count", "  Res Doors", "  Comm Doors", "  SQFT (Comm)"],
             "━ Working Days":             ["  Holidays"],
         }
         for _gh in _s4_groups:
