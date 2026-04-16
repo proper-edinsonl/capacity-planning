@@ -8281,10 +8281,10 @@ if "calc_data" in st.session_state:
                     _rem_hrs  = _cap_hrs - _prod_hrs
                     _pct_rem  = (_rem_hrs / _cap_hrs * 100) if _cap_hrs > 0 else 0.0
 
-                    # MEC & Other review hours for this Sr.
-                    _mec_hrs   = float(_mec_rev_by_email.get(_sr_em, 0.0))
-                    _other_hrs = float(_other_rev_by_email.get(_sr_em, 0.0))
-                    _rem_mec   = _cap_hrs - _mec_hrs
+                    # MEC & Other client hrs combined (proc if Ideal Proc=Sr, rev if Ideal Rev=Sr)
+                    _cli_hrs   = (float(_mec_rev_by_email.get(_sr_em, 0.0))
+                                  + float(_other_rev_by_email.get(_sr_em, 0.0)))
+                    _rem_mec   = _cap_hrs - _cli_hrs
                     _pct_mec   = (_rem_mec / _cap_hrs * 100) if _cap_hrs > 0 else 0.0
 
                     # Ratio flags
@@ -8305,8 +8305,7 @@ if "calc_data" in st.session_state:
                         'Remaining Hrs':                     round(_rem_hrs, 1),
                         '% Remaining':                       round(_pct_rem, 1),
                         'Status':                            _sr_status(_pct_rem),
-                        'MEC Review Hrs':                    round(_mec_hrs, 1),
-                        'Other Review Hrs':                  round(_other_hrs, 1),
+                        'MEC & Other Client Hrs':            round(_cli_hrs, 1),
                         'Remaining Hrs (MEC)':               round(_rem_mec, 1),
                         '% Remaining (MEC)':                 round(_pct_mec, 1),
                         'Status (MEC)':                      _sr_status(_pct_mec),
@@ -8331,9 +8330,8 @@ if "calc_data" in st.session_state:
                             'Productive Capacity (After Ops R)': st.column_config.NumberColumn('Productive Capacity (After Ops R)', format='%.1f'),
                             'Remaining Hrs':                     st.column_config.NumberColumn('Remaining Hrs',                     format='%.1f'),
                             '% Remaining':                       st.column_config.NumberColumn('% Remaining',                      format='%.1f%%'),
-                            'MEC Review Hrs':                    st.column_config.NumberColumn('MEC Review Hrs',    format='%.1f'),
-                            'Other Review Hrs':                  st.column_config.NumberColumn('Other Review Hrs',  format='%.1f'),
-                            'Remaining Hrs (MEC)':               st.column_config.NumberColumn('Remaining Hrs (MEC)', format='%.1f'),
+                            'MEC & Other Client Hrs':            st.column_config.NumberColumn('MEC & Other Client Hrs', format='%.1f'),
+                            'Remaining Hrs (MEC)':               st.column_config.NumberColumn('Remaining Hrs (MEC)',    format='%.1f'),
                             '% Remaining (MEC)':                 st.column_config.NumberColumn('% Remaining (MEC)',   format='%.1f%%'),
                         }
                     )
