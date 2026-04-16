@@ -2181,6 +2181,16 @@ else:
     if "POD" not in st.session_state.reductions_df.columns:
         st.session_state.reductions_df.insert(1, "POD", "")
 
+if "s4v2_hist_df" not in st.session_state:
+    st.session_state.s4v2_hist_df = pd.DataFrame(
+        columns=["Confirmed", "POD", "Client", "Required Role"] + meses_hrs_cols)
+if "s4v2_red_df" not in st.session_state:
+    st.session_state.s4v2_red_df = pd.DataFrame(
+        columns=["Confirmed", "POD", "Client", "Required Role"] + meses_hrs_cols)
+if "s4v2_doorcount_df" not in st.session_state:
+    st.session_state.s4v2_doorcount_df = pd.DataFrame(
+        columns=["Confirmed", "Client", "POD"] + meses_pct_cols)
+
 if "hs_sync_choice" not in st.session_state:
     st.session_state.hs_sync_choice = None          # None | "yes" | "skip"
 if "hs_parsed" not in st.session_state:
@@ -8112,17 +8122,119 @@ if (
                 _hrs_adj_by_role.get('Sr. Accountant',     0) * _shrink_sr
             )
 
-            # Final Required FTEs (post-auto base + hours adjustments)
-            _new_req_a1  = max(0.0, _req_a1 + _adj_fte_a1)
-            _new_req_a2  = max(0.0, _req_a2 + _adj_fte_a2)
-            _new_req_gn  = max(0.0, _req_gn + _adj_fte_gn)
-            _new_req_sr  = max(0.0, _req_sr + _adj_fte_sr)
+            # ── Add Hours (Scenario) per scope ───────────────────────────────
+            _s4_mhrs_col = f"M{_i+1} (Hrs)"
+            _s4_hist_raw = st.session_state.get('s4v2_hist_df', pd.DataFrame())
+            _s4_hist_conf = _s4_hist_raw[
+                _s4_hist_raw.get('Confirmed', pd.Series(False, index=_s4_hist_raw.index)).eq(True)
+            ] if not _s4_hist_raw.empty else pd.DataFrame()
+            # Scope filter
+            if not _s4_hist_conf.empty:
+                if _scope_is_pod:
+                    _s4h_pod_match = _s4_hist_conf['POD'].astype(str).str.strip() == _scope
+                    _s4h_cli_match = (_s4_hist_conf.get('Client', pd.Series('', index=_s4_hist_conf.index))
+                                      .astype(str).str.strip().str.lower().isin(_pod_clients_lower))
+                    _s4_hist_conf = _s4_hist_conf[_s4h_pod_match | _s4h_cli_match]
+                elif _scope_is_sr:
+                    _s4_hist_conf = _s4_hist_conf[
+                        _s4_hist_conf.get('Client', pd.Series('', index=_s4_hist_conf.index))
+                        .astype(str).str.strip().str.lower().isin(_pod_clients_lower)
+                    ]
+                # else Overall: use all confirmed rows
+            _s4_add_hrs_by_role = {}
+            _s4_add_hrs_total   = 0.0
+            if not _s4_hist_conf.empty and _s4_mhrs_col in _s4_hist_conf.columns:
+                for _rl in roles_permitidos:
+                    _rl_mask = _s4_hist_conf['Required Role'].astype(str).str.strip() == _rl
+                    _rl_hrs  = float(pd.to_numeric(_s4_hist_conf.loc[_rl_mask, _s4_mhrs_col], errors='coerce').fillna(0.0).sum())
+                    _s4_add_hrs_by_role[_rl] = _rl_hrs
+                    _s4_add_hrs_total += _rl_hrs * _shrink_cache.get(_rl, 1.0)
+
+            # ── Reduce Hours (Scenario) per scope ────────────────────────────
+            _s4_red_raw = st.session_state.get('s4v2_red_df', pd.DataFrame())
+            _s4_red_conf = _s4_red_raw[
+                _s4_red_raw.get('Confirmed', pd.Series(False, index=_s4_red_raw.index)).eq(True)
+            ] if not _s4_red_raw.empty else pd.DataFrame()
+            if not _s4_red_conf.empty:
+                if _scope_is_pod:
+                    _s4r_pod_match = _s4_red_conf['POD'].astype(str).str.strip() == _scope
+                    _s4r_cli_match = (_s4_red_conf.get('Client', pd.Series('', index=_s4_red_conf.index))
+                                      .astype(str).str.strip().str.lower().isin(_pod_clients_lower))
+                    _s4_red_conf = _s4_red_conf[_s4r_pod_match | _s4r_cli_match]
+                elif _scope_is_sr:
+                    _s4_red_conf = _s4_red_conf[
+                        _s4_red_conf.get('Client', pd.Series('', index=_s4_red_conf.index))
+                        .astype(str).str.strip().str.lower().isin(_pod_clients_lower)
+                    ]
+            _s4_red_hrs_by_role = {}
+            _s4_red_hrs_total   = 0.0
+            if not _s4_red_conf.empty and _s4_mhrs_col in _s4_red_conf.columns:
+                for _rl in roles_permitidos:
+                    _rl_mask = _s4_red_conf['Required Role'].astype(str).str.strip() == _rl
+                    _rl_hrs  = float(pd.to_numeric(_s4_red_conf.loc[_rl_mask, _s4_mhrs_col], errors='coerce').fillna(0.0).sum())
+                    _s4_red_hrs_by_role[_rl] = _rl_hrs
+                    _s4_red_hrs_total += _rl_hrs * _shrink_cache.get(_rl, 1.0)
+                # Also count rows without a specific role (prorate across all roles)
+                _s4r_no_role = _s4_red_conf[
+                    _s4_red_conf.get('Required Role', pd.Series('', index=_s4_red_conf.index))
+                    .astype(str).str.strip().isin(['', 'nan', 'None'])
+                ]
+                if not _s4r_no_role.empty:
+                    _s4r_norole_hrs = float(pd.to_numeric(_s4r_no_role[_s4_mhrs_col], errors='coerce').fillna(0.0).sum())
+                    _s4_red_hrs_total += _s4r_norole_hrs  # use average shrinkage for generic rows
+
+            # ── Door Count Variation (Scenario) per scope ────────────────────
+            _s4_dc_raw_s4 = st.session_state.get('s4v2_doorcount_df', pd.DataFrame())
+            _s4_dc_conf   = _s4_dc_raw_s4[
+                _s4_dc_raw_s4.get('Confirmed', pd.Series(False, index=_s4_dc_raw_s4.index)).eq(True)
+            ] if not _s4_dc_raw_s4.empty else pd.DataFrame()
+            _s4_dc_adj_hrs = 0.0
+            _s4_mpct_col = f"M{_i+1} (%)"
+            if not _s4_dc_conf.empty and _s4_mpct_col in _s4_dc_conf.columns:
+                # Build per-client base hours from _rb_scope (post Step-3 Final Hours)
+                _s4_rb_noempty = not (_rb_scope.empty if hasattr(_rb_scope, 'empty') else True)
+                _s4_bcol = f"M{_i+1} ({_ms}) - Final Hours"
+                for _, _dcr in _s4_dc_conf.iterrows():
+                    _dc_cli  = str(_dcr.get('Client', '') or '').strip()
+                    _dc_pod  = str(_dcr.get('POD', '') or '').strip()
+                    _dc_pct  = float(pd.to_numeric(_dcr.get(_s4_mpct_col, 0), errors='coerce') or 0.0)
+                    if _dc_pct == 0.0 or not _dc_cli:
+                        continue
+                    # Scope check: if we're in a POD scope, the client must belong to it
+                    if _scope_is_pod and _dc_cli.lower() not in _pod_clients_lower:
+                        if _dc_pod and _dc_pod != _scope:
+                            continue
+                    elif _scope_is_sr and _dc_cli.lower() not in _pod_clients_lower:
+                        continue
+                    # Get client's base hours from rb_scope
+                    if _s4_rb_noempty and 'Client' in _rb_scope.columns and _s4_bcol in _rb_scope.columns:
+                        _cli_mask_dc = _rb_scope['Client'].astype(str).str.strip().str.lower() == _dc_cli.lower()
+                        _cli_base_hrs = float(_rb_scope.loc[_cli_mask_dc, _s4_bcol].sum())
+                    else:
+                        _cli_base_hrs = 0.0
+                    _s4_dc_adj_hrs += _cli_base_hrs * (_dc_pct / 100.0)
+
+            # ── Per-role FTE adjustments from Add/Remove Hours ───────────────
+            _add_fte_a1 = (_s4_add_hrs_by_role.get('Accountant I',       0) * _shrink_a1) / _d_fte_m
+            _add_fte_a2 = (_s4_add_hrs_by_role.get('Accountant II',      0) * _shrink_a2) / _d_fte_m
+            _add_fte_gn = (_s4_add_hrs_by_role.get('General Accountant', 0) * _shrink_gn) / _d_fte_m
+            _add_fte_sr = (_s4_add_hrs_by_role.get('Sr. Accountant',     0) * _shrink_sr) / _d_fte_m
+            _red_fte_a1 = (_s4_red_hrs_by_role.get('Accountant I',       0) * _shrink_a1) / _d_fte_m
+            _red_fte_a2 = (_s4_red_hrs_by_role.get('Accountant II',      0) * _shrink_a2) / _d_fte_m
+            _red_fte_gn = (_s4_red_hrs_by_role.get('General Accountant', 0) * _shrink_gn) / _d_fte_m
+            _red_fte_sr = (_s4_red_hrs_by_role.get('Sr. Accountant',     0) * _shrink_sr) / _d_fte_m
+
+            # Final Required FTEs (post-auto base + hours adjustments + add/reduce hours)
+            _new_req_a1  = max(0.0, _req_a1 + _adj_fte_a1 + _add_fte_a1 - _red_fte_a1)
+            _new_req_a2  = max(0.0, _req_a2 + _adj_fte_a2 + _add_fte_a2 - _red_fte_a2)
+            _new_req_gn  = max(0.0, _req_gn + _adj_fte_gn + _add_fte_gn - _red_fte_gn)
+            _new_req_sr  = max(0.0, _req_sr + _adj_fte_sr + _add_fte_sr - _red_fte_sr)
             _new_req_tot = _new_req_a1 + _new_req_a2 + _new_req_gn + _new_req_sr
 
             # Automation savings in total hours (for "(-) Automations" display row)
             _scen_auto_hrs = _s4_auto_sav_total[_i] if _i < len(_s4_auto_sav_total) else 0.0
             _new_b_auto    = _scen_auto_hrs
-            _new_b_fin     = max(0.0, _b_curr - _scen_auto_hrs + _hrs_total_adj)
+            _new_b_fin     = max(0.0, _b_curr - _scen_auto_hrs + _hrs_total_adj + _s4_add_hrs_total - _s4_red_hrs_total + _s4_dc_adj_hrs)
 
             # ── Apply Actual HC adjustments ──────────────────────────────────
             _m_tot  = (float(_base_hc_tot) + _net_adj_total) if _base_hc_tot is not None else None
@@ -8169,6 +8281,9 @@ if (
             _scen_rows.setdefault("  (-) Confirmed Churn (Hrs)", {})[_col] = _fmt(_b_chrn if _b_chrn else None, 'n')
             _scen_rows.setdefault("  (-) Automations",           {})[_col] = _fmt(_new_b_auto if _new_b_auto else None, 'n')
             _scen_rows.setdefault("  (+) Manual Adjustments",    {})[_col] = _fmt(_b_ap - _b_am if (_b_ap - _b_am) != 0 else None, 'n')
+            _scen_rows.setdefault("  (+) Add Hours (Scenario)",  {})[_col] = _fmt(_s4_add_hrs_total if _s4_add_hrs_total else None, 'n')
+            _scen_rows.setdefault("  (-) Reduce Hours (Scenario)",{})[_col] = _fmt(_s4_red_hrs_total if _s4_red_hrs_total else None, 'n')
+            _scen_rows.setdefault("  (+/-) Door Count (Scenario)",{})[_col] = _fmt(_s4_dc_adj_hrs if _s4_dc_adj_hrs else None, 'n')
             _scen_rows.setdefault("(/) Capacity Productivity",  {})[_col] = _fmt(_tgt, '%')
             _scen_rows.setdefault("(/) Shrinkage (%)",          {})[_col] = _fmt(100 - _tgt if _new_b_fin > 0 else None, '%')
             _s4_act_hc_prod = (
@@ -8498,11 +8613,17 @@ if (
         def _conf_snap():
             try:
                 return hash((
-                    tuple(st.session_state.s4v2_hc_adj_df.get("Confirmed",  pd.Series()).tolist()),
-                    tuple(st.session_state.s4v2_mrr_adj_df.get("Confirmed", pd.Series()).tolist()),
-                    tuple(st.session_state.s4v2_hrs_role_df.get("Confirmed",pd.Series()).tolist()),
-                    tuple(st.session_state.s4v2_auto_df.get("Confirmed",    pd.Series()).tolist())
-                    if not st.session_state.s4v2_auto_df.empty else (),
+                    tuple(st.session_state.s4v2_hc_adj_df.get("Confirmed",     pd.Series()).tolist()),
+                    tuple(st.session_state.s4v2_mrr_adj_df.get("Confirmed",    pd.Series()).tolist()),
+                    tuple(st.session_state.s4v2_hrs_role_df.get("Confirmed",   pd.Series()).tolist()),
+                    tuple(st.session_state.s4v2_auto_df.get("Confirmed",       pd.Series()).tolist())
+                        if not st.session_state.s4v2_auto_df.empty else (),
+                    tuple(st.session_state.s4v2_hist_df.get("Confirmed",       pd.Series()).tolist())
+                        if not st.session_state.s4v2_hist_df.empty else (),
+                    tuple(st.session_state.s4v2_red_df.get("Confirmed",        pd.Series()).tolist())
+                        if not st.session_state.s4v2_red_df.empty else (),
+                    tuple(st.session_state.s4v2_doorcount_df.get("Confirmed",  pd.Series()).tolist())
+                        if not st.session_state.s4v2_doorcount_df.empty else (),
                 ))
             except Exception:
                 return None
@@ -8716,6 +8837,222 @@ if (
                         except Exception:
                             st.rerun()
 
+        # ── Add Hours (Scenario) ─────────────────────────────────────────────
+        with st.expander("➕ Add Hours (Scenario)", expanded=False):
+            st.markdown("**Extra hours to add per client/role per month (e.g. onboarding, historical accounting, new clients).** Include the POD for new clients not yet in the cascade.")
+            _s4h_pods_opts = [""] + (lista_pods or st.session_state.get('_lista_pods', []))
+            _s4h_cli_opts  = [""] + lista_clientes
+            _s4h_rol_opts  = roles_permitidos
+
+            # Template download
+            _s4h_tmpl = pd.DataFrame([
+                {"POD": "POD A", "Client": "Acme Corp", "Required Role": "Accountant I",
+                 "M1 (Hrs)": 20, "M2 (Hrs)": 20, "M3 (Hrs)": 20,
+                 "M4 (Hrs)": 0,  "M5 (Hrs)": 0,  "M6 (Hrs)": 0},
+            ])
+            _s4h_buf = BytesIO()
+            _s4h_tmpl.to_excel(_s4h_buf, index=False)
+            _s4h_dl_col, _s4h_ul_col = st.columns([1, 1])
+            with _s4h_dl_col:
+                st.download_button("📄 Download Add Hours Template", _s4h_buf.getvalue(),
+                                   file_name="S4_AddHours_Template.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                   key="dl_s4h_tmpl")
+            with _s4h_ul_col:
+                _s4h_upload = st.file_uploader("📂 Upload Add Hours file", type=["xlsx"],
+                                               key="fu_s4h_tmpl", label_visibility="collapsed")
+                st.caption("📂 Upload Add Hours file (.xlsx)")
+                if _s4h_upload is not None:
+                    try:
+                        _s4h_up_df = pd.read_excel(_s4h_upload)
+                        if 'Role' in _s4h_up_df.columns and 'Required Role' not in _s4h_up_df.columns:
+                            _s4h_up_df = _s4h_up_df.rename(columns={'Role': 'Required Role'})
+                        _s4h_expected = ['Confirmed', 'POD', 'Client', 'Required Role',
+                                         'M1 (Hrs)', 'M2 (Hrs)', 'M3 (Hrs)', 'M4 (Hrs)', 'M5 (Hrs)', 'M6 (Hrs)']
+                        for _s4hc in _s4h_expected:
+                            if _s4hc not in _s4h_up_df.columns:
+                                _s4h_up_df[_s4hc] = True if _s4hc == 'Confirmed' else (0.0 if '(Hrs)' in _s4hc else '')
+                        _s4h_up_df = _s4h_up_df[_s4h_expected]
+                        _s4h_up_df['Confirmed'] = True
+                        for _s4hc in ['M1 (Hrs)', 'M2 (Hrs)', 'M3 (Hrs)', 'M4 (Hrs)', 'M5 (Hrs)', 'M6 (Hrs)']:
+                            _s4h_up_df[_s4hc] = pd.to_numeric(_s4h_up_df[_s4hc], errors='coerce').fillna(0.0)
+                        st.session_state.s4v2_hist_df = _s4h_up_df
+                        st.success(f"✅ Loaded {len(_s4h_up_df)} row(s) — all marked Confirmed.")
+                    except Exception as _s4he:
+                        st.error(f"❌ Could not load file: {_s4he}")
+
+            if "Confirmed" not in st.session_state.s4v2_hist_df.columns:
+                st.session_state.s4v2_hist_df.insert(0, "Confirmed", False)
+            if "POD" not in st.session_state.s4v2_hist_df.columns:
+                st.session_state.s4v2_hist_df.insert(1, "POD", "")
+            st.caption("☑️ **Confirmed** rows are applied in the scenario. All uploaded rows are confirmed by default.")
+            st.session_state.s4v2_hist_df = st.data_editor(
+                st.session_state.s4v2_hist_df,
+                num_rows="dynamic",
+                use_container_width=True,
+                key="s4v2_hist_ed",
+                column_config={
+                    "Confirmed": st.column_config.CheckboxColumn("✅", default=True, help="Only confirmed rows are applied"),
+                    "POD": st.column_config.SelectboxColumn("POD", options=_s4h_pods_opts, default="", help="Required for new clients"),
+                    "Client": st.column_config.SelectboxColumn("Client", options=_s4h_cli_opts, required=True),
+                    "Required Role": st.column_config.SelectboxColumn("Required Role", options=_s4h_rol_opts, required=True),
+                    "M1 (Hrs)": st.column_config.NumberColumn("M1 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
+                    "M2 (Hrs)": st.column_config.NumberColumn("M2 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
+                    "M3 (Hrs)": st.column_config.NumberColumn("M3 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
+                    "M4 (Hrs)": st.column_config.NumberColumn("M4 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
+                    "M5 (Hrs)": st.column_config.NumberColumn("M5 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
+                    "M6 (Hrs)": st.column_config.NumberColumn("M6 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
+                }
+            )
+
+        # ── Reduce Hours (Scenario) ──────────────────────────────────────────
+        with st.expander("➖ Reduce Hours (Scenario)", expanded=False):
+            st.markdown(
+                "**Manual hours to subtract from the scenario.** Targeting is hierarchical:\n\n"
+                "- **POD only** → prorates across all clients & roles in that POD\n"
+                "- **POD + Role** → prorates across all clients in that POD for that role\n"
+                "- **POD + Client + Role** → applies to that exact combination\n"
+                "- **Client + Role** → applies to that client/role (no POD filter)"
+            )
+            _s4r_pods_opts = [""] + (lista_pods or st.session_state.get('_lista_pods', []))
+            _s4r_cli_opts  = [""] + lista_clientes
+
+            # Template download
+            _s4r_tmpl = pd.DataFrame([
+                {"Confirmed": True, "POD": "POD A", "Client": "", "Required Role": "",
+                 "M1 (Hrs)": 10, "M2 (Hrs)": 10, "M3 (Hrs)": 0, "M4 (Hrs)": 0, "M5 (Hrs)": 0, "M6 (Hrs)": 0},
+                {"Confirmed": True, "POD": "", "Client": "Acme Corp", "Required Role": "Accountant I",
+                 "M1 (Hrs)": 8, "M2 (Hrs)": 0, "M3 (Hrs)": 0, "M4 (Hrs)": 0, "M5 (Hrs)": 0, "M6 (Hrs)": 0},
+            ])
+            _s4r_buf = BytesIO()
+            _s4r_tmpl.to_excel(_s4r_buf, index=False)
+            _s4r_dl_col, _s4r_ul_col = st.columns([1, 1])
+            with _s4r_dl_col:
+                st.download_button("📄 Download Reduce Hours Template", _s4r_buf.getvalue(),
+                                   file_name="S4_ReduceHours_Template.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                   key="dl_s4r_tmpl")
+            with _s4r_ul_col:
+                _s4r_upload = st.file_uploader("📂 Upload Reduce Hours file", type=["xlsx"],
+                                               key="fu_s4r_tmpl", label_visibility="collapsed")
+                st.caption("📂 Upload Reduce Hours file (.xlsx)")
+                if _s4r_upload is not None:
+                    try:
+                        _s4r_up_df = pd.read_excel(_s4r_upload)
+                        if 'Role' in _s4r_up_df.columns and 'Required Role' not in _s4r_up_df.columns:
+                            _s4r_up_df = _s4r_up_df.rename(columns={'Role': 'Required Role'})
+                        _s4r_expected = ['Confirmed', 'POD', 'Client', 'Required Role',
+                                         'M1 (Hrs)', 'M2 (Hrs)', 'M3 (Hrs)', 'M4 (Hrs)', 'M5 (Hrs)', 'M6 (Hrs)']
+                        for _s4rc in _s4r_expected:
+                            if _s4rc not in _s4r_up_df.columns:
+                                _s4r_up_df[_s4rc] = True if _s4rc == 'Confirmed' else (0.0 if '(Hrs)' in _s4rc else '')
+                        _s4r_up_df = _s4r_up_df[_s4r_expected]
+                        _s4r_up_df['Confirmed'] = True
+                        for _s4rc in ['M1 (Hrs)', 'M2 (Hrs)', 'M3 (Hrs)', 'M4 (Hrs)', 'M5 (Hrs)', 'M6 (Hrs)']:
+                            _s4r_up_df[_s4rc] = pd.to_numeric(_s4r_up_df[_s4rc], errors='coerce').fillna(0.0)
+                        st.session_state.s4v2_red_df = _s4r_up_df
+                        st.success(f"✅ Loaded {len(_s4r_up_df)} row(s) — all marked Confirmed.")
+                    except Exception as _s4re:
+                        st.error(f"❌ Could not load file: {_s4re}")
+
+            if "Confirmed" not in st.session_state.s4v2_red_df.columns:
+                st.session_state.s4v2_red_df.insert(0, "Confirmed", False)
+            if "POD" not in st.session_state.s4v2_red_df.columns:
+                st.session_state.s4v2_red_df.insert(1, "POD", "")
+            st.caption("☑️ Check **Confirmed** on each row to include it in the scenario. Unconfirmed rows are ignored.")
+            st.session_state.s4v2_red_df = st.data_editor(
+                st.session_state.s4v2_red_df,
+                num_rows="dynamic",
+                use_container_width=True,
+                key="s4v2_red_ed",
+                column_config={
+                    "Confirmed": st.column_config.CheckboxColumn("✅", default=False, help="Only confirmed rows are applied"),
+                    "POD": st.column_config.SelectboxColumn("POD", options=_s4r_pods_opts, default="", help="Leave blank to target by Client only"),
+                    "Client": st.column_config.SelectboxColumn("Client", options=_s4r_cli_opts, default="", help="Leave blank to target entire POD"),
+                    "Required Role": st.column_config.SelectboxColumn("Role", options=[""] + roles_permitidos, default="", help="Leave blank to prorate across all roles"),
+                    "M1 (Hrs)": st.column_config.NumberColumn("M1 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
+                    "M2 (Hrs)": st.column_config.NumberColumn("M2 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
+                    "M3 (Hrs)": st.column_config.NumberColumn("M3 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
+                    "M4 (Hrs)": st.column_config.NumberColumn("M4 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
+                    "M5 (Hrs)": st.column_config.NumberColumn("M5 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
+                    "M6 (Hrs)": st.column_config.NumberColumn("M6 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
+                }
+            )
+
+        # ── Door Count Variation (Scenario) ─────────────────────────────────
+        with st.expander("🚪 Door Count Variation (Scenario)", expanded=False):
+            st.markdown(
+                "**Door / property count variation per client.** "
+                "Applies a percentage change to that client's capacity hours for the selected months — "
+                "positive % = increase (more doors), negative % = decrease. "
+                "Only ✅ Confirmed rows are applied in the scenario."
+            )
+            _s4dc_cli_opts  = [""] + lista_clientes
+            _s4dc_pods_opts = [""] + (lista_pods or st.session_state.get('_lista_pods', []))
+
+            # Template download
+            _s4dc_tmpl = pd.DataFrame([
+                {"Client": "Acme Corp", "POD": "POD A",
+                 "M1 (%)": 5.0, "M2 (%)": 5.0, "M3 (%)": 0.0,
+                 "M4 (%)": 0.0, "M5 (%)": 0.0, "M6 (%)": 0.0},
+                {"Client": "Beta LLC",  "POD": "",
+                 "M1 (%)": -10.0, "M2 (%)": -10.0, "M3 (%)": 0.0,
+                 "M4 (%)": 0.0,  "M5 (%)": 0.0,    "M6 (%)": 0.0},
+            ])
+            _s4dc_buf = BytesIO()
+            _s4dc_tmpl.to_excel(_s4dc_buf, index=False)
+            _s4dc_dl_col, _s4dc_ul_col = st.columns([1, 1])
+            with _s4dc_dl_col:
+                st.download_button(
+                    "📄 Download Door Count Template", _s4dc_buf.getvalue(),
+                    file_name="S4_DoorCount_Template.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_s4dc_tmpl",
+                )
+            with _s4dc_ul_col:
+                _s4dc_upload = st.file_uploader("📂 Upload Door Count file", type=["xlsx"],
+                                                key="fu_s4dc_tmpl", label_visibility="collapsed")
+                st.caption("📂 Upload Door Count file (.xlsx)")
+                if _s4dc_upload is not None:
+                    try:
+                        _s4dc_up_df = pd.read_excel(_s4dc_upload)
+                        _s4dc_expected = ['Confirmed', 'Client', 'POD'] + meses_pct_cols
+                        for _s4dcc in _s4dc_expected:
+                            if _s4dcc not in _s4dc_up_df.columns:
+                                _s4dc_up_df[_s4dcc] = True if _s4dcc == 'Confirmed' else (0.0 if '(%)' in _s4dcc else '')
+                        _s4dc_up_df = _s4dc_up_df[_s4dc_expected]
+                        _s4dc_up_df['Confirmed'] = True
+                        for _s4dcc in meses_pct_cols:
+                            _s4dc_up_df[_s4dcc] = pd.to_numeric(_s4dc_up_df[_s4dcc], errors='coerce').fillna(0.0)
+                        st.session_state.s4v2_doorcount_df = _s4dc_up_df
+                        st.success(f"✅ Loaded {len(_s4dc_up_df)} row(s) — all marked Confirmed.")
+                    except Exception as _s4dce:
+                        st.error(f"❌ Could not load file: {_s4dce}")
+
+            if "Confirmed" not in st.session_state.s4v2_doorcount_df.columns:
+                st.session_state.s4v2_doorcount_df.insert(0, "Confirmed", True)
+            if "POD" not in st.session_state.s4v2_doorcount_df.columns:
+                st.session_state.s4v2_doorcount_df.insert(2, "POD", "")
+
+            st.caption("☑️ **Confirmed** rows are applied in the scenario. Positive % = hours increase, negative % = decrease.")
+            st.session_state.s4v2_doorcount_df = st.data_editor(
+                st.session_state.s4v2_doorcount_df,
+                num_rows="dynamic",
+                use_container_width=True,
+                key="s4v2_dc_ed",
+                column_config={
+                    "Confirmed": st.column_config.CheckboxColumn("✅", default=True, help="Only confirmed rows are applied"),
+                    "Client": st.column_config.SelectboxColumn("Client", options=_s4dc_cli_opts, required=True),
+                    "POD": st.column_config.SelectboxColumn("POD", options=_s4dc_pods_opts, default=""),
+                    "M1 (%)": st.column_config.NumberColumn("M1 (%)", format="%.1f%%", help="% change for month 1"),
+                    "M2 (%)": st.column_config.NumberColumn("M2 (%)", format="%.1f%%"),
+                    "M3 (%)": st.column_config.NumberColumn("M3 (%)", format="%.1f%%"),
+                    "M4 (%)": st.column_config.NumberColumn("M4 (%)", format="%.1f%%"),
+                    "M5 (%)": st.column_config.NumberColumn("M5 (%)", format="%.1f%%"),
+                    "M6 (%)": st.column_config.NumberColumn("M6 (%)", format="%.1f%%"),
+                },
+            )
+
         # ── Confirmed-change detection ───────────────────────────────────────
         # Compare Confirmed state after all editors have rendered.
         # If only numeric values changed → scope="fragment" rerun (fast, display untouched).
@@ -8754,6 +9091,9 @@ if (
                 st.session_state.s4v2_mrr_adj_df.to_excel(_xw, sheet_name='MRR_Adjustments', index=False)
                 st.session_state.s4v2_hrs_role_df.to_excel(_xw, sheet_name='Hours_Adjustments', index=False)
                 st.session_state.s4v2_auto_df.to_excel(_xw, sheet_name='Auto_Savings', index=False)
+                st.session_state.s4v2_hist_df.to_excel(_xw, sheet_name='Add_Hours', index=False)
+                st.session_state.s4v2_red_df.to_excel(_xw, sheet_name='Reduce_Hours', index=False)
+                st.session_state.s4v2_doorcount_df.to_excel(_xw, sheet_name='DoorCount_Variation', index=False)
             _dl_c1.download_button(
                 "📥 Download Scenario",
                 _dl_buf.getvalue(),
@@ -8825,6 +9165,9 @@ if (
                 st.session_state.s4v2_mrr_adj_df.to_excel(_xw_all, sheet_name='4_MRR_Adjustments', index=False)
                 st.session_state.s4v2_hrs_role_df.to_excel(_xw_all, sheet_name='4_Hours_Adjustments', index=False)
                 st.session_state.s4v2_auto_df.to_excel(_xw_all, sheet_name='4_Auto_Savings', index=False)
+                st.session_state.s4v2_hist_df.to_excel(_xw_all, sheet_name='4_Add_Hours', index=False)
+                st.session_state.s4v2_red_df.to_excel(_xw_all, sheet_name='4_Reduce_Hours', index=False)
+                st.session_state.s4v2_doorcount_df.to_excel(_xw_all, sheet_name='4_DoorCount_Variation', index=False)
             _dl_c2.download_button(
                 "📥 Download All (Steps 2 + 3 + 4)",
                 _dl_all_buf.getvalue(),
@@ -8855,6 +9198,9 @@ if (
                     'mrr_adj_df':    st.session_state.s4v2_mrr_adj_df.copy(),
                     'hrs_role_df':   st.session_state.s4v2_hrs_role_df.copy(),
                     'auto_df':       st.session_state.s4v2_auto_df.copy(),
+                    'hist_df':       st.session_state.s4v2_hist_df.copy(),
+                    'red_df':        st.session_state.s4v2_red_df.copy(),
+                    'doorcount_df':  st.session_state.s4v2_doorcount_df.copy(),
                     'scope':         st.session_state.get('s4v2_scope', 'Overall'),
                     # Raw pipeline data so the scenario can be reloaded as a base
                     'vol_merged':    st.session_state.get('df_clean', pd.DataFrame()),
@@ -8881,6 +9227,9 @@ if (
                     if _ld.get('mrr_adj_df')   is not None: st.session_state.s4v2_mrr_adj_df  = _ld['mrr_adj_df']
                     if _ld.get('hrs_role_df')  is not None: st.session_state.s4v2_hrs_role_df = _ld['hrs_role_df']
                     if _ld.get('auto_df')      is not None: st.session_state.s4v2_auto_df      = _ld['auto_df']
+                    if _ld.get('hist_df')      is not None: st.session_state.s4v2_hist_df      = _ld['hist_df']
+                    if _ld.get('red_df')       is not None: st.session_state.s4v2_red_df       = _ld['red_df']
+                    if _ld.get('doorcount_df') is not None: st.session_state.s4v2_doorcount_df = _ld['doorcount_df']
                     st.success(f"Loaded: **{_ld.get('name', '')}**")
                     st.rerun()   # full rerun so display fragment also refreshes
 
