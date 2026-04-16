@@ -7587,14 +7587,14 @@ if "calc_data" in st.session_state:
                     _pe  = str(_brow.get('Processor Email', '') or '').strip().lower()
                     _pn  = str(_brow.get('Processor', '') or '').strip()
                     _pr  = str(_brow.get('Processor Role', '') or '').strip()
-                    _tp  = float(_brow.get('Total Hrs Proc w/ Shrinkage', 0) or 0)
+                    _tp  = float(_brow.get('Prod Hrs Proc (M1)', 0) or 0)
                     if _pe and _pe not in ('nan', 'none', '') and _tp > 0:
                         _el_assign.setdefault(_pe, []).append(('proc', _bcli, _pr, _tp, _bpod, _pn))
 
                     _re  = str(_brow.get('Reviewer Email', '') or '').strip().lower()
                     _rn  = str(_brow.get('Reviewer', '') or '').strip()
                     _rr  = str(_brow.get('Reviewer Role', '') or '').strip()
-                    _tr  = float(_brow.get('Total Hrs Rev w/ Shrinkage', 0) or 0)
+                    _tr  = float(_brow.get('Prod Hrs Rev (M1)', 0) or 0)
                     if _re and _re not in ('nan', 'none', '') and _tr > 0:
                         _el_assign.setdefault(_re, []).append(('rev', _bcli, _rr, _tr, _bpod, _rn))
 
@@ -7691,16 +7691,17 @@ if "calc_data" in st.session_state:
                 # ── Employee Hours Forecast ────────────────────────────────────
                 st.markdown("#### Employee Hours Forecast")
                 st.caption(
-                    "Busy Hours = sum of each employee's assigned hours (Processor + Reviewer), "
-                    "scaled month-by-month using the same logic as the cascade "
-                    "(flat for fixed-days old clients, learning curve for new clients, "
-                    "proportional for network-days). "
+                    "**Busy Hours = productive processing + reviewing hours** assigned to each employee "
+                    "(pure work time, before shrinkage), scaled month-by-month using the same cascade logic "
+                    "(flat for fixed-days old clients, learning curve for new clients, proportional for network-days). "
                     f"**Productive Capacity = available hours × role productivity goal** "
                     f"(Acct I/II = {int(util_acc1*100)}%, Gen. Acc. = {int(util_gen*100)}%, "
                     f"Sr. Acc. = {int(util_sr*100)}%). "
                     "**Hrs Left = productive capacity − busy hours** — negative values flag roles "
-                    "that are already over-utilised vs. their productivity target. Employees with "
-                    "a role ending in ` Att` are attrited (hours left = 0, all load is unassigned)."
+                    "that are already over-utilised vs. their productivity target. "
+                    "**Alert Relocate** = employee appears in volume assignments but is not an active productive role (Acc I/II, GA, Sr.) — "
+                    "busy hours shown for redistribution planning, Hrs Left = 0. "
+                    "Employees with a role ending in ` Att` are attrited."
                 )
 
                 # Active HC employees (not attrited) + all volume file employees
@@ -7757,14 +7758,14 @@ if "calc_data" in st.session_state:
                         _avail    = _el_hrs_fte.get(_ei, 150.0)
                         _prod_cap = _avail * _util_goal
                         _busy     = 0.0
-                        # No Active employees: still show their assigned load so planners
-                        # can see hours that need redistribution, but no productive capacity.
-                        if not _no_active:
-                            for _atype, _acli, _arole, _am1, _apod, _aname in _asns:
-                                if _el_pod != "Overall" and _apod != _el_pod:
-                                    continue
-                                _ratio = _el_ratio.get((_acli, _arole, _ei), 1.0)
-                                _busy += _am1 * _ratio
+                        # Compute busy hours for ALL employees — active AND alert-relocate.
+                        # Alert Relocate employees still carry load that needs redistribution;
+                        # their Hrs Left is forced to 0 below (no productive capacity target).
+                        for _atype, _acli, _arole, _am1, _apod, _aname in _asns:
+                            if _el_pod != "Overall" and _apod != _el_pod:
+                                continue
+                            _ratio = _el_ratio.get((_acli, _arole, _ei), 1.0)
+                            _busy += _am1 * _ratio
                         _busy = round(_busy, 1)
                         _mc   = _el_month_cols[_ei]
                         _rd[f"{_mc} Busy Hrs"] = _busy
