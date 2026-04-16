@@ -3834,6 +3834,9 @@ if "calc_data" in st.session_state:
                 _ob_disp['Start Date'] = pd.to_datetime(_ob_disp['Start Date'], errors='coerce').dt.strftime('%Y-%m-%d').fillna('—')
                 _ob_disp['POD'] = _ob_disp['POD'].replace({'nan': '—', '': '—', 'None': '—'}).fillna('—')
                 _ob_disp['Include'] = True  # must be added before data_editor
+                # Dynamic key — resets the data_editor when client list changes,
+                # preventing React error #185 (infinite update loop on shape change)
+                _ob_editor_key = f"hs_ob_editor_{len(_ob_disp)}_{abs(hash(tuple(_ob_disp['Client'].tolist())))}"
                 _ob_disp = st.data_editor(
                     _ob_disp,
                     use_container_width=True,
@@ -3844,12 +3847,12 @@ if "calc_data" in st.session_state:
                         'POD':     st.column_config.TextColumn('POD'),
                         'MRR ($)': st.column_config.NumberColumn('MRR ($)', format='$%.0f'),
                     },
-                    key="hs_ob_editor",
+                    key=_ob_editor_key,
                 )
                 _sel_ob = _ob_disp[_ob_disp['Include'] == True]
                 if st.button(
                     f"🤖 Queue {len(_sel_ob)} Clients for AI Prediction (Step 4)",
-                    type="primary", key="hs_queue_ai_btn",
+                    type="primary", key=f"hs_queue_ai_btn_{len(_ob_disp)}",
                     disabled=len(_sel_ob) == 0
                 ):
                     # Pre-populate ai_manual_clients with these new clients
