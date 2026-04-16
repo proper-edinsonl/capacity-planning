@@ -3833,26 +3833,27 @@ if "calc_data" in st.session_state:
                 _ob_disp.columns = ['Client', 'POD', 'Lifecycle', 'PMS', 'MRR ($)', 'Start Date']
                 _ob_disp['Start Date'] = pd.to_datetime(_ob_disp['Start Date'], errors='coerce').dt.strftime('%Y-%m-%d').fillna('—')
                 _ob_disp['POD'] = _ob_disp['POD'].replace({'nan': '—', '': '—', 'None': '—'}).fillna('—')
-                _ob_disp['Include'] = True  # must be added before data_editor
-                # Dynamic key — resets the data_editor when client list changes,
-                # preventing React error #185 (infinite update loop on shape change)
-                _ob_editor_key = f"hs_ob_editor_{len(_ob_disp)}_{abs(hash(tuple(_ob_disp['Client'].tolist())))}"
-                _ob_disp = st.data_editor(
+                # Display as read-only table — avoids data_editor React #185 crash
+                # inside fragments when data shape changes between renders
+                st.dataframe(
                     _ob_disp,
                     use_container_width=True,
                     hide_index=True,
-                    disabled=['Client', 'POD', 'Lifecycle', 'PMS', 'MRR ($)', 'Start Date'],
                     column_config={
-                        'Include': st.column_config.CheckboxColumn('Include', default=True),
-                        'POD':     st.column_config.TextColumn('POD'),
                         'MRR ($)': st.column_config.NumberColumn('MRR ($)', format='$%.0f'),
                     },
-                    key=_ob_editor_key,
                 )
-                _sel_ob = _ob_disp[_ob_disp['Include'] == True]
+                _ob_all_clients = _ob_disp['Client'].tolist()
+                _sel_clients = st.multiselect(
+                    "Select clients to queue:",
+                    options=_ob_all_clients,
+                    default=_ob_all_clients,
+                    key="hs_ob_multiselect",
+                )
+                _sel_ob = _ob_disp[_ob_disp['Client'].isin(_sel_clients)]
                 if st.button(
                     f"🤖 Queue {len(_sel_ob)} Clients for AI Prediction (Step 4)",
-                    type="primary", key=f"hs_queue_ai_btn_{len(_ob_disp)}",
+                    type="primary", key="hs_queue_ai_btn",
                     disabled=len(_sel_ob) == 0
                 ):
                     # Pre-populate ai_manual_clients with these new clients
