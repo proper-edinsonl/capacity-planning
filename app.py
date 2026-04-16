@@ -1918,6 +1918,30 @@ def _process_hc_report(file_bytes: bytes):
         by_sr_norm[_norm_name(_sn)] = _sr_data
         by_sr_email[_email]         = _sr_data
 
+    # ── Attrited (non-active) employees — kept so the Employee Level tab
+    # can surface them with a "<role> Att" suffix, indicating they are no
+    # longer productively available. We only include people who had a POD
+    # and a Capacity-mapped role at some point; otherwise the list balloons
+    # with support / corporate headcount unrelated to capacity planning.
+    attrited_raw = df[~df['Worker Status'].astype(str).str.lower().isin(['active', 'ready to start'])].copy()
+    if not attrited_raw.empty:
+        _att_pod_mask = attrited_raw['Department unit'].astype(str).str.strip().str.lower().str.startswith('pod')
+        attrited_pods = attrited_raw[_att_pod_mask].copy()
+        attrited_pods['Capacity Role'] = (
+            attrited_pods['Job title'].astype(str).str.lower().str.strip()
+            .map(_HC_ROLE_MAP).fillna('Other')
+        )
+        attrited_pods['POD'] = attrited_pods['Department unit'].astype(str).str.strip().str.title()
+        attrited_pods = attrited_pods[attrited_pods['Capacity Role'].isin(
+            ['Accountant I', 'Accountant II', 'General Accountant', 'Sr. Accountant']
+        )]
+        attrited_detail = attrited_pods[['Full name', 'Work Email', 'Job title',
+                                         'Capacity Role', 'POD', 'Worker Status']].copy()
+    else:
+        attrited_detail = pd.DataFrame(columns=[
+            'Full name', 'Work Email', 'Job title', 'Capacity Role', 'POD', 'Worker Status'
+        ])
+
     return {
         'by_role':        by_role,
         'by_pod_role':    by_pod_role,
@@ -1930,6 +1954,7 @@ def _process_hc_report(file_bytes: bytes):
         'mgr_total':      n_mgr_total,
         'mgr_by_pod':     mgr_by_pod,
         'detail':         active_pods[['Full name', 'Work Email', 'Job title', 'Capacity Role', 'POD']],
+        'attrited_detail': attrited_detail,
     }
 
 
@@ -2134,10 +2159,19 @@ if "automations_df" not in st.session_state:
 meses_hrs_cols = [f"M{i+1} (Hrs)" for i in range(6)]
 meses_fte_cols = [f"M{i+1} (FTEs)" for i in range(6)]
 
+meses_pct_cols = [f"M{i+1} (%)" for i in range(6)]   # for door-count variation
+
 if "historical_df" not in st.session_state:
-    st.session_state.historical_df = pd.DataFrame(columns=["Confirmed", "Client", "Required Role"] + meses_hrs_cols)
+    st.session_state.historical_df = pd.DataFrame(columns=["Confirmed", "POD", "Client", "Required Role"] + meses_hrs_cols)
 elif "Confirmed" not in st.session_state.historical_df.columns:
     st.session_state.historical_df.insert(0, "Confirmed", False)
+if "POD" not in st.session_state.historical_df.columns:
+    st.session_state.historical_df.insert(1, "POD", "")
+
+if "doorcount_df" not in st.session_state:
+    st.session_state.doorcount_df = pd.DataFrame(
+        columns=["Confirmed", "Client", "POD"] + meses_pct_cols
+    )
 
 if "reductions_df" not in st.session_state:
     st.session_state.reductions_df = pd.DataFrame(columns=["Confirmed", "POD", "Client", "Required Role"] + meses_hrs_cols)
@@ -2348,6 +2382,77 @@ _stc_sb_scroll.html("""
         }, { passive: false, capture: true });
     }
     attach();
+})();
+</script>
+""", height=0)
+
+# ── Main content wheel forwarder (JS) ────────────────────────────────────────
+# Streamlit's `st.dataframe` (and Plotly, AgGrid, etc.) trap wheel events so
+# the mouse wheel only scrolls the inner table — not the page — when the
+# cursor hovers over a waterfall. When the inner table has no more room to
+# scroll in the wheel direction, OR when the table content fits without its
+# own scrollbar (common for collapsed groups), we need to forward the wheel
+# to the main page scroll container. This listener does exactly that.
+import streamlit.components.v1 as _stc_main_scroll
+_stc_main_scroll.html("""
+<script>
+(function(){
+    var doc = window.parent.document;
+    var win = window.parent;
+    if (doc.__capMainScrollInit) return;
+    doc.__capMainScrollInit = true;
+
+    function isScrollable(el){
+        if (!el || el === doc.body || el === doc.documentElement) return false;
+        var cs = win.getComputedStyle(el);
+        var oy = cs.overflowY;
+        return (oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight + 1;
+    }
+
+    function findInnerScrollable(startEl, stopAt){
+        var el = startEl;
+        while (el && el !== stopAt && el !== doc.body){
+            if (isScrollable(el)) return el;
+            el = el.parentElement;
+        }
+        return null;
+    }
+
+    function pageScroller(){
+        // Streamlit app main scroll container — try a few selectors
+        return doc.querySelector('section.main')
+            || doc.querySelector('[data-testid="stAppViewContainer"] section')
+            || doc.querySelector('[data-testid="stAppViewContainer"]')
+            || doc.scrollingElement
+            || doc.documentElement;
+    }
+
+    doc.addEventListener('wheel', function(ev){
+        // Ignore sidebar (handled by its own listener)
+        var sb = doc.querySelector('section[data-testid="stSidebar"]');
+        if (sb && sb.contains(ev.target)) return;
+
+        var page = pageScroller();
+        // Find innermost scrollable ancestor of the wheel target
+        var inner = findInnerScrollable(ev.target, page);
+        if (!inner){
+            // No nested scroller — browser default handles page scroll
+            return;
+        }
+        // If inner can still scroll in the wheel direction, let it.
+        var dy = ev.deltaY;
+        var atTop    = inner.scrollTop <= 0;
+        var atBottom = (inner.scrollTop + inner.clientHeight) >= (inner.scrollHeight - 1);
+        if ((dy < 0 && !atTop) || (dy > 0 && !atBottom)){
+            return; // inner consumes it naturally
+        }
+        // Forward to page
+        if (page){
+            page.scrollTop += dy;
+            ev.preventDefault();
+            ev.stopPropagation();
+        }
+    }, { passive: false, capture: true });
 })();
 </script>
 """, height=0)
@@ -3214,6 +3319,14 @@ with tab1:
 # ==========================================
 # HUBSPOT SYNC (optional, after Step 1)
 # ==========================================
+# ── Re-enter the Data Load & Filters tab for all remaining sections
+# (HubSpot sync, Step 2 Efficiency, Step 3 Dashboards, Step 4 Scenario).
+# Without this, these blocks render at the page level and leak into the
+# other sibling tabs (Vol & AHT, Prediction, Recon, Actual Hours).
+# We use manual __enter__ to keep zero-indent code unchanged, and close
+# the context right before the next sibling `with tab_predict:` block.
+tab1.__enter__()
+
 if "calc_data" in st.session_state:
 
     @st.fragment
@@ -3815,6 +3928,7 @@ if "calc_data" in st.session_state:
             with _eff_col1:
                 if st.button("⚙️ Add Efficiency", type="primary", use_container_width=True):
                     st.session_state.s2_efficiency_choice = "yes"
+                    st.session_state['_s2_proceed'] = False   # reset gate
                     st.rerun()
             with _eff_col2:
                 if st.button("⏭️ Skip to Step 3 & 4", use_container_width=True):
@@ -3828,6 +3942,7 @@ if "calc_data" in st.session_state:
             st.success("Efficiency step skipped — no automations or adjustments will be applied.")
             if st.button("⚙️ Go back and add efficiency initiatives", key="s2_back_btn"):
                 st.session_state.s2_efficiency_choice = "yes"
+                st.session_state['_s2_proceed'] = False   # reset gate
                 st.rerun()
         else:
             # Show the full efficiency tables
@@ -3917,9 +4032,11 @@ if "calc_data" in st.session_state:
 
         @st.fragment
         def _hist_tab_fragment():
-            st.markdown("**Pure extra hours to add per month (e.g. Historical Accounting).**")
+            st.markdown("**Pure extra hours to add per month (e.g. Historical Accounting). Include the POD for new clients.**")
+            _avail_pods_h = [""] + lista_pods
+            _avail_cli_h  = st.session_state.calc_data.get('clientes_validos', [])
             _hist_tmpl = pd.DataFrame([
-                {"Client": "Acme Corp", "Required Role": "Accountant I",
+                {"POD": "POD A", "Client": "Acme Corp", "Required Role": "Accountant I",
                  "M1 (Hrs)": 20, "M2 (Hrs)": 20, "M3 (Hrs)": 20,
                  "M4 (Hrs)": 0,  "M5 (Hrs)": 0,  "M6 (Hrs)": 0},
             ])
@@ -3940,36 +4057,44 @@ if "calc_data" in st.session_state:
                         _hist_up_df = pd.read_excel(_hist_upload)
                         if 'Role' in _hist_up_df.columns and 'Required Role' not in _hist_up_df.columns:
                             _hist_up_df = _hist_up_df.rename(columns={'Role': 'Required Role'})
-                        _hist_expected = ['Confirmed', 'Client', 'Required Role',
+                        _hist_expected = ['Confirmed', 'POD', 'Client', 'Required Role',
                                           'M1 (Hrs)', 'M2 (Hrs)', 'M3 (Hrs)', 'M4 (Hrs)', 'M5 (Hrs)', 'M6 (Hrs)']
                         for _hc2 in _hist_expected:
                             if _hc2 not in _hist_up_df.columns:
-                                _hist_up_df[_hc2] = False if _hc2 == 'Confirmed' else (0.0 if '(Hrs)' in _hc2 else '')
+                                _hist_up_df[_hc2] = True if _hc2 == 'Confirmed' else (0.0 if '(Hrs)' in _hc2 else '')
                         _hist_up_df = _hist_up_df[_hist_expected]
-                        _hist_up_df['Confirmed'] = _hist_up_df['Confirmed'].fillna(False).astype(bool)
+                        # All rows from upload are confirmed by default
+                        _hist_up_df['Confirmed'] = True
                         for _hc2 in ['M1 (Hrs)', 'M2 (Hrs)', 'M3 (Hrs)', 'M4 (Hrs)', 'M5 (Hrs)', 'M6 (Hrs)']:
                             _hist_up_df[_hc2] = pd.to_numeric(_hist_up_df[_hc2], errors='coerce').fillna(0.0)
                         # Normalize client names case-insensitively
-                        _avail_cli = st.session_state.calc_data.get('clientes_validos', [])
-                        _cli_norm  = {c.lower().strip(): c for c in _avail_cli if c}
+                        _cli_norm_h = {c.lower().strip(): c for c in _avail_cli_h if c}
                         _hist_up_df['Client'] = _hist_up_df['Client'].fillna('').astype(str).str.strip().apply(
-                            lambda v: _cli_norm.get(v.lower(), v) if v else ''
+                            lambda v: _cli_norm_h.get(v.lower(), v) if v else ''
+                        )
+                        # Normalize POD
+                        _pod_norm_h = {p.lower().strip(): p for p in lista_pods if p}
+                        _hist_up_df['POD'] = _hist_up_df['POD'].fillna('').astype(str).str.strip().apply(
+                            lambda v: _pod_norm_h.get(v.lower(), v) if v else ''
                         )
                         st.session_state.historical_df = _hist_up_df
-                        st.success(f"✅ Loaded {len(_hist_up_df)} row(s) from file.")
+                        st.success(f"✅ Loaded {len(_hist_up_df)} row(s) — all marked Confirmed.")
                     except Exception as _he:
                         st.error(f"❌ Could not read file: {_he}")
             if "Confirmed" not in st.session_state.historical_df.columns:
                 st.session_state.historical_df.insert(0, "Confirmed", False)
-            st.caption("☑️ Check **Confirmed** on each row to include it in the cascade. Unconfirmed rows are ignored.")
+            if "POD" not in st.session_state.historical_df.columns:
+                st.session_state.historical_df.insert(1, "POD", "")
+            st.caption("☑️ **Confirmed** rows are included in the cascade. All uploaded rows are confirmed by default.")
             st.session_state.historical_df = st.data_editor(
                 st.session_state.historical_df,
                 num_rows="dynamic",
                 use_container_width=True,
                 key="hist_ed",
                 column_config={
-                    "Confirmed": st.column_config.CheckboxColumn("✅", default=False, help="Only confirmed rows are applied in Step 3"),
-                    "Client": st.column_config.SelectboxColumn("Client", options=st.session_state.calc_data['clientes_validos'], required=True),
+                    "Confirmed": st.column_config.CheckboxColumn("✅", default=True, help="Only confirmed rows are applied in Step 3"),
+                    "POD": st.column_config.SelectboxColumn("POD", options=_avail_pods_h, default="", help="Required for new clients not yet in the cascade"),
+                    "Client": st.column_config.SelectboxColumn("Client", options=_avail_cli_h, required=True),
                     "Required Role": st.column_config.SelectboxColumn("Required Role", options=roles_permitidos, required=True),
                 }
             )
@@ -4016,7 +4141,8 @@ if "calc_data" in st.session_state:
                             if _rc not in _red_up_df.columns:
                                 _red_up_df[_rc] = False if _rc == 'Confirmed' else (0.0 if '(Hrs)' in _rc else '')
                         _red_up_df = _red_up_df[_red_expected]
-                        _red_up_df['Confirmed'] = _red_up_df['Confirmed'].fillna(False).astype(bool)
+                        # All rows from upload are confirmed by default
+                        _red_up_df['Confirmed'] = True
                         for _hc in ['M1 (Hrs)', 'M2 (Hrs)', 'M3 (Hrs)', 'M4 (Hrs)', 'M5 (Hrs)', 'M6 (Hrs)']:
                             _red_up_df[_hc] = pd.to_numeric(_red_up_df[_hc], errors='coerce').fillna(0.0)
                         # Normalize POD/Client values to match exact dropdown options (case-insensitive)
@@ -4031,7 +4157,7 @@ if "calc_data" in st.session_state:
                             lambda v: _cli_norm_map.get(v.lower(), v) if v else ''
                         )
                         st.session_state.reductions_df = _red_up_df
-                        st.success(f"✅ Loaded {len(_red_up_df)} row(s) from file.")
+                        st.success(f"✅ Loaded {len(_red_up_df)} row(s) — all marked Confirmed.")
                     except Exception as _re:
                         st.error(f"❌ Could not read file: {_re}")
             if "Confirmed" not in st.session_state.reductions_df.columns:
@@ -4060,8 +4186,93 @@ if "calc_data" in st.session_state:
                 }
             )
 
+        @st.fragment
+        def _doorcount_tab_fragment():
+            st.markdown(
+                "**Door / property count variation per client.** "
+                "Applies a percentage change to that client's capacity hours for the selected months — "
+                "positive % = increase (more doors), negative % = decrease. "
+                "Only ✅ Confirmed rows are applied in the cascade."
+            )
+            _dc_avail_cli  = [""] + st.session_state.calc_data.get('clientes_validos', [])
+            _dc_avail_pods = [""] + lista_pods
+
+            # ── Template download ─────────────────────────────────────────────
+            _dc_tmpl = pd.DataFrame([
+                {"Client": "Acme Corp", "POD": "POD A",
+                 "M1 (%)": 5.0, "M2 (%)": 5.0, "M3 (%)": 0.0,
+                 "M4 (%)": 0.0, "M5 (%)": 0.0, "M6 (%)": 0.0},
+                {"Client": "Beta LLC",  "POD": "",
+                 "M1 (%)": -10.0, "M2 (%)": -10.0, "M3 (%)": 0.0,
+                 "M4 (%)": 0.0,  "M5 (%)": 0.0,    "M6 (%)": 0.0},
+            ])
+            _dc_buf = BytesIO()
+            _dc_tmpl.to_excel(_dc_buf, index=False)
+            _dc_dl_col, _dc_ul_col = st.columns([1, 1])
+            with _dc_dl_col:
+                st.download_button(
+                    "📄 Download Door Count Template",
+                    _dc_buf.getvalue(),
+                    file_name="DoorCount_Variation_Template.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_dc_tmpl",
+                )
+            with _dc_ul_col:
+                _dc_upload = st.file_uploader("📂 Upload Door Count file", type=["xlsx"],
+                                              key="fu_dc_tmpl", label_visibility="collapsed")
+                st.caption("📂 Upload Door Count file (.xlsx)")
+                if _dc_upload is not None:
+                    try:
+                        _dc_up_df = pd.read_excel(_dc_upload)
+                        _dc_expected = ['Confirmed', 'Client', 'POD'] + meses_pct_cols
+                        for _dcc in _dc_expected:
+                            if _dcc not in _dc_up_df.columns:
+                                _dc_up_df[_dcc] = True if _dcc == 'Confirmed' else (0.0 if '(%)' in _dcc else '')
+                        _dc_up_df = _dc_up_df[_dc_expected]
+                        _dc_up_df['Confirmed'] = True   # all uploaded rows confirmed
+                        for _dcc in meses_pct_cols:
+                            _dc_up_df[_dcc] = pd.to_numeric(_dc_up_df[_dcc], errors='coerce').fillna(0.0)
+                        _dc_cli_norm = {c.lower().strip(): c for c in _dc_avail_cli if c}
+                        _dc_up_df['Client'] = _dc_up_df['Client'].fillna('').astype(str).str.strip().apply(
+                            lambda v: _dc_cli_norm.get(v.lower(), v) if v else ''
+                        )
+                        _dc_pod_norm = {p.lower().strip(): p for p in lista_pods if p}
+                        _dc_up_df['POD'] = _dc_up_df['POD'].fillna('').astype(str).str.strip().apply(
+                            lambda v: _dc_pod_norm.get(v.lower(), v) if v else ''
+                        )
+                        st.session_state.doorcount_df = _dc_up_df
+                        st.success(f"✅ Loaded {len(_dc_up_df)} row(s) — all marked Confirmed.")
+                    except Exception as _dce:
+                        st.error(f"❌ Could not read file: {_dce}")
+
+            if "Confirmed" not in st.session_state.doorcount_df.columns:
+                st.session_state.doorcount_df.insert(0, "Confirmed", True)
+            if "POD" not in st.session_state.doorcount_df.columns:
+                st.session_state.doorcount_df.insert(2, "POD", "")
+
+            st.caption("☑️ **Confirmed** rows are applied in the cascade. Positive % = hours increase, negative % = decrease.")
+            st.session_state.doorcount_df = st.data_editor(
+                st.session_state.doorcount_df,
+                num_rows="dynamic",
+                use_container_width=True,
+                key="dc_ed",
+                column_config={
+                    "Confirmed": st.column_config.CheckboxColumn("✅", default=True, help="Only confirmed rows are applied in Step 3"),
+                    "Client": st.column_config.SelectboxColumn("Client", options=_dc_avail_cli, required=True),
+                    "POD": st.column_config.SelectboxColumn("POD", options=_dc_avail_pods, default=""),
+                    "M1 (%)": st.column_config.NumberColumn("M1 (%)", format="%.1f%%", help="% change for month 1"),
+                    "M2 (%)": st.column_config.NumberColumn("M2 (%)", format="%.1f%%"),
+                    "M3 (%)": st.column_config.NumberColumn("M3 (%)", format="%.1f%%"),
+                    "M4 (%)": st.column_config.NumberColumn("M4 (%)", format="%.1f%%"),
+                    "M5 (%)": st.column_config.NumberColumn("M5 (%)", format="%.1f%%"),
+                    "M6 (%)": st.column_config.NumberColumn("M6 (%)", format="%.1f%%"),
+                },
+            )
+
         if st.session_state.s2_efficiency_choice == "yes":
-            t_auto, t_hist, t_red = st.tabs(["⚙️ Automations", "➕ Add Hours", "➖ Reduce Hours"])
+            t_auto, t_hist, t_red, t_door = st.tabs([
+                "⚙️ Automations", "➕ Add Hours", "➖ Reduce Hours", "🚪 Door Count Variation"
+            ])
 
             with t_auto:
                 _auto_tab_fragment()
@@ -4071,6 +4282,24 @@ if "calc_data" in st.session_state:
 
             with t_red:
                 _red_tab_fragment()
+
+            with t_door:
+                _doorcount_tab_fragment()
+
+            # ── Proceed gate: hide Step 3 & 4 while the user is actively
+            # configuring Step 2. A "Proceed" button opens the gate; having
+            # already-run cascade results also keeps the gate open.
+            _s2_proc = st.session_state.get('_s2_proceed', False)
+            if not _s2_proc and 'final_dashboards' not in st.session_state:
+                st.divider()
+                _s2p_c1, _s2p_c2 = st.columns([3, 1])
+                with _s2p_c1:
+                    st.info("👆 Configure efficiency initiatives above. Click **Proceed to Step 3** when ready.")
+                with _s2p_c2:
+                    if st.button("▶ Proceed to Step 3", type="primary", key="s2_proceed_btn", use_container_width=True):
+                        st.session_state['_s2_proceed'] = True
+                        st.rerun()
+                st.stop()   # hides Step 3 & 4 until user clicks Proceed
 
         # ==========================================
     # STEP 3: RECALCULATION & DASHBOARDS
@@ -4313,10 +4542,15 @@ if "calc_data" in st.session_state:
                     _effs  = _auto_cache.get((_ck, _tk, _pk, _pmsk), [(0.0,0.0,0.0,0.0)]*6)
 
                     if _s3_use_real_cas:
-                        _ideal_p = str(row.get('Proc Role', 'Accountant I')).strip()
-                        _ideal_r = str(row.get('Rev Role',  'Sr. Accountant')).strip()
-                        if _ideal_p in ['nan','None','']: _ideal_p = 'Accountant I'
-                        if _ideal_r in ['nan','None','']: _ideal_r = 'Sr. Accountant'
+                        _ideal_p = str(row.get('Proc Role', '')).strip()
+                        _ideal_r = str(row.get('Rev Role',  '')).strip()
+                        # Fall back to Ideal Proc/Rev when real roles are blank/invalid
+                        if _ideal_p in ['nan', 'None', '']:
+                            _ideal_p = str(row.get('Ideal Proc', row.get('Proc Role', 'Accountant I'))).strip()
+                        if _ideal_r in ['nan', 'None', '']:
+                            _ideal_r = str(row.get('Ideal Rev', row.get('Rev Role', 'Sr. Accountant'))).strip()
+                        if _ideal_p in ['nan', 'None', '']: _ideal_p = 'Accountant I'
+                        if _ideal_r in ['nan', 'None', '']: _ideal_r = 'Sr. Accountant'
                     else:
                         _ideal_p = str(row.get('Ideal Proc', row.get('Proc Role', 'Accountant I'))).strip()
                         _ideal_r = str(row.get('Ideal Rev',  row.get('Rev Role',  'Sr. Accountant'))).strip()
@@ -4445,7 +4679,10 @@ if "calc_data" in st.session_state:
                     if pd.notna(c_name) and pd.notna(rol):
                         mask = (df_resumen["Client"] == c_name) & (df_resumen["Required Role"] == rol)
                         if not mask.any():
-                            new_row = {"POD": "Manual/Historical", "Client": c_name, "Required Role": rol, "Monthly_Cost": cost_map.get(rol, 0)}
+                            _h_pod = str(r.get("POD", "") or "").strip()
+                            if not _h_pod or _h_pod.lower() in ('nan', 'none', ''):
+                                _h_pod = "Manual/Historical"
+                            new_row = {"POD": _h_pod, "Client": c_name, "Required Role": rol, "Monthly_Cost": cost_map.get(rol, 0)}
                             for col in df_resumen.columns:
                                 if col not in new_row: new_row[col] = 0.0
                             df_resumen = pd.concat([df_resumen, pd.DataFrame([new_row])], ignore_index=True)
@@ -4455,6 +4692,32 @@ if "calc_data" in st.session_state:
                             val = pd.to_numeric(r.get(f"M{i+1} (Hrs)", 0), errors='coerce')
                             if pd.notna(val) and val > 0:
                                 df_resumen.loc[mask, f"M{i+1} ({mes_str}) - Adjustments (+) Hrs"] += val
+
+                # 3b. APPLY DOOR COUNT VARIATION
+                # Each confirmed row specifies a % change per month for a client.
+                # The percentage scales that client's Post-Auto Hours for the chosen months.
+                # Positive = more doors (more hours), negative = fewer doors (fewer hours).
+                _dc_raw = st.session_state.get('doorcount_df', pd.DataFrame())
+                if not _dc_raw.empty:
+                    _dc_conf = _dc_raw[_dc_raw.get('Confirmed', pd.Series(True, index=_dc_raw.index)) == True]
+                    for _, _dcr in _dc_conf.iterrows():
+                        _dc_cli = str(_dcr.get('Client', '') or '').strip()
+                        if not _dc_cli or _dc_cli.lower() in ('nan', 'none', ''):
+                            continue
+                        _dc_mask = df_resumen['Client'] == _dc_cli
+                        for _dci, _dcms in enumerate(meses_proyeccion):
+                            _dc_pct = pd.to_numeric(_dcr.get(f"M{_dci+1} (%)", 0), errors='coerce') or 0.0
+                            if _dc_pct == 0.0:
+                                continue
+                            _dc_post_col = f"M{_dci+1} ({_dcms}) - Post-Auto Hours"
+                            _dc_adj_col  = (
+                                f"M{_dci+1} ({_dcms}) - Adjustments (+) Hrs"
+                                if _dc_pct > 0
+                                else f"M{_dci+1} ({_dcms}) - Adjustments (-) Hrs"
+                            )
+                            if _dc_post_col in df_resumen.columns and _dc_mask.any():
+                                _dc_delta = df_resumen.loc[_dc_mask, _dc_post_col] * (abs(_dc_pct) / 100.0)
+                                df_resumen.loc[_dc_mask, _dc_adj_col] += _dc_delta.values
 
                 # 4. APPLY (-) REDUCTION ADJUSTMENTS  (POD-hierarchy)
                 _red_raw = st.session_state.reductions_df
@@ -6513,21 +6776,81 @@ if "calc_data" in st.session_state:
                 'General Accountant': 'FTEs General Acc.',
                 'Sr. Accountant':     'FTEs Sr. Accountant',
             }
+
+            # ── Cascade-aware scope: POD / Sr. filter from Step 3 ────────────
+            _ov_cascade_pods = st.session_state.get('_dash_sel_pods', [])
+            _ov_cascade_srs  = st.session_state.get('_dash_sel_srs', [])
+            _ov_scope_label  = "Overall"
+            if _ov_cascade_pods:
+                _ov_scope_label = f"POD · {', '.join(_ov_cascade_pods)}"
+            elif _ov_cascade_srs:
+                _ov_scope_label = f"Sr. · {', '.join(_ov_cascade_srs)}"
+
             if not _el_gen.empty:
-                st.markdown("#### 📋 Overall Role Summary")
-                st.caption("Matches the Required HC breakdown shown in the Capacity Overview. Actual HC column requires an HC report upload.")
-                _el_hc_br = _hc_el.get('by_role', {}) if _hc_el else {}
+                st.markdown(f"#### 📋 Overall Role Summary — {_ov_scope_label}")
+                st.caption(
+                    "Matches the Required HC breakdown shown in the Capacity Overview. "
+                    "Scoped by the active Step 3 cascade filter (POD / Sr. Accountant). "
+                    "Actual HC column requires an HC report upload."
+                )
                 _el_mcols_ov = [f"M{_ei+1} ({meses_proyeccion[_ei]})" for _ei in range(6)]
 
-                # Build total required FTEs per month
+                # ── Build required FTEs per role & month, scoped by cascade ──
+                _ov_req_by_role = {r: {c: 0.0 for c in _el_mcols_ov} for r in _el_role_fte_map_ov}
+                if _ov_cascade_pods or _ov_cascade_srs:
+                    # Scope Required FTEs from the client dashboard (hours → FTEs)
+                    for _ei in range(6):
+                        _mc_o = _el_mcols_ov[_ei]
+                        _fcol_ov = f"M{_ei+1} ({meses_proyeccion[_ei]}) - Final Hours"
+                        _av_ov   = _el_hrs_fte.get(_ei, 150.0)
+                        if not _el_cli.empty and _fcol_ov in _el_cli.columns:
+                            _scope_df = _el_cli
+                            if _ov_cascade_pods and 'POD' in _scope_df.columns:
+                                _scope_df = _scope_df[_scope_df['POD'].astype(str).isin(_ov_cascade_pods)]
+                            if _ov_cascade_srs and 'Sr. Accountant' in _scope_df.columns:
+                                _scope_df = _scope_df[_scope_df['Sr. Accountant'].astype(str).isin(_ov_cascade_srs)]
+                            for _r_ov in _el_role_fte_map_ov:
+                                _h = float(_scope_df[_scope_df['Required Role'] == _r_ov][_fcol_ov].sum())
+                                _ov_req_by_role[_r_ov][_mc_o] = round(_h / _av_ov, 2) if _av_ov > 0 else 0.0
+                else:
+                    for _r_ov, _cn_ov in _el_role_fte_map_ov.items():
+                        for _ei in range(6):
+                            _mc_o = _el_mcols_ov[_ei]
+                            _ov_req_by_role[_r_ov][_mc_o] = round(
+                                float(_el_gen.iloc[_ei].get(_cn_ov, 0) or 0) if _ei < len(_el_gen) else 0.0, 2
+                            )
+
+                # ── Actual HC per role, scoped by cascade ──
+                _ov_act_by_role = {r: None for r in _el_role_fte_map_ov}
+                if _hc_el:
+                    if _ov_cascade_pods:
+                        _bpr_ov = _hc_el.get('by_pod_role', pd.DataFrame())
+                        if not _bpr_ov.empty:
+                            _m_ov = _bpr_ov['POD'].astype(str).isin(_ov_cascade_pods)
+                            _bpr_ov = _bpr_ov[_m_ov]
+                            for _r_ov in _el_role_fte_map_ov:
+                                _rsum = float(_bpr_ov[_bpr_ov['Capacity Role'] == _r_ov]['HC'].sum())
+                                _ov_act_by_role[_r_ov] = _rsum
+                    elif _ov_cascade_srs:
+                        _by_sr_lu = _hc_el.get('by_sr', {})
+                        _agg = {r: 0.0 for r in _el_role_fte_map_ov}
+                        for _sr_n in _ov_cascade_srs:
+                            _sd = _by_sr_lu.get(_sr_n, {})
+                            _rd = _sd.get('by_role', {}) if _sd else {}
+                            for _r_ov in _el_role_fte_map_ov:
+                                _agg[_r_ov] += float(_rd.get(_r_ov, 0) or 0)
+                        _ov_act_by_role = {r: _agg[r] for r in _el_role_fte_map_ov}
+                    else:
+                        _br = _hc_el.get('by_role', {})
+                        _ov_act_by_role = {r: float(_br.get(r, 0) or 0) for r in _el_role_fte_map_ov}
+
+                # ── Totals ──
                 _ov_total_req = {}
                 for _ei in range(6):
                     _mc = _el_mcols_ov[_ei]
-                    _ov_total_req[_mc] = round(sum(
-                        float(_el_gen.iloc[_ei].get(_cn, 0) or 0) if _ei < len(_el_gen) else 0.0
-                        for _cn in _el_role_fte_map_ov.values()
-                    ), 2)
-                _ov_total_act = sum(_el_hc_br.get(r, 0) for r in _el_role_fte_map_ov) if _hc_el else None
+                    _ov_total_req[_mc] = round(sum(_ov_req_by_role[r][_mc] for r in _el_role_fte_map_ov), 2)
+                _ov_total_act = (sum(v for v in _ov_act_by_role.values() if v is not None)
+                                 if _hc_el else None)
 
                 _ov_rows = {}
                 _ov_rows['━ Required HC (FTEs)'] = _ov_total_req
@@ -6537,12 +6860,9 @@ if "calc_data" in st.session_state:
                         c: round(_ov_total_act - _ov_total_req[c], 2) for c in _el_mcols_ov
                     }
 
-                for _r_ov, _cn_ov in _el_role_fte_map_ov.items():
-                    _r_req = {}
-                    for _ei in range(6):
-                        _mc = _el_mcols_ov[_ei]
-                        _r_req[_mc] = round(float(_el_gen.iloc[_ei].get(_cn_ov, 0) or 0) if _ei < len(_el_gen) else 0.0, 2)
-                    _r_act = _el_hc_br.get(_r_ov, 0) if _hc_el else None
+                for _r_ov in _el_role_fte_map_ov:
+                    _r_req = _ov_req_by_role[_r_ov]
+                    _r_act = _ov_act_by_role.get(_r_ov)
                     _ov_rows[f'  · {_r_ov} — Req. FTEs'] = _r_req
                     if _r_act is not None:
                         _ov_rows[f'  · {_r_ov} — Actual HC'] = {c: _r_act for c in _el_mcols_ov}
@@ -6587,7 +6907,10 @@ if "calc_data" in st.session_state:
                         "Showing active HC employees with available hours only."
                     )
 
-                # ── Build HC roster: email → {name, role, pod, email_display} ──
+                # ── Build HC roster: email → {name, role, pod, attrited} ──
+                # Active employees first; then append attrited (terminated) employees
+                # with role suffixed by " Att" so capacity planners can see who
+                # previously carried load that now needs redistribution.
                 _hc_roster = {}
                 _hc_det2 = _hc_el.get('detail', pd.DataFrame())
                 if not _hc_det2.empty:
@@ -6595,11 +6918,32 @@ if "calc_data" in st.session_state:
                         _hem = str(_hr.get('Work Email', '')).strip()
                         if _hem and _hem.lower() not in ('nan', 'none', ''):
                             _hc_roster[_hem.lower()] = {
-                                'name':  str(_hr.get('Full name', '')).strip(),
-                                'email': _hem,
-                                'role':  str(_hr.get('Capacity Role', '')).strip(),
-                                'pod':   str(_hr.get('POD', '')).strip(),
+                                'name':     str(_hr.get('Full name', '')).strip(),
+                                'email':    _hem,
+                                'role':     str(_hr.get('Capacity Role', '')).strip(),
+                                'pod':      str(_hr.get('POD', '')).strip(),
+                                'attrited': False,
                             }
+
+                # Attrited employees — append with " Att" suffix on role
+                _hc_att_det = _hc_el.get('attrited_detail', pd.DataFrame())
+                if not _hc_att_det.empty:
+                    for _, _har in _hc_att_det.iterrows():
+                        _aem = str(_har.get('Work Email', '')).strip()
+                        if not _aem or _aem.lower() in ('nan', 'none', ''):
+                            continue
+                        _aem_k = _aem.lower()
+                        # If the person somehow also appears as active, keep the active row
+                        if _aem_k in _hc_roster:
+                            continue
+                        _base_role = str(_har.get('Capacity Role', '')).strip() or 'Other'
+                        _hc_roster[_aem_k] = {
+                            'name':     str(_har.get('Full name', '')).strip(),
+                            'email':    _aem,
+                            'role':     f"{_base_role} Att",
+                            'pod':      str(_har.get('POD', '')).strip(),
+                            'attrited': True,
+                        }
 
                 # ── Build ratio cache: (client, role, month_idx) → ratio vs M1 ─
                 # Captures fixed-days (flat/learning-curve) vs network-days (proportional)
@@ -6732,10 +7076,15 @@ if "calc_data" in st.session_state:
                     "scaled month-by-month using the same logic as the cascade "
                     "(flat for fixed-days old clients, learning curve for new clients, "
                     "proportional for network-days). "
-                    "Hrs Left = available hours − busy hours."
+                    f"**Productive Capacity = available hours × role productivity goal** "
+                    f"(Acct I/II = {int(util_acc1*100)}%, Gen. Acc. = {int(util_gen*100)}%, "
+                    f"Sr. Acc. = {int(util_sr*100)}%). "
+                    "**Hrs Left = productive capacity − busy hours** — negative values flag roles "
+                    "that are already over-utilised vs. their productivity target. Employees with "
+                    "a role ending in ` Att` are attrited (hours left = 0, all load is unassigned)."
                 )
 
-                # Union of all emails: from input assignments + HC active roster
+                # Union of all emails: from input assignments + HC roster (active + attrited)
                 _all_em = set(_el_assign.keys()) | set(_hc_roster.keys())
 
                 # Apply POD filter
@@ -6748,6 +7097,11 @@ if "calc_data" in st.session_state:
                             _filtered_em.add(_em)
                     _all_em = _filtered_em
 
+                # Role → utilization goal lookup — strips the " Att" suffix on the fly
+                def _role_util(_r):
+                    _rk = (_r or '').replace(' Att', '').strip()
+                    return utilization_map.get(_rk, util_acc1)
+
                 _el_emp_rows = []
                 for _em in sorted(_all_em):
                     _info    = _hc_roster.get(_em, {})
@@ -6755,24 +7109,38 @@ if "calc_data" in st.session_state:
                     # Role always from HC report — do NOT fall back to assignment data
                     _role    = _info.get('role', '')
                     _pod_d   = _info.get('pod', '')
+                    _attr    = bool(_info.get('attrited', False))
                     # POD may still fall back to assignment if employee not in HC
                     _asns    = _el_assign.get(_em, [])
                     if not _pod_d and _asns: _pod_d = _asns[0][4]
 
+                    # Role-specific productivity target (85 / 80 / 50%)
+                    _util_goal = _role_util(_role)
+
                     _rd = {'Email': _email_d, 'Role': _role, 'POD': _pod_d}
                     for _ei in range(6):
                         _avail = _el_hrs_fte.get(_ei, 150.0)
+                        _prod_cap = _avail * _util_goal   # productive capacity
                         _busy  = 0.0
-                        for _atype, _acli, _arole, _am1, _apod, _aname in _asns:
-                            if _el_pod != "Overall" and _apod != _el_pod:
-                                continue
-                            _ratio = _el_ratio.get((_acli, _arole, _ei), 1.0)
-                            _busy += _am1 * _ratio
+                        # Attrited employees contribute 0 productive capacity —
+                        # we still report busy hours (past assignments) so planners
+                        # can see load that needs redistribution.
+                        if not _attr:
+                            for _atype, _acli, _arole, _am1, _apod, _aname in _asns:
+                                if _el_pod != "Overall" and _apod != _el_pod:
+                                    continue
+                                _ratio = _el_ratio.get((_acli, _arole, _ei), 1.0)
+                                _busy += _am1 * _ratio
                         _busy = round(_busy, 1)
                         _mc   = _el_month_cols[_ei]
                         _rd[f"{_mc} Busy Hrs"] = _busy
-                        _rd[f"{_mc} Hrs Left"] = round(_avail - _busy, 1)
-                        _rd[f"{_mc} Util %"]   = round(_busy / _avail * 100, 1) if _avail > 0 else 0.0
+                        if _attr:
+                            # Hrs Left = 0 (no productive capacity); Util % left blank
+                            _rd[f"{_mc} Hrs Left"] = 0.0
+                            _rd[f"{_mc} Util %"]   = None
+                        else:
+                            _rd[f"{_mc} Hrs Left"] = round(_prod_cap - _busy, 1)
+                            _rd[f"{_mc} Util %"]   = round(_busy / _prod_cap * 100, 1) if _prod_cap > 0 else 0.0
                     _el_emp_rows.append(_rd)
 
                 if _el_emp_rows:
@@ -8372,6 +8740,9 @@ if (
                     st.session_state.historical_df.to_excel(_xw_all, sheet_name='2_Add_Hours', index=False)
                 if not st.session_state.reductions_df.empty:
                     st.session_state.reductions_df.to_excel(_xw_all, sheet_name='2_Reductions', index=False)
+                _dc_exp = st.session_state.get('doorcount_df', pd.DataFrame())
+                if not _dc_exp.empty:
+                    _dc_exp.to_excel(_xw_all, sheet_name='2_DoorCount_Variation', index=False)
                 # ── Step 4 scenario ───────────────────────────────────────────
                 _df_scen.to_excel(_xw_all, sheet_name='4_Scenario')
                 st.session_state.s4v2_params_df.to_excel(_xw_all, sheet_name='4_Global_Params', index=False)
@@ -8449,12 +8820,29 @@ if (
 
     # ── end of _s4v2_inputs_frag ────────────────────────────────────────────────
 
+    # ── Step 4 progress indicator ────────────────────────────────────────────────
+    # The Step 4 display fragment can take a moment to build the scenario table
+    # (precomputes 6 months × many rows). Show a transient progress bar while
+    # Streamlit renders the fragment so the user knows loading is in progress.
+    if not st.session_state.get('_s4_ready', False):
+        _s4_prog = st.progress(0, text="⏳ Loading Step 4 Capacity Scenario Planner…")
+        for _s4_pct in range(10, 101, 10):
+            import time as _time_s4
+            _time_s4.sleep(0.04)
+            _s4_prog.progress(_s4_pct, text=f"⏳ Initialising Step 4… {_s4_pct}%")
+        _s4_prog.empty()
+        st.session_state['_s4_ready'] = True
+
     _s4v2_fragment()          # display: scope, params, computation, table, comparison
     _s4v2_inputs_frag()       # inputs:  editors + downloads (isolated, fast reruns)
 
     if "df_clean" in st.session_state and "calc_data" in st.session_state:
         with st.expander("🧠 New Clients AI Prediction", expanded=False):
             _make_ai_prediction_fragment(pfx="s4", add_to_scenario=True)()
+
+# ── Close the Data Load & Filters tab context that was re-entered above
+# so the remaining sibling tabs render their own isolated content.
+tab1.__exit__(None, None, None)
 
 # ==========================================
 with tab_predict:
