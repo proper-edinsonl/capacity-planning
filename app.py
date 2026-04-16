@@ -7757,18 +7757,23 @@ if "calc_data" in st.session_state:
             _CLI_MIN, _CLI_MAX = 3, 5
             _THRESHOLD_PCT     = 7.0       # ±7% boundary
 
-            _hc_sr       = st.session_state.get('hc_data')
-            _cd_sr       = st.session_state.get('calc_data', {})
-            _df_clean_sr = st.session_state.get('df_clean', pd.DataFrame())
-            _df_rb       = _cd_sr.get('df_resumen_base', pd.DataFrame())
-            _meses_sr    = meses_proyeccion          # global variable — always defined
-            _wdays_sr    = _cd_sr.get('dict_workable_days', {})
+            _hc_sr    = st.session_state.get('hc_data')
+            _cd_sr    = st.session_state.get('calc_data', {})
+            _wdays_sr = _cd_sr.get('dict_workable_days', {})
+            _meses_sr = meses_proyeccion   # global — always defined
+            _fd_sr    = st.session_state.get('final_dashboards')
 
             if _hc_sr is None:
                 st.info("ℹ️ Upload the **HC Weekly Report** in Step 0 to enable Sr. Ratios.")
-            elif not _wdays_sr:
-                st.info("ℹ️ Run **Step 1** first to compute capacity data.")
+            elif not _wdays_sr or _fd_sr is None:
+                st.info("ℹ️ Run **Step 1** and generate reports first.")
             else:
+                # ── Data from final_dashboards['cliente'] ─────────────────────
+                # This DF already has Client, POD, Sr. Accountant, and per-month
+                # Productive Hours — no secondary joins needed.
+                _fd_cli = _fd_sr.get('cliente', pd.DataFrame())
+                _has_sr_col = 'Sr. Accountant' in _fd_cli.columns and 'Client' in _fd_cli.columns
+
                 # Month selector
                 _sr_month_opts = [f"M{i+1} — {m}" for i, m in enumerate(_meses_sr)]
                 _sr_sel_label  = st.selectbox("Period", _sr_month_opts, key="_sr_ratios_month")
@@ -7792,30 +7797,20 @@ if "calc_data" in st.session_state:
                     except Exception:
                         return '—'
 
-                # Client count per Sr. from df_clean
+                # Client count per Sr. — from final_dashboards (already has Sr. Accountant)
                 _sr_cli_count = {}
-                if not _df_clean_sr.empty and 'Sr. Accountant' in _df_clean_sr.columns and 'client_name' in _df_clean_sr.columns:
+                if _has_sr_col:
                     _sr_cli_count = (
-                        _df_clean_sr[_df_clean_sr['Sr. Accountant'].notna()]
-                        .groupby('Sr. Accountant')['client_name'].nunique()
+                        _fd_cli[_fd_cli['Sr. Accountant'].astype(str).str.strip().ne('')]
+                        .groupby('Sr. Accountant')['Client'].nunique()
                         .to_dict()
                     )
 
-                # Productive hours per Sr. — join df_resumen_base with df_clean via Client
+                # Productive hours per Sr. — from final_dashboards (already has Productive Hrs cols)
                 _sr_prod_hrs_map = {}
-                if (not _df_rb.empty and 'Client' in _df_rb.columns and _sr_prod_col in _df_rb.columns
-                        and not _df_clean_sr.empty and 'Sr. Accountant' in _df_clean_sr.columns
-                        and 'client_name' in _df_clean_sr.columns):
-                    _sr_cli_lkp = (
-                        _df_clean_sr[['client_name', 'Sr. Accountant']].drop_duplicates()
-                        .assign(_ckey=lambda d: d['client_name'].astype(str).str.lower().str.strip())
-                    )
-                    _df_rb_j = _df_rb.copy()
-                    _df_rb_j['_ckey'] = _df_rb_j['Client'].astype(str).str.lower().str.strip()
-                    _df_rb_j = _df_rb_j.merge(_sr_cli_lkp[['_ckey', 'Sr. Accountant']],
-                                               on='_ckey', how='left')
+                if _has_sr_col and _sr_prod_col in _fd_cli.columns:
                     _sr_prod_hrs_map = (
-                        _df_rb_j[_df_rb_j['Sr. Accountant'].notna()]
+                        _fd_cli[_fd_cli['Sr. Accountant'].astype(str).str.strip().ne('')]
                         .groupby('Sr. Accountant')[_sr_prod_col].sum()
                         .to_dict()
                     )
