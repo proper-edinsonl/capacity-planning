@@ -2850,42 +2850,33 @@ with tab1:
 
             col1, col2, col3 = st.columns(3)
             with col1:
+                # No default= here — key already handles persistence across reruns.
+                # Passing both default= and key= can cause React reconciliation loops.
                 selected_pods = st.multiselect(
-                    "1. Filter by POD", options=all_pods,
-                    default=st.session_state.get('_filt_pods', []),
+                    "Filter by POD", options=all_pods,
                     key="_s0_pods_ms",
                 )
             with col2:
                 selected_srs = st.multiselect(
-                    "2. Filter by Sr. Accountant", options=all_srs,
-                    default=st.session_state.get('_filt_srs', []),
+                    "Filter by Sr. Accountant", options=all_srs,
                     key="_s0_srs_ms",
                 )
 
-            # Persist selections — only write when value changes to avoid render-loop
-            if st.session_state.get('_filt_pods', []) != selected_pods:
+            # Sync to _filt_pods/_filt_srs only when value changes (other steps read these)
+            if st.session_state.get('_filt_pods') != selected_pods:
                 st.session_state['_filt_pods'] = selected_pods
-            if st.session_state.get('_filt_srs', []) != selected_srs:
+            if st.session_state.get('_filt_srs') != selected_srs:
                 st.session_state['_filt_srs']  = selected_srs
-
-            default_clients = []
-            if selected_pods or selected_srs:
-                mask = pd.Series(True, index=df_temp.index)
-                if selected_pods: mask &= df_temp['POD'].isin(selected_pods)
-                if selected_srs:  mask &= df_temp['Sr. Accountant'].isin(selected_srs)
-                default_clients = sorted(df_temp[mask]['client_name'].dropna().astype(str).unique().tolist())
 
             with col3:
                 selected_clients_final = st.multiselect(
-                    "3. Clients to Process", options=all_clients,
-                    default=default_clients,
+                    "Clients to Process", options=all_clients,
                     key="_s0_clients_ms",
                 )
                 if not selected_clients_final:
                     st.info("ℹ️ If left empty, the entire database will be processed.")
 
-            # Persist client selection — only write when value changes
-            if st.session_state.get('_filt_clients', []) != selected_clients_final:
+            if st.session_state.get('_filt_clients') != selected_clients_final:
                 st.session_state['_filt_clients'] = selected_clients_final
 
             # ── Confirmation of active filter — shown BEFORE onboarding list ─────
