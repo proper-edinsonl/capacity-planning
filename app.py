@@ -3017,15 +3017,14 @@ with tab1:
                             key="_ob_replace_multiselect",
                         )
                         _cur_rep = set(_cur_rep_list)
-                        # Keep _ob_replace_set in sync (only write when value changes)
-                        if _cur_rep != st.session_state.get('_ob_replace_set', set()):
-                            st.session_state['_ob_replace_set'] = _cur_rep
 
                         if _cur_rep:
                             if st.button(
                                 f"🤖 Queue {len(_cur_rep)} client(s) for AI Prediction",
                                 key="_ob_queue_ai_btn", type="primary"
                             ):
+                                # Write _ob_replace_set only inside button callback — never during render
+                                st.session_state['_ob_replace_set'] = _cur_rep
                                 _existing_ai2 = st.session_state.get('ai_manual_clients', pd.DataFrame())
                                 _new_ai_rows2 = []
                                 for _, _ob_r in _ob_disp_df[_ob_disp_df['Client'].isin(_cur_rep)].iterrows():
