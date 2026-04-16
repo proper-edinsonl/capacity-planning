@@ -7278,8 +7278,9 @@ if "calc_data" in st.session_state:
                     "a role ending in ` Att` are attrited (hours left = 0, all load is unassigned)."
                 )
 
-                # Union of all emails: from input assignments + HC roster (active + attrited)
-                _all_em = set(_el_assign.keys()) | set(_hc_roster.keys())
+                # Active HC employees (not attrited) + all volume file employees
+                _hc_active_set = {e for e, inf in _hc_roster.items() if not inf.get('attrited', False)}
+                _all_em = set(_el_assign.keys()) | _hc_active_set
 
                 # Apply POD filter
                 if _el_pod != "Overall":
@@ -7291,35 +7292,49 @@ if "calc_data" in st.session_state:
                             _filtered_em.add(_em)
                     _all_em = _filtered_em
 
-                # Role → utilization goal lookup — strips the " Att" suffix on the fly
+                # Role → utilization goal lookup — strips " Att" and " - No Active" suffixes
                 def _role_util(_r):
-                    _rk = (_r or '').replace(' Att', '').strip()
+                    _rk = (_r or '').replace(' Att', '').replace(' - No Active', '').strip()
                     return utilization_map.get(_rk, util_acc1)
 
                 _el_emp_rows = []
                 for _em in sorted(_all_em):
                     _info    = _hc_roster.get(_em, {})
                     _email_d = _info.get('email', _em)
-                    # Role always from HC report — do NOT fall back to assignment data
-                    _role    = _info.get('role', '')
-                    _pod_d   = _info.get('pod', '')
-                    _attr    = bool(_info.get('attrited', False))
-                    # POD may still fall back to assignment if employee not in HC
                     _asns    = _el_assign.get(_em, [])
-                    if not _pod_d and _asns: _pod_d = _asns[0][4]
+
+                    # Determine if this employee is active in HC
+                    _is_active_hc = _em in _hc_active_set
+
+                    if _is_active_hc:
+                        # Role always from HC report for active employees
+                        _role  = _info.get('role', '')
+                        _pod_d = _info.get('pod', '')
+                        _no_active = False
+                    else:
+                        # Volume-only or not currently active in HC —
+                        # derive role from assignments (most common role used)
+                        _asn_roles = [a[2] for a in _asns if a[2]]
+                        _base_role = max(set(_asn_roles), key=_asn_roles.count) if _asn_roles else 'Unknown'
+                        _role  = f"{_base_role} - No Active"
+                        _pod_d = _asns[0][4] if _asns else ''
+                        _no_active = True
+
+                    # POD fallback to assignment if missing
+                    if not _pod_d and _asns:
+                        _pod_d = _asns[0][4]
 
                     # Role-specific productivity target (85 / 80 / 50%)
                     _util_goal = _role_util(_role)
 
                     _rd = {'Email': _email_d, 'Role': _role, 'POD': _pod_d}
                     for _ei in range(6):
-                        _avail = _el_hrs_fte.get(_ei, 150.0)
-                        _prod_cap = _avail * _util_goal   # productive capacity
-                        _busy  = 0.0
-                        # Attrited employees contribute 0 productive capacity —
-                        # we still report busy hours (past assignments) so planners
-                        # can see load that needs redistribution.
-                        if not _attr:
+                        _avail    = _el_hrs_fte.get(_ei, 150.0)
+                        _prod_cap = _avail * _util_goal
+                        _busy     = 0.0
+                        # No Active employees: still show their assigned load so planners
+                        # can see hours that need redistribution, but no productive capacity.
+                        if not _no_active:
                             for _atype, _acli, _arole, _am1, _apod, _aname in _asns:
                                 if _el_pod != "Overall" and _apod != _el_pod:
                                     continue
@@ -7328,8 +7343,8 @@ if "calc_data" in st.session_state:
                         _busy = round(_busy, 1)
                         _mc   = _el_month_cols[_ei]
                         _rd[f"{_mc} Busy Hrs"] = _busy
-                        if _attr:
-                            # Hrs Left = 0 (no productive capacity); Util % left blank
+                        if _no_active:
+                            # No productive capacity; Util % left blank
                             _rd[f"{_mc} Hrs Left"] = 0.0
                             _rd[f"{_mc} Util %"]   = None
                         else:
