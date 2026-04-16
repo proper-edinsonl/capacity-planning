@@ -8129,11 +8129,117 @@ if "calc_data" in st.session_state:
             _el_df_exp = st.session_state.get('_s3_emp_level_df', pd.DataFrame())
             if not _el_df_exp.empty:
                 _el_df_exp.to_excel(writer, index=False, sheet_name='Employee_Level')
-            # Tab 8: Sr. Ratios
-            _sr_rat_exp = st.session_state.get('_s3_sr_ratios_df', pd.DataFrame())
-            if not _sr_rat_exp.empty:
-                _sr_rat_exp.to_excel(writer, index=False, sheet_name='Sr_Ratios')
-            # Tab 9: Client MRR by Month
+            # Tab 8: Sr. Ratios — computed inline so it's always fresh (no tab visit required)
+            _sr_hc_exp  = st.session_state.get('hc_data', None)
+            _sr_wday_exp = st.session_state.get('calc_data', {}).get('dict_workable_days', {})
+            if _sr_hc_exp and _sr_wday_exp:
+                _SR_OPS_FIXED_X = 35.0;  _SR_OPS_VAR_X = 1.5
+                _SR_HRS_DAY_X   = 8.0;   _SR_BASE_DAYS_X = 20;  _SR_THRESH_X = 7.0
+                _DR_MIN_X, _DR_MAX_X   = 7, 9
+                _CLI_MIN_X, _CLI_MAX_X = 3, 5
+                _sr_mi_x     = st.session_state.get('_sr_ratios_month', None)
+                _sr_opts_x   = [f"M{i+1} — {m}" for i, m in enumerate(meses_proyeccion)]
+                _sr_mi_idx_x = _sr_opts_x.index(_sr_mi_x) if _sr_mi_x in _sr_opts_x else 0
+                _sr_ndays_x  = _sr_wday_exp.get(_sr_mi_idx_x, 20)
+                _df_cx = st.session_state.get('df_clean', pd.DataFrame())
+                _sr_cli_x = {}
+                if 'Sr. Accountant' in _df_cx.columns and 'client_name' in _df_cx.columns:
+                    _sr_cli_x = (_df_cx[_df_cx['Sr. Accountant'].astype(str).str.strip().ne('')]
+                                 .groupby(_df_cx['Sr. Accountant'].astype(str).str.lower().str.strip())
+                                 ['client_name'].nunique().to_dict())
+                _sr_prh_x = {}
+                if ('processor' in _df_cx.columns and 'Capacity Processing Hours' in _df_cx.columns
+                        and 'reviewer' in _df_cx.columns and 'Capacity reviewing hours' in _df_cx.columns):
+                    _pm_x = _df_cx.groupby(_df_cx['processor'].astype(str).str.lower().str.strip())['Capacity Processing Hours'].sum().to_dict()
+                    _rm_x = _df_cx.groupby(_df_cx['reviewer'].astype(str).str.lower().str.strip())['Capacity reviewing hours'].sum().to_dict()
+                    for _ex in set(_pm_x) | set(_rm_x):
+                        _sr_prh_x[_ex] = float(_pm_x.get(_ex, 0.0)) + float(_rm_x.get(_ex, 0.0))
+                _sr_mec_x, _sr_oth_x = {}, {}
+                _need_x = ['Ideal Proc', 'Ideal Rev', 'Capacity Processing Hours', 'Capacity reviewing hours', 'type', 'Sr. Accountant']
+                if not _df_cx.empty and all(c in _df_cx.columns for c in _need_x):
+                    _sk_x  = _df_cx['Sr. Accountant'].astype(str).str.lower().str.strip()
+                    _ip_x  = _df_cx['Ideal Proc'].astype(str).str.strip()
+                    _ir_x  = _df_cx['Ideal Rev'].astype(str).str.strip()
+                    _ty_x  = _df_cx['type'].astype(str).str.strip().str.upper()
+                    _ph_x  = pd.to_numeric(_df_cx['Capacity Processing Hours'], errors='coerce').fillna(0.0)
+                    _rh_x  = pd.to_numeric(_df_cx['Capacity reviewing hours'],  errors='coerce').fillna(0.0)
+                    _cp_x  = pd.concat([
+                        pd.DataFrame({'_sr': _sk_x[_ip_x=='Sr. Accountant'], '_ty': _ty_x[_ip_x=='Sr. Accountant'], '_h': _ph_x[_ip_x=='Sr. Accountant']}),
+                        pd.DataFrame({'_sr': _sk_x[_ir_x=='Sr. Accountant'], '_ty': _ty_x[_ir_x=='Sr. Accountant'], '_h': _rh_x[_ir_x=='Sr. Accountant']}),
+                    ], ignore_index=True)
+                    if not _cp_x.empty:
+                        _piv_x = _cp_x.groupby(['_sr','_ty'])['_h'].sum().unstack(fill_value=0.0)
+                        _sr_mec_x = _piv_x.get('MEC',   pd.Series(dtype=float)).to_dict()
+                        _sr_oth_x = _piv_x.get('OTHER', pd.Series(dtype=float)).to_dict()
+                def _ast_x(p):
+                    if p > _SR_THRESH_X:   return '🟢 Available'
+                    if p >= -_SR_THRESH_X: return '✅ On Track'
+                    return '🔴 Potential Burnout'
+                _sr_rows_x = []
+                for _sea_x, _sia_x in _sr_hc_exp.get('by_sr_email', {}).items():
+                    _drc_x = int(_sia_x.get('dr_total', 0))
+                    _sdt_x = _sia_x.get('start_date', pd.NaT)
+                    _sc_x  = _sr_ndays_x / _SR_BASE_DAYS_X
+                    _oph_x = (_SR_OPS_FIXED_X + _SR_OPS_VAR_X * _drc_x) * _sc_x
+                    _toh_x = _SR_HRS_DAY_X * _sr_ndays_x
+                    _cph_x = max(_toh_x - _oph_x, 0.0)
+                    _prh_v = float(_sr_prh_x.get(_sea_x, 0.0))
+                    _rmh_x = _cph_x - _prh_v
+                    _pct_x = (_rmh_x / _cph_x * 100) if _cph_x > 0 else 0.0
+                    _clh_x = float(_sr_mec_x.get(_sea_x, 0.0)) + float(_sr_oth_x.get(_sea_x, 0.0))
+                    _rmm_x = _cph_x - _clh_x
+                    _ptm_x = (_rmm_x / _cph_x * 100) if _cph_x > 0 else 0.0
+                    _cli_c = int(_sr_cli_x.get(_sea_x, 0))
+                    _drf_x = '✅' if _DR_MIN_X  <= _drc_x  <= _DR_MAX_X  else ('⬇️' if _drc_x  < _DR_MIN_X  else '⬆️')
+                    _clf_x = '✅' if _CLI_MIN_X <= _cli_c <= _CLI_MAX_X else ('⬇️' if _cli_c < _CLI_MIN_X else '⬆️')
+                    _sr_rows_x.append({
+                        'POD':                               str(_sia_x.get('pod', '')),
+                        'Sr. Accountant':                    _sea_x,
+                        'Period':                            meses_proyeccion[_sr_mi_idx_x],
+                        'Hire Date':                         pd.Timestamp(_sdt_x).strftime('%Y-%m-%d') if pd.notna(_sdt_x) else '—',
+                        'Direct Reports':                    f"{_drc_x} {_drf_x}",
+                        'Clients Assigned':                  f"{_cli_c} {_clf_x}",
+                        'Productive Hrs':                    round(_prh_v, 1),
+                        'Total Work Hours':                  round(_toh_x, 1),
+                        'Ops Rhythm Hrs':                    round(_oph_x, 1),
+                        'Productive Capacity (After Ops R)': round(_cph_x, 1),
+                        'Remaining Hrs':                     round(_rmh_x, 1),
+                        '% Remaining':                       round(_pct_x, 1),
+                        'Status':                            _ast_x(_pct_x),
+                        'MEC & Other Client Hrs':            round(_clh_x, 1),
+                        'Remaining Hrs (MEC)':               round(_rmm_x, 1),
+                        '% Remaining (MEC)':                 round(_ptm_x, 1),
+                        'Status (MEC)':                      _ast_x(_ptm_x),
+                    })
+                if _sr_rows_x:
+                    _sr_df_x = pd.DataFrame(_sr_rows_x).sort_values(['POD', 'Sr. Accountant']).reset_index(drop=True)
+                    _sr_df_x.to_excel(writer, index=False, sheet_name='Sr_Ratios')
+                    st.session_state['_s3_sr_ratios_df'] = _sr_df_x.copy()
+            # Tab 9: Client FTEs by Month — POD + Sr. + Client totals across all roles
+            _cli_fte_src = st.session_state.final_dashboards.get('cliente', pd.DataFrame())
+            if not _cli_fte_src.empty:
+                _fte_id_cols  = [c for c in ['POD', 'Sr. Accountant', 'Client'] if c in _cli_fte_src.columns]
+                _fte_m_cols   = [c for c in _cli_fte_src.columns if '- Final FTEs' in c]
+                _fte_hrs_cols = [c for c in _cli_fte_src.columns if '- Final Hours' in c]
+                _fte_keep     = _fte_id_cols + _fte_m_cols + _fte_hrs_cols
+                if _fte_id_cols and _fte_m_cols:
+                    _cli_fte_df = (
+                        _cli_fte_src[_fte_keep]
+                        .groupby(_fte_id_cols, as_index=False)[_fte_m_cols + _fte_hrs_cols].sum()
+                        .sort_values(_fte_id_cols)
+                        .reset_index(drop=True)
+                    )
+                    # Rename columns: "M1 (Jan 2026) - Final FTEs" → "M1 FTEs", etc.
+                    _fte_rename = {}
+                    for _c in _fte_m_cols:
+                        _lbl = _c.split(' - ')[0]   # e.g. "M1 (Jan 2026)"
+                        _fte_rename[_c] = f"{_lbl} FTEs"
+                    for _c in _fte_hrs_cols:
+                        _lbl = _c.split(' - ')[0]
+                        _fte_rename[_c] = f"{_lbl} Hrs"
+                    _cli_fte_df.rename(columns=_fte_rename, inplace=True)
+                    _cli_fte_df.to_excel(writer, index=False, sheet_name='Client_FTEs_by_Month')
+            # Tab 10: Client MRR by Month
             _cmrr_exp = st.session_state.final_dashboards.get('client_mrr', pd.DataFrame())
             if not _cmrr_exp.empty:
                 _cmrr_exp.to_excel(writer, index=False, sheet_name='Client_MRR')
@@ -10102,10 +10208,22 @@ if (
                 _df_resbase_s4 = st.session_state.get('calc_data', {}).get('df_resumen_base', pd.DataFrame())
                 if not _df_resbase_s4.empty:
                     _df_resbase_s4.to_excel(_xw, sheet_name='Base_Hours_by_Role', index=False)
-                # Sr. Ratios
+                # Sr. Ratios (always from session state — populated by primary export builder)
                 _sr_rat_dl = st.session_state.get('_s3_sr_ratios_df', pd.DataFrame())
                 if not _sr_rat_dl.empty:
                     _sr_rat_dl.to_excel(_xw, sheet_name='Sr_Ratios', index=False)
+                # Client FTEs by Month
+                _cli_fte_s4 = _fd_s4.get('cliente', pd.DataFrame())
+                if not _cli_fte_s4.empty:
+                    _fte_id_s4  = [c for c in ['POD', 'Sr. Accountant', 'Client'] if c in _cli_fte_s4.columns]
+                    _fte_mc_s4  = [c for c in _cli_fte_s4.columns if '- Final FTEs' in c]
+                    _fte_hc_s4  = [c for c in _cli_fte_s4.columns if '- Final Hours' in c]
+                    if _fte_id_s4 and _fte_mc_s4:
+                        _cfte_s4 = (_cli_fte_s4[_fte_id_s4 + _fte_mc_s4 + _fte_hc_s4]
+                                    .groupby(_fte_id_s4, as_index=False)[_fte_mc_s4 + _fte_hc_s4].sum()
+                                    .sort_values(_fte_id_s4).reset_index(drop=True))
+                        _cfte_s4.rename(columns={c: c.replace('- Final FTEs', 'FTEs').replace('- Final Hours', 'Hrs') for c in _fte_mc_s4 + _fte_hc_s4}, inplace=True)
+                        _cfte_s4.to_excel(_xw, sheet_name='Client_FTEs_by_Month', index=False)
                 # Scenario inputs
                 st.session_state.s4v2_hc_adj_df.to_excel(_xw, sheet_name='HC_Adjustments', index=False)
                 st.session_state.s4v2_mrr_adj_df.to_excel(_xw, sheet_name='MRR_Adjustments', index=False)
@@ -10163,6 +10281,18 @@ if (
                 _sr_rat_all = st.session_state.get('_s3_sr_ratios_df', pd.DataFrame())
                 if not _sr_rat_all.empty:
                     _sr_rat_all.to_excel(_xw_all, sheet_name='3_Sr_Ratios', index=False)
+                # Tab: Client FTEs by Month
+                _cli_fte_all = _fd_all.get('cliente', pd.DataFrame())
+                if not _cli_fte_all.empty:
+                    _fte_id_all  = [c for c in ['POD', 'Sr. Accountant', 'Client'] if c in _cli_fte_all.columns]
+                    _fte_mc_all  = [c for c in _cli_fte_all.columns if '- Final FTEs' in c]
+                    _fte_hc_all  = [c for c in _cli_fte_all.columns if '- Final Hours' in c]
+                    if _fte_id_all and _fte_mc_all:
+                        _cfte_all = (_cli_fte_all[_fte_id_all + _fte_mc_all + _fte_hc_all]
+                                     .groupby(_fte_id_all, as_index=False)[_fte_mc_all + _fte_hc_all].sum()
+                                     .sort_values(_fte_id_all).reset_index(drop=True))
+                        _cfte_all.rename(columns={c: c.replace('- Final FTEs', 'FTEs').replace('- Final Hours', 'Hrs') for c in _fte_mc_all + _fte_hc_all}, inplace=True)
+                        _cfte_all.to_excel(_xw_all, sheet_name='3_Client_FTEs_by_Month', index=False)
                 # ── Step 2 inputs ─────────────────────────────────────────────
                 if not st.session_state.automations_df.empty:
                     st.session_state.automations_df.to_excel(_xw_all, sheet_name='2_Automations', index=False)
