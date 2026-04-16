@@ -1838,7 +1838,7 @@ def _process_hc_report(file_bytes: bytes):
     df = pd.read_excel(BytesIO(file_bytes), sheet_name='Weekly Report')
     df.columns = df.columns.str.strip()
 
-    active = df[df['Worker Status'].astype(str).str.lower().isin(['active', 'ready to start'])].copy()
+    active = df[df['Worker Status'].astype(str).str.lower() == 'active'].copy()
     pod_mask = active['Department unit'].astype(str).str.strip().str.lower().str.startswith('pod')
     active_pods = active[pod_mask].copy()
 
@@ -1864,8 +1864,11 @@ def _process_hc_report(file_bytes: bytes):
         if not _mgr_df.empty else {}
     )
 
-    by_role     = active_pods.groupby('Capacity Role')['Full name'].count().to_dict()
-    by_pod_role = (active_pods.groupby(['POD', 'Capacity Role'])['Full name']
+    _productive_roles = {'Accountant I', 'Accountant II', 'General Accountant', 'Sr. Accountant'}
+    by_role     = {k: v for k, v in active_pods.groupby('Capacity Role')['Full name'].count().to_dict().items()
+                   if k in _productive_roles}
+    by_pod_role = (active_pods[active_pods['Capacity Role'].isin(_productive_roles)]
+                   .groupby(['POD', 'Capacity Role'])['Full name']
                    .count().reset_index().rename(columns={'Full name': 'HC'}))
     total       = int(active_pods['Capacity Role'].ne('Other').sum())  # count only mapped roles
 
