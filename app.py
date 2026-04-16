@@ -5779,22 +5779,14 @@ if "calc_data" in st.session_state:
             'client_mrr': _df_height(len(_fd_now.get('client_mrr', pd.DataFrame()))),
         }
 
-        # ── Overlay placeholder (must be before widgets) ─────────────────────────
-        _dash_ov = st.empty()
-
-        # ── Environment fingerprint for change detection ──────────────────────────
+        # ── Environment fingerprint (tracked for future use; visual feedback via JS bar) ──
         _dash_env_now = json.dumps([
             st.session_state.get('view_mode_radio', ''),
             sorted(st.session_state.get('_dash_sel_pods',    [])),
             sorted(st.session_state.get('_dash_sel_srs',     [])),
             st.session_state.get('_fd_version', 0),
         ], sort_keys=True)
-        _dash_env_prev  = st.session_state.get('_dash_env_prev', '')
-        _dash_env_changed = bool(_dash_env_prev) and _dash_env_prev != _dash_env_now
         st.session_state['_dash_env_prev'] = _dash_env_now
-
-        if _dash_env_changed:
-            _loading_overlay(_dash_ov, "Updating Dashboard", "📊", 0, 1, "Refreshing view…")
 
         st.success("✅ Dashboards and Final Reports Generated Successfully!")
 
@@ -8337,10 +8329,7 @@ if "calc_data" in st.session_state:
                 else:
                     st.warning("No Sr. Accountant data found in the HC report.")
 
-        # ── Clear view-change overlay after all dashboard tabs rendered ──────────
-        if _dash_env_changed:
-            _dash_ov.empty()
-            _inject_scroll_reset()
+        # (View-change feedback handled by JS thin progress bar — no blocking overlay)
 
 
 # ==========================================
