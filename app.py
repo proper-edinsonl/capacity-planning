@@ -2862,9 +2862,11 @@ with tab1:
                     key="_s0_srs_ms",
                 )
 
-            # Persist selections immediately so they survive any rerun
-            st.session_state['_filt_pods'] = selected_pods
-            st.session_state['_filt_srs']  = selected_srs
+            # Persist selections — only write when value changes to avoid render-loop
+            if st.session_state.get('_filt_pods', []) != selected_pods:
+                st.session_state['_filt_pods'] = selected_pods
+            if st.session_state.get('_filt_srs', []) != selected_srs:
+                st.session_state['_filt_srs']  = selected_srs
 
             default_clients = []
             if selected_pods or selected_srs:
@@ -2882,8 +2884,9 @@ with tab1:
                 if not selected_clients_final:
                     st.info("ℹ️ If left empty, the entire database will be processed.")
 
-            # Persist client selection as well
-            st.session_state['_filt_clients'] = selected_clients_final
+            # Persist client selection — only write when value changes
+            if st.session_state.get('_filt_clients', []) != selected_clients_final:
+                st.session_state['_filt_clients'] = selected_clients_final
 
             # ── Confirmation of active filter — shown BEFORE onboarding list ─────
             st.divider()
