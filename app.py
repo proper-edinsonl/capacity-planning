@@ -5779,6 +5779,110 @@ if "calc_data" in st.session_state:
             'client_mrr': _df_height(len(_fd_now.get('client_mrr', pd.DataFrame()))),
         }
 
+        # ── Auto-compute Sr. Ratios so export always has data (no tab visit needed) ──
+        _sr_auto_hc   = st.session_state.get('hc_data', None)
+        _sr_auto_cd   = st.session_state.get('calc_data', {})
+        _sr_auto_wday = _sr_auto_cd.get('dict_workable_days', {})
+        if _sr_auto_hc and _sr_auto_wday:
+            _SR_OPS_FIXED_MONTHLY_A = 35.0
+            _SR_OPS_VAR_PER_DR_A    = 1.5
+            _SR_HRS_PER_DAY_A       = 8.0
+            _SR_OPS_BASE_DAYS_A     = 20
+            _THRESHOLD_PCT_A        = 7.0
+            _DR_MIN_A, _DR_MAX_A    = 7, 9
+            _CLI_MIN_A, _CLI_MAX_A  = 3, 5
+            # Use currently selected month in the Sr. Ratios tab (default M1)
+            _sr_auto_mi      = st.session_state.get('_sr_ratios_month', None)
+            _sr_auto_opts    = [f"M{i+1} — {m}" for i, m in enumerate(meses_proyeccion)]
+            _sr_auto_mi_idx  = _sr_auto_opts.index(_sr_auto_mi) if _sr_auto_mi in _sr_auto_opts else 0
+            _sr_auto_net_days = _sr_auto_wday.get(_sr_auto_mi_idx, 20)
+            _df_ca = st.session_state.get('df_clean', pd.DataFrame())
+            # Clients per Sr.
+            _sr_auto_cli_cnt = {}
+            if 'Sr. Accountant' in _df_ca.columns and 'client_name' in _df_ca.columns:
+                _sr_auto_cli_cnt = (
+                    _df_ca[_df_ca['Sr. Accountant'].astype(str).str.strip().ne('')]
+                    .groupby(_df_ca['Sr. Accountant'].astype(str).str.lower().str.strip())
+                    ['client_name'].nunique().to_dict()
+                )
+            # Productive hrs per Sr.
+            _sr_auto_prod_hrs = {}
+            if ('processor' in _df_ca.columns and 'Capacity Processing Hours' in _df_ca.columns
+                    and 'reviewer' in _df_ca.columns and 'Capacity reviewing hours' in _df_ca.columns):
+                _pm = _df_ca.groupby(_df_ca['processor'].astype(str).str.lower().str.strip())['Capacity Processing Hours'].sum().to_dict()
+                _rm = _df_ca.groupby(_df_ca['reviewer'].astype(str).str.lower().str.strip())['Capacity reviewing hours'].sum().to_dict()
+                for _ema in set(_pm) | set(_rm):
+                    _sr_auto_prod_hrs[_ema] = float(_pm.get(_ema, 0.0)) + float(_rm.get(_ema, 0.0))
+            # MEC & Other hrs per Sr.
+            _sr_auto_mec, _sr_auto_other = {}, {}
+            _need_a = ['Ideal Proc', 'Ideal Rev', 'Capacity Processing Hours', 'Capacity reviewing hours', 'type', 'Sr. Accountant']
+            if not _df_ca.empty and all(c in _df_ca.columns for c in _need_a):
+                _sk   = _df_ca['Sr. Accountant'].astype(str).str.lower().str.strip()
+                _ipa  = _df_ca['Ideal Proc'].astype(str).str.strip()
+                _ira  = _df_ca['Ideal Rev'].astype(str).str.strip()
+                _tya  = _df_ca['type'].astype(str).str.strip().str.upper()
+                _pha  = pd.to_numeric(_df_ca['Capacity Processing Hours'], errors='coerce').fillna(0.0)
+                _rha  = pd.to_numeric(_df_ca['Capacity reviewing hours'],  errors='coerce').fillna(0.0)
+                _cpa  = pd.concat([
+                    pd.DataFrame({'_sr': _sk[_ipa == 'Sr. Accountant'], '_ty': _tya[_ipa == 'Sr. Accountant'], '_h': _pha[_ipa == 'Sr. Accountant']}),
+                    pd.DataFrame({'_sr': _sk[_ira == 'Sr. Accountant'], '_ty': _tya[_ira == 'Sr. Accountant'], '_h': _rha[_ira == 'Sr. Accountant']}),
+                ], ignore_index=True)
+                if not _cpa.empty:
+                    _piva = _cpa.groupby(['_sr', '_ty'])['_h'].sum().unstack(fill_value=0.0)
+                    _sr_auto_mec   = _piva.get('MEC',   pd.Series(dtype=float)).to_dict()
+                    _sr_auto_other = _piva.get('OTHER', pd.Series(dtype=float)).to_dict()
+            # Build rows
+            _sr_auto_rows = []
+            for _sea, _sia in _sr_auto_hc.get('by_sr_email', {}).items():
+                _drc  = int(_sia.get('dr_total', 0))
+                _podv = str(_sia.get('pod', ''))
+                _sdt  = _sia.get('start_date', pd.NaT)
+                _clic = int(_sr_auto_cli_cnt.get(_sea, 0))
+                _prh  = float(_sr_auto_prod_hrs.get(_sea, 0.0))
+                _sc   = _sr_auto_net_days / _SR_OPS_BASE_DAYS_A
+                _oph  = (_SR_OPS_FIXED_MONTHLY_A + _SR_OPS_VAR_PER_DR_A * _drc) * _sc
+                _toh  = _SR_HRS_PER_DAY_A * _sr_auto_net_days
+                _cph  = max(_toh - _oph, 0.0)
+                _rmh  = _cph - _prh
+                _pct  = (_rmh / _cph * 100) if _cph > 0 else 0.0
+                _clih = float(_sr_auto_mec.get(_sea, 0.0)) + float(_sr_auto_other.get(_sea, 0.0))
+                _rmmc = _cph - _clih
+                _pctm = (_rmmc / _cph * 100) if _cph > 0 else 0.0
+                def _ast(p):
+                    if p > _THRESHOLD_PCT_A:   return '🟢 Available'
+                    if p >= -_THRESHOLD_PCT_A: return '✅ On Track'
+                    return '🔴 Potential Burnout'
+                _drf  = '✅' if _DR_MIN_A  <= _drc  <= _DR_MAX_A  else ('⬇️' if _drc  < _DR_MIN_A  else '⬆️')
+                _clf  = '✅' if _CLI_MIN_A <= _clic <= _CLI_MAX_A else ('⬇️' if _clic < _CLI_MIN_A else '⬆️')
+                try:
+                    _ten = str(_sia.get('start_date', ''))[:10]
+                except Exception:
+                    _ten = '—'
+                _sr_auto_rows.append({
+                    'POD':                               _podv,
+                    'Sr. Accountant':                    _sea,
+                    'Hire Date':                         pd.Timestamp(_sdt).strftime('%Y-%m-%d') if pd.notna(_sdt) else '—',
+                    'Direct Reports':                    f"{_drc} {_drf}",
+                    'Clients Assigned':                  f"{_clic} {_clf}",
+                    'Productive Hrs':                    round(_prh, 1),
+                    'Total Work Hours':                  round(_toh, 1),
+                    'Ops Rhythm Hrs':                    round(_oph, 1),
+                    'Productive Capacity (After Ops R)': round(_cph, 1),
+                    'Remaining Hrs':                     round(_rmh, 1),
+                    '% Remaining':                       round(_pct, 1),
+                    'Status':                            _ast(_pct),
+                    'MEC & Other Client Hrs':            round(_clih, 1),
+                    'Remaining Hrs (MEC)':               round(_rmmc, 1),
+                    '% Remaining (MEC)':                 round(_pctm, 1),
+                    'Status (MEC)':                      _ast(_pctm),
+                })
+            if _sr_auto_rows:
+                st.session_state['_s3_sr_ratios_df'] = (
+                    pd.DataFrame(_sr_auto_rows)
+                    .sort_values(['POD', 'Sr. Accountant'])
+                    .reset_index(drop=True)
+                )
+
         # ── Environment fingerprint (tracked for future use; visual feedback via JS bar) ──
         _dash_env_now = json.dumps([
             st.session_state.get('view_mode_radio', ''),
