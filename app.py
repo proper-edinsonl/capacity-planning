@@ -2654,25 +2654,86 @@ _stc_sb_scroll.html("""
 </script>
 """, height=0)
 
-# ── Scroll-position preservation across Streamlit rerenders ──────────────────
+# ── Scroll-position preservation + thin loading bar for all widget interactions ──
 st.markdown("""<script>
 (function(){
-    var _key = 'cov_scroll_pos';
-    var main = null;
-    function getMain(){ return window.parent.document.querySelector('section.main'); }
-    // Save position before each Streamlit update
-    window.parent.document.addEventListener('streamlit:beforeRender', function(){
-        main = getMain();
-        if(main) sessionStorage.setItem(_key, main.scrollTop);
-    });
-    // Restore position after Streamlit update
-    window.parent.document.addEventListener('streamlit:afterRender', function(){
-        var saved = sessionStorage.getItem(_key);
-        if(saved){
-            main = getMain();
-            if(main) main.scrollTop = parseInt(saved, 10);
-        }
-    });
+    var doc = window.parent.document;
+
+    /* ── 1. Scroll preservation via MutationObserver ── */
+    var _scrollKey = 'cov_scroll_pos';
+    var _scrollLocked = false;
+    function getMain(){ return doc.querySelector('section.main'); }
+
+    function saveScroll(){
+        var m = getMain();
+        if(m && m.scrollTop > 0) sessionStorage.setItem(_scrollKey, m.scrollTop);
+    }
+    function restoreScroll(){
+        var saved = sessionStorage.getItem(_scrollKey);
+        if(!saved) return;
+        var m = getMain();
+        if(m){ m.scrollTop = parseInt(saved, 10); }
+    }
+
+    /* ── 2. Thin top progress bar ── */
+    var bar = doc.getElementById('cov-top-bar');
+    if(!bar){
+        bar = doc.createElement('div');
+        bar.id = 'cov-top-bar';
+        bar.style.cssText = [
+            'position:fixed','top:0','left:0','height:3px','width:0',
+            'background:linear-gradient(90deg,#3b82f6,#6366f1)',
+            'z-index:999997','transition:width 0.4s ease,opacity 0.3s ease',
+            'opacity:0','pointer-events:none'
+        ].join(';');
+        doc.body.appendChild(bar);
+    }
+    var _barTimer = null;
+    function showBar(){
+        clearTimeout(_barTimer);
+        bar.style.opacity = '1';
+        bar.style.width   = '65%';
+    }
+    function hideBar(){
+        bar.style.width = '100%';
+        _barTimer = setTimeout(function(){
+            bar.style.opacity = '0';
+            setTimeout(function(){ bar.style.width = '0'; }, 350);
+        }, 250);
+    }
+
+    /* ── 3. Wire up widget clicks → show bar + save scroll ── */
+    doc.addEventListener('click', function(e){
+        var el = e.target.closest(
+            '[data-testid="stButton"] button,' +
+            '[data-testid="stTabs"] button[role="tab"],' +
+            '[data-baseweb="radio"] label,' +
+            '[data-baseweb="select"] [role="option"],' +
+            'details summary'
+        );
+        if(el){ saveScroll(); showBar(); }
+    }, true);
+    doc.addEventListener('change', function(e){
+        var el = e.target.closest('select,input[type="radio"],input[type="checkbox"]');
+        if(el){ saveScroll(); showBar(); }
+    }, true);
+
+    /* ── 4. MutationObserver: detect Streamlit re-render → restore scroll + hide bar ── */
+    var _mut = null;
+    function attachObserver(){
+        var main = getMain();
+        if(!main){ setTimeout(attachObserver, 300); return; }
+        if(_mut) _mut.disconnect();
+        _mut = new MutationObserver(function(){
+            clearTimeout(_barTimer);
+            _barTimer = setTimeout(function(){
+                restoreScroll();
+                hideBar();
+            }, 120);
+        });
+        _mut.observe(main, { childList: true, subtree: true });
+    }
+    attachObserver();
 })();
 </script>""", unsafe_allow_html=True)
 
@@ -5708,6 +5769,33 @@ if "calc_data" in st.session_state:
     # RENDER DASHBOARDS IF AVAILABLE
     # ==========================================
     if "final_dashboards" in st.session_state:
+        # ── Always recompute table heights from current data ──────────────────────
+        _fd_now = st.session_state['final_dashboards']
+        st.session_state['_df_heights'] = {
+            'cliente':    _df_height(len(_fd_now.get('cliente',   pd.DataFrame()))),
+            'pod':        _df_height(len(_fd_now.get('pod',        pd.DataFrame()))),
+            'pod_sr':     _df_height(len(_fd_now.get('pod_sr',     pd.DataFrame()))),
+            'general':    _df_height(len(_fd_now.get('general',    pd.DataFrame()))),
+            'client_mrr': _df_height(len(_fd_now.get('client_mrr', pd.DataFrame()))),
+        }
+
+        # ── Overlay placeholder (must be before widgets) ─────────────────────────
+        _dash_ov = st.empty()
+
+        # ── Environment fingerprint for change detection ──────────────────────────
+        _dash_env_now = json.dumps([
+            st.session_state.get('view_mode_radio', ''),
+            sorted(st.session_state.get('_dash_sel_pods',    [])),
+            sorted(st.session_state.get('_dash_sel_srs',     [])),
+            st.session_state.get('_fd_version', 0),
+        ], sort_keys=True)
+        _dash_env_prev  = st.session_state.get('_dash_env_prev', '')
+        _dash_env_changed = bool(_dash_env_prev) and _dash_env_prev != _dash_env_now
+        st.session_state['_dash_env_prev'] = _dash_env_now
+
+        if _dash_env_changed:
+            _loading_overlay(_dash_ov, "Updating Dashboard", "📊", 0, 1, "Refreshing view…")
+
         st.success("✅ Dashboards and Final Reports Generated Successfully!")
 
         # ── View mode selector ────────────────────────────────────────────────────
@@ -8248,6 +8336,11 @@ if "calc_data" in st.session_state:
                     )
                 else:
                     st.warning("No Sr. Accountant data found in the HC report.")
+
+        # ── Clear view-change overlay after all dashboard tabs rendered ──────────
+        if _dash_env_changed:
+            _dash_ov.empty()
+            _inject_scroll_reset()
 
 
 # ==========================================
