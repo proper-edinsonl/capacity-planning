@@ -2993,10 +2993,8 @@ with tab1:
                 _n_ob_total  = len(_ob_disp_df)
                 _n_ob_w_data = int(_has_data_m.sum())
 
-                with st.expander(
-                    f"🆕 New / Onboarding Clients — {_n_ob_total} found",
-                    expanded=True
-                ):
+                st.markdown(f"#### 🆕 New / Onboarding Clients — {_n_ob_total} found")
+                with st.container():
                     _disp_cols = ['Client', 'Status', 'Go Live', 'POD', 'PMS', 'MRR ($)',
                                   'Proc Hrs', 'Rev Hrs', 'Total Hrs']
                     st.dataframe(_ob_disp_df[_disp_cols], use_container_width=True, hide_index=True)
@@ -3007,8 +3005,6 @@ with tab1:
                             "Click below to queue them for AI prediction — their existing hours will be replaced."
                         )
 
-                    # Single Queue All button — no multiselect/checkbox widgets that can loop
-                    _all_ob_clients = _ob_disp_df['Client'].tolist()
                     if st.button(
                         f"🤖 Queue All {_n_ob_total} Client(s) for AI Prediction",
                         key="btn_ob_queue_all", type="primary"
