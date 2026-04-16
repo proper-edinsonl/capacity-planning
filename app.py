@@ -1970,6 +1970,53 @@ def _process_hc_report(file_bytes: bytes):
     }
 
 
+# ==========================================
+# LOADING OVERLAY + UX HELPERS
+# ==========================================
+def _loading_overlay(container, step_name: str, icon: str, stage: int, total: int, message: str):
+    """Render a full-screen loading overlay with live progress. Call repeatedly to update."""
+    pct = int(stage / max(total, 1) * 100)
+    done = pct >= 100
+    bar_color   = "#22c55e" if done else "#3b82f6"
+    bar_color2  = "#16a34a" if done else "#6366f1"
+    bottom_text = "✅ All done! Click <b>Continue</b> below." if done else f"{pct}% — Please wait…"
+    container.markdown(f"""
+<div style="
+    position:fixed;top:0;left:0;width:100%;height:100%;
+    z-index:999999;background:rgba(15,23,42,0.88);
+    display:flex;align-items:center;justify-content:center;
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+  <div style="
+    background:#fff;border-radius:20px;padding:52px 60px;
+    min-width:480px;max-width:560px;text-align:center;
+    box-shadow:0 32px 80px rgba(0,0,0,0.45);">
+    <div style="font-size:48px;margin-bottom:18px;">{icon}</div>
+    <h2 style="margin:0 0 10px;color:#0f172a;font-size:22px;font-weight:700;">{step_name}</h2>
+    <p style="color:#475569;margin:0 0 28px;font-size:15px;min-height:22px;">{message}</p>
+    <div style="background:#e2e8f0;border-radius:999px;height:10px;overflow:hidden;margin-bottom:12px;">
+      <div style="background:linear-gradient(90deg,{bar_color},{bar_color2});
+        height:100%;width:{pct}%;border-radius:999px;"></div>
+    </div>
+    <p style="color:#94a3b8;font-size:13px;margin:0;" id="ov-bottom">{bottom_text}</p>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+
+def _df_height(n_rows: int, min_h: int = 150, max_h: int = 700, row_px: int = 35) -> int:
+    """Compute an appropriate st.dataframe height for n_rows rows."""
+    return min(max_h, max(min_h, 38 + n_rows * row_px))
+
+
+def _inject_scroll_reset():
+    """Inject JS to smoothly scroll the Streamlit main panel to the top."""
+    st.markdown("""<script>
+setTimeout(function(){
+    var m = window.parent.document.querySelector('section.main');
+    if(m) m.scrollTo({top:0, behavior:'smooth'});
+}, 350);
+</script>""", unsafe_allow_html=True)
+
+
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="Capacity & FTE Projections", layout="wide", initial_sidebar_state="collapsed")
 
@@ -2606,6 +2653,28 @@ _stc_sb_scroll.html("""
 })();
 </script>
 """, height=0)
+
+# ── Scroll-position preservation across Streamlit rerenders ──────────────────
+st.markdown("""<script>
+(function(){
+    var _key = 'cov_scroll_pos';
+    var main = null;
+    function getMain(){ return window.parent.document.querySelector('section.main'); }
+    // Save position before each Streamlit update
+    window.parent.document.addEventListener('streamlit:beforeRender', function(){
+        main = getMain();
+        if(main) sessionStorage.setItem(_key, main.scrollTop);
+    });
+    // Restore position after Streamlit update
+    window.parent.document.addEventListener('streamlit:afterRender', function(){
+        var saved = sessionStorage.getItem(_key);
+        if(saved){
+            main = getMain();
+            if(main) main.scrollTop = parseInt(saved, 10);
+        }
+    });
+})();
+</script>""", unsafe_allow_html=True)
 
 # ── Main content wheel forwarder (JS) ────────────────────────────────────────
 # Streamlit's `st.dataframe` (and Plotly, AgGrid, etc.) trap wheel events so
@@ -3332,253 +3401,270 @@ with tab1:
         )
 
         _auto_baseline = st.session_state.pop('_auto_run_baseline', False)
+        _s1_ov = st.empty()
         if st.button("⚙️ Generate Baseline", type="primary", use_container_width=True) or _auto_baseline:
             _has_pipeline = "pipeline_vol_merged" in st.session_state
             if not uploaded_file and not _has_pipeline:
                 st.error("⚠️ Please upload an Excel file or run the Data Pipeline first.")
             else:
-                with st.spinner("Calculating operational baseline (without automations)..."):
-                    try:
-                        if uploaded_file:
-                            try:
-                                df = pd.read_excel(uploaded_file, sheet_name="vol_merged")
-                            except:
-                                df = pd.read_excel(uploaded_file)
-                            df.columns = df.columns.str.strip()
+                _loading_overlay(_s1_ov, "Step 1 · Building Baseline", "⚙️", 0, 5, "Initializing…")
+                try:
+                    if uploaded_file:
+                        _loading_overlay(_s1_ov, "Step 1 · Building Baseline", "⚙️", 1, 5, "Reading volume file…")
+                        try:
+                            df = pd.read_excel(uploaded_file, sheet_name="vol_merged")
+                        except:
+                            df = pd.read_excel(uploaded_file)
+                        df.columns = df.columns.str.strip()
+                    else:
+                        _loading_overlay(_s1_ov, "Step 1 · Building Baseline", "⚙️", 1, 5, "Loading pipeline data…")
+                        # Use pipeline / scenario data
+                        df = st.session_state.pipeline_vol_merged.copy()
+                        df.columns = df.columns.str.strip()
+
+                    # ── Apply active filters to df ────────────────────────────────
+                    # Priority: client list > Sr. Accountant > POD.
+                    # All three are applied so that selecting only a POD (without
+                    # explicit clients) still restricts the baseline to that POD.
+                    _s1_filt_clients = st.session_state.get('_filt_clients', selected_clients_final)
+                    _s1_filt_srs     = st.session_state.get('_filt_srs',     selected_srs)
+                    _s1_filt_pods    = st.session_state.get('_filt_pods',     selected_pods)
+
+                    _s1_mask = pd.Series(True, index=df.index)
+                    if _s1_filt_clients and 'client_name' in df.columns:
+                        _s1_mask &= df['client_name'].isin(_s1_filt_clients)
+                    else:
+                        # No explicit client list — apply POD / Sr. directly
+                        if _s1_filt_pods and 'POD' in df.columns:
+                            _s1_mask &= df['POD'].isin(_s1_filt_pods)
+                        if _s1_filt_srs and 'Sr. Accountant' in df.columns:
+                            _s1_mask &= df['Sr. Accountant'].isin(_s1_filt_srs)
+
+                    if not _s1_mask.all():
+                        df = df[_s1_mask].copy()
+
+                    # DATE CLEANING
+                    _loading_overlay(_s1_ov, "Step 1 · Building Baseline", "⚙️", 2, 5, "Cleaning dates & numeric columns…")
+                    def clean_date_column(col_name):
+                        if col_name not in df.columns:
+                            return pd.Series(pd.NaT, index=df.index)
+                        s = df[col_name].astype(str).str.strip().str.lower()
+                        garbage = ['0', '0.0', 'nan', 'nat', 'none', 'null', '', ' ', '00:00:00', '00:00:00.000000']
+                        s = s.replace(garbage, np.nan)
+                        s = pd.to_datetime(s, errors='coerce').dt.normalize()
+                        s = s.where(s.dt.year >= 2000, pd.NaT)
+                        return s
+
+                    df['Go Live']            = clean_date_column('Go Live')
+                    df['Final Service Date'] = clean_date_column('Final Service Date')
+
+                    if 'MRR' in df.columns:
+                        df['MRR'] = df['MRR'].astype(str).str.replace(r'[$, ]', '', regex=True)
+                        df['MRR'] = pd.to_numeric(df['MRR'], errors='coerce').fillna(0.0)
+                    else:
+                        df['MRR'] = 0.0
+
+                    cols_to_clean = [
+                        'Capacity Processing Hours', 'Capacity reviewing hours',
+                        'Closed tickets with Proc time', 'Closed tickets with rev time',
+                        '>>> FINAL Capacity Proc AHT', '>>> FINAL Capacity Rev AHT'
+                    ]
+                    for col in cols_to_clean:
+                        if col in df.columns:
+                            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
                         else:
-                            # Use pipeline / scenario data
-                            df = st.session_state.pipeline_vol_merged.copy()
-                            df.columns = df.columns.str.strip()
+                            df[col] = 0
 
-                        # ── Apply active filters to df ────────────────────────────────
-                        # Priority: client list > Sr. Accountant > POD.
-                        # All three are applied so that selecting only a POD (without
-                        # explicit clients) still restricts the baseline to that POD.
-                        _s1_filt_clients = st.session_state.get('_filt_clients', selected_clients_final)
-                        _s1_filt_srs     = st.session_state.get('_filt_srs',     selected_srs)
-                        _s1_filt_pods    = st.session_state.get('_filt_pods',     selected_pods)
+                    # MRR BASE VALIDATION
+                    _loading_overlay(_s1_ov, "Step 1 · Building Baseline", "⚙️", 3, 5, "Computing client metrics…")
+                    df_clients_unique = df.groupby('client_name', as_index=False).agg({
+                        'MRR':                'max',
+                        'Go Live':            lambda x: x.dropna().iloc[0] if not x.dropna().empty else pd.NaT,
+                        'Final Service Date': lambda x: x.dropna().iloc[0] if not x.dropna().empty else pd.NaT,
+                    })
 
-                        _s1_mask = pd.Series(True, index=df.index)
-                        if _s1_filt_clients and 'client_name' in df.columns:
-                            _s1_mask &= df['client_name'].isin(_s1_filt_clients)
-                        else:
-                            # No explicit client list — apply POD / Sr. directly
-                            if _s1_filt_pods and 'POD' in df.columns:
-                                _s1_mask &= df['POD'].isin(_s1_filt_pods)
-                            if _s1_filt_srs and 'Sr. Accountant' in df.columns:
-                                _s1_mask &= df['Sr. Accountant'].isin(_s1_filt_srs)
+                    st.session_state.df_clean         = df.copy()
+                    st.session_state.df_clients_unique = df_clients_unique.copy()
+                    _build_client_master_map()   # build POD / Sr. / Vol maps from Step 1 data
 
-                        if not _s1_mask.all():
-                            df = df[_s1_mask].copy()
+                    dict_hrs_per_fte   = {}
+                    dict_workable_days = {}
 
-                        # DATE CLEANING
-                        def clean_date_column(col_name):
-                            if col_name not in df.columns:
-                                return pd.Series(pd.NaT, index=df.index)
-                            s = df[col_name].astype(str).str.strip().str.lower()
-                            garbage = ['0', '0.0', 'nan', 'nat', 'none', 'null', '', ' ', '00:00:00', '00:00:00.000000']
-                            s = s.replace(garbage, np.nan)
-                            s = pd.to_datetime(s, errors='coerce').dt.normalize()
-                            s = s.where(s.dt.year >= 2000, pd.NaT)
-                            return s
+                    # ── Pre-compute month params + vectorised apct/lc (Step 1) ───
+                    _b_gl  = df['Go Live'].values
+                    _b_fsd = df['Final Service Date'].values
+                    _b_ptix = pd.to_numeric(df['Closed tickets with Proc time'], errors='coerce').fillna(0).values
+                    _b_rtix = pd.to_numeric(df['Closed tickets with rev time'],  errors='coerce').fillna(0).values
+                    _b_paht = pd.to_numeric(df['>>> FINAL Capacity Proc AHT'],   errors='coerce').fillna(0).values
+                    _b_raht = pd.to_numeric(df['>>> FINAL Capacity Rev AHT'],    errors='coerce').fillna(0).values
 
-                        df['Go Live']            = clean_date_column('Go Live')
-                        df['Final Service Date'] = clean_date_column('Final Service Date')
+                    # ── IDEAL + REAL role arrays — vectorised (no iterrows) ──────────
+                    _INVALID_ROLES = {'nan', 'None', ''}
+                    _ip_pref = (df['Ideal Proc'].astype(str).str.strip()
+                                if 'Ideal Proc' in df.columns
+                                else pd.Series([''] * len(df), index=df.index))
+                    _ip_fb   = (df['Proc Role'].astype(str).str.strip()
+                                if 'Proc Role'  in df.columns
+                                else pd.Series([''] * len(df), index=df.index))
+                    _ir_pref = (df['Ideal Rev'].astype(str).str.strip()
+                                if 'Ideal Rev'  in df.columns
+                                else pd.Series([''] * len(df), index=df.index))
+                    _ir_fb   = (df['Rev Role'].astype(str).str.strip()
+                                if 'Rev Role'   in df.columns
+                                else pd.Series([''] * len(df), index=df.index))
 
-                        if 'MRR' in df.columns:
-                            df['MRR'] = df['MRR'].astype(str).str.replace(r'[$, ]', '', regex=True)
-                            df['MRR'] = pd.to_numeric(df['MRR'], errors='coerce').fillna(0.0)
-                        else:
-                            df['MRR'] = 0.0
+                    # Ideal: prefer Ideal Proc/Rev, fall back to Proc/Rev Role
+                    _b_ip = np.where(
+                        _ip_pref.isin(_INVALID_ROLES),
+                        np.where(_ip_fb.isin(_INVALID_ROLES), 'Accountant I',   _ip_fb),
+                        _ip_pref
+                    )
+                    _b_ir = np.where(
+                        _ir_pref.isin(_INVALID_ROLES),
+                        np.where(_ir_fb.isin(_INVALID_ROLES), 'Sr. Accountant', _ir_fb),
+                        _ir_pref
+                    )
+                    _b_up = np.array([utilization_map.get(ip, util_acc1) for ip in _b_ip])
+                    _b_ur = np.array([utilization_map.get(ir, util_sr)   for ir in _b_ir])
 
-                        cols_to_clean = [
-                            'Capacity Processing Hours', 'Capacity reviewing hours',
-                            'Closed tickets with Proc time', 'Closed tickets with rev time',
-                            '>>> FINAL Capacity Proc AHT', '>>> FINAL Capacity Rev AHT'
-                        ]
-                        for col in cols_to_clean:
-                            if col in df.columns:
-                                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-                            else:
-                                df[col] = 0
+                    # Real: use Proc/Rev Role directly (no ideal fallback)
+                    _b_ip_real = np.where(_ip_fb.isin(_INVALID_ROLES), 'Accountant I',   _ip_fb)
+                    _b_ir_real = np.where(_ir_fb.isin(_INVALID_ROLES), 'Sr. Accountant', _ir_fb)
+                    _b_up_real = np.array([utilization_map.get(ip, util_acc1) for ip in _b_ip_real])
+                    _b_ur_real = np.array([utilization_map.get(ir, util_sr)   for ir in _b_ir_real])
+                    _b_month_frames_real = []
+                    _b_pod_s = df.get('POD', pd.Series(['No POD']*len(df))).fillna('No POD').astype(str).str.strip()
+                    _b_pod   = _b_pod_s.where(~_b_pod_s.str.lower().isin({'nan','none',''}), 'No POD').values
+                    _b_cli = df.get('client_name', pd.Series(['Unknown']*len(df))).fillna('Unknown').astype(str).values
 
-                        # MRR BASE VALIDATION
-                        df_clients_unique = df.groupby('client_name', as_index=False).agg({
-                            'MRR':                'max',
-                            'Go Live':            lambda x: x.dropna().iloc[0] if not x.dropna().empty else pd.NaT,
-                            'Final Service Date': lambda x: x.dropna().iloc[0] if not x.dropna().empty else pd.NaT,
-                        })
+                    _b_month_frames = []
 
-                        st.session_state.df_clean         = df.copy()
-                        st.session_state.df_clients_unique = df_clients_unique.copy()
-                        _build_client_master_map()   # build POD / Sr. / Vol maps from Step 1 data
+                    # Base month = previous calendar month (e.g. Feb when today is Mar).
+                    # Its network-day count is the reference for demand fluctuation.
+                    _bm_start     = pd.Timestamp((today.replace(day=1) - relativedelta(months=1)).date())
+                    _bm_end       = pd.Timestamp((_bm_start + relativedelta(months=1) - relativedelta(days=1)).date())
+                    base_net_days = max(1, int(np.busday_count(
+                        _bm_start.strftime('%Y-%m-%d'),
+                        (_bm_end + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+                    )))
 
-                        dict_hrs_per_fte   = {}
-                        dict_workable_days = {}
+                    _loading_overlay(_s1_ov, "Step 1 · Building Baseline", "⚙️", 4, 5, "Building monthly projections…")
+                    for i, mes_str in enumerate(meses_proyeccion):
+                        mes_date = today + relativedelta(months=_month_offsets[i])
+                        start_m  = pd.Timestamp(mes_date.replace(day=1).date())
+                        end_m    = pd.Timestamp((start_m + relativedelta(months=1) - relativedelta(days=1)).date())
+                        # Actual network days (Mon-Fri) for this month — always from
+                        # busday_count regardless of the fixed-days setting.
+                        # Used on the demand side: customer hours reflect real workload.
+                        actual_net_days = int(np.busday_count(start_m.strftime('%Y-%m-%d'),
+                                                              (end_m + pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
+                        # Capacity days: user-supplied fixed value OR actual network days.
+                        # This drives FTE availability — fewer days = more FTEs needed.
+                        net_days = fixed_days if calc_mode == "Fixed days per month" else actual_net_days
+                        holidays      = holidays_per_month[mes_str]
+                        workable_days = max(1, net_days - holidays)
+                        dict_hrs_per_fte[i]   = workable_days * 7.5
+                        dict_workable_days[i] = workable_days
 
-                        # ── Pre-compute month params + vectorised apct/lc (Step 1) ───
-                        _b_gl  = df['Go Live'].values
-                        _b_fsd = df['Final Service Date'].values
-                        _b_ptix = pd.to_numeric(df['Closed tickets with Proc time'], errors='coerce').fillna(0).values
-                        _b_rtix = pd.to_numeric(df['Closed tickets with rev time'],  errors='coerce').fillna(0).values
-                        _b_paht = pd.to_numeric(df['>>> FINAL Capacity Proc AHT'],   errors='coerce').fillna(0).values
-                        _b_raht = pd.to_numeric(df['>>> FINAL Capacity Rev AHT'],    errors='coerce').fillna(0).values
-
-                        # ── IDEAL + REAL role arrays — vectorised (no iterrows) ──────────
-                        _INVALID_ROLES = {'nan', 'None', ''}
-                        _ip_pref = (df['Ideal Proc'].astype(str).str.strip()
-                                    if 'Ideal Proc' in df.columns
-                                    else pd.Series([''] * len(df), index=df.index))
-                        _ip_fb   = (df['Proc Role'].astype(str).str.strip()
-                                    if 'Proc Role'  in df.columns
-                                    else pd.Series([''] * len(df), index=df.index))
-                        _ir_pref = (df['Ideal Rev'].astype(str).str.strip()
-                                    if 'Ideal Rev'  in df.columns
-                                    else pd.Series([''] * len(df), index=df.index))
-                        _ir_fb   = (df['Rev Role'].astype(str).str.strip()
-                                    if 'Rev Role'   in df.columns
-                                    else pd.Series([''] * len(df), index=df.index))
-
-                        # Ideal: prefer Ideal Proc/Rev, fall back to Proc/Rev Role
-                        _b_ip = np.where(
-                            _ip_pref.isin(_INVALID_ROLES),
-                            np.where(_ip_fb.isin(_INVALID_ROLES), 'Accountant I',   _ip_fb),
-                            _ip_pref
+                        # Vectorised active_pct (pd fillna/clip avoids NPY_ITER_REFS_OK with object arrays)
+                        _gl_s  = pd.to_datetime(pd.Series(_b_gl),  errors='coerce').fillna(start_m).clip(lower=start_m, upper=end_m)
+                        _fsd_s = pd.to_datetime(pd.Series(_b_fsd), errors='coerce').fillna(end_m).clip(lower=start_m, upper=end_m)
+                        _dias  = np.busday_count(
+                            _gl_s.values.astype('datetime64[D]'),
+                            (_fsd_s + pd.Timedelta(days=1)).values.astype('datetime64[D]')
                         )
-                        _b_ir = np.where(
-                            _ir_pref.isin(_INVALID_ROLES),
-                            np.where(_ir_fb.isin(_INVALID_ROLES), 'Sr. Accountant', _ir_fb),
-                            _ir_pref
+                        # active_pct: always relative to real network days of this month
+                        _ap = np.clip(np.maximum(_dias.astype(float), 0) / actual_net_days, 0.0, 1.0) if actual_net_days > 0 else np.zeros(len(df))
+
+                        # Day-scale: how this month's network days compare to the base month.
+                        #   Fixed days  → scale = 1.0  (requirement stays constant every month)
+                        #   Network days → scale = current / base  (hours flex with day count)
+                        day_scale = 1.0 if calc_mode == "Fixed days per month" \
+                                    else (actual_net_days / base_net_days)
+
+                        # Vectorised learning_mult
+                        _hgl   = pd.notna(pd.Series(_b_gl)).values
+                        _gl_ts = pd.DatetimeIndex(pd.to_datetime(pd.Series(_b_gl), errors='coerce').fillna(start_m))
+                        _md    = np.where(_hgl, (start_m.year-_gl_ts.year.values)*12+(start_m.month-_gl_ts.month.values), 999).astype(int)
+                        _lc   = np.select(
+                            [~_hgl|(_ap==0), (_md==0)&_hgl&(_ap>0), (_md==1)&_hgl&(_ap>0), (_md==2)&_hgl&(_ap>0)],
+                            [1.0, 1.17, 0.86, 0.99], default=1.0
                         )
-                        _b_up = np.array([utilization_map.get(ip, util_acc1) for ip in _b_ip])
-                        _b_ur = np.array([utilization_map.get(ir, util_sr)   for ir in _b_ir])
 
-                        # Real: use Proc/Rev Role directly (no ideal fallback)
-                        _b_ip_real = np.where(_ip_fb.isin(_INVALID_ROLES), 'Accountant I',   _ip_fb)
-                        _b_ir_real = np.where(_ir_fb.isin(_INVALID_ROLES), 'Sr. Accountant', _ir_fb)
-                        _b_up_real = np.array([utilization_map.get(ip, util_acc1) for ip in _b_ip_real])
-                        _b_ur_real = np.array([utilization_map.get(ir, util_sr)   for ir in _b_ir_real])
-                        _b_month_frames_real = []
-                        _b_pod_s = df.get('POD', pd.Series(['No POD']*len(df))).fillna('No POD').astype(str).str.strip()
-                        _b_pod   = _b_pod_s.where(~_b_pod_s.str.lower().isin({'nan','none',''}), 'No POD').values
-                        _b_cli = df.get('client_name', pd.Series(['Unknown']*len(df))).fillna('Unknown').astype(str).values
+                        _bp = (_b_ptix * _ap * _b_paht * _lc * day_scale) / 60
+                        _br = (_b_rtix * _ap * _b_raht * _lc * day_scale) / 60
+                        _tp = _bp * (2 - _b_up + absenteeism + attrition)
+                        _tr = _br * (2 - _b_ur + absenteeism + attrition)
 
-                        _b_month_frames = []
+                        col_name = f"M{i+1} ({mes_str}) - Base Hours"
+                        col_prod = f"M{i+1} ({mes_str}) - Productive Hours"
+                        _b_month_frames.append(pd.DataFrame({
+                            'POD':           np.concatenate([_b_pod, _b_pod]),
+                            'Client':        np.concatenate([_b_cli, _b_cli]),
+                            'Required Role': np.concatenate([_b_ip,  _b_ir]),
+                            col_name:        np.concatenate([_tp,    _tr]),
+                            col_prod:        np.concatenate([_bp,    _br])
+                        }))
+                        # Real-role base: same productive hours, but shrinkage uses real role utilisation
+                        _tp_real = _bp * (2 - _b_up_real + absenteeism + attrition)
+                        _tr_real = _br * (2 - _b_ur_real + absenteeism + attrition)
+                        _b_month_frames_real.append(pd.DataFrame({
+                            'POD':           np.concatenate([_b_pod,    _b_pod]),
+                            'Client':        np.concatenate([_b_cli,    _b_cli]),
+                            'Required Role': np.concatenate([_b_ip_real, _b_ir_real]),
+                            col_name:        np.concatenate([_tp_real,  _tr_real]),
+                            col_prod:        np.concatenate([_bp,       _br])
+                        }))
 
-                        # Base month = previous calendar month (e.g. Feb when today is Mar).
-                        # Its network-day count is the reference for demand fluctuation.
-                        _bm_start     = pd.Timestamp((today.replace(day=1) - relativedelta(months=1)).date())
-                        _bm_end       = pd.Timestamp((_bm_start + relativedelta(months=1) - relativedelta(days=1)).date())
-                        base_net_days = max(1, int(np.busday_count(
-                            _bm_start.strftime('%Y-%m-%d'),
-                            (_bm_end + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-                        )))
+                    df_sum_raw      = pd.concat(_b_month_frames, ignore_index=True)
+                    cols_meses      = [c for c in df_sum_raw.columns if " - Base Hours" in c or " - Productive Hours" in c]
+                    df_resumen_base = df_sum_raw.groupby(['POD', 'Client', 'Required Role'])[cols_meses].sum().reset_index()
 
-                        for i, mes_str in enumerate(meses_proyeccion):
-                            mes_date = today + relativedelta(months=_month_offsets[i])
-                            start_m  = pd.Timestamp(mes_date.replace(day=1).date())
-                            end_m    = pd.Timestamp((start_m + relativedelta(months=1) - relativedelta(days=1)).date())
-                            # Actual network days (Mon-Fri) for this month — always from
-                            # busday_count regardless of the fixed-days setting.
-                            # Used on the demand side: customer hours reflect real workload.
-                            actual_net_days = int(np.busday_count(start_m.strftime('%Y-%m-%d'),
-                                                                  (end_m + pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
-                            # Capacity days: user-supplied fixed value OR actual network days.
-                            # This drives FTE availability — fewer days = more FTEs needed.
-                            net_days = fixed_days if calc_mode == "Fixed days per month" else actual_net_days
-                            holidays      = holidays_per_month[mes_str]
-                            workable_days = max(1, net_days - holidays)
-                            dict_hrs_per_fte[i]   = workable_days * 7.5
-                            dict_workable_days[i] = workable_days
+                    # Real-role base
+                    df_sum_raw_real      = pd.concat(_b_month_frames_real, ignore_index=True)
+                    cols_meses_real      = [c for c in df_sum_raw_real.columns if " - Base Hours" in c or " - Productive Hours" in c]
+                    df_resumen_base_real = df_sum_raw_real.groupby(['POD', 'Client', 'Required Role'])[cols_meses_real].sum().reset_index()
 
-                            # Vectorised active_pct (pd fillna/clip avoids NPY_ITER_REFS_OK with object arrays)
-                            _gl_s  = pd.to_datetime(pd.Series(_b_gl),  errors='coerce').fillna(start_m).clip(lower=start_m, upper=end_m)
-                            _fsd_s = pd.to_datetime(pd.Series(_b_fsd), errors='coerce').fillna(end_m).clip(lower=start_m, upper=end_m)
-                            _dias  = np.busday_count(
-                                _gl_s.values.astype('datetime64[D]'),
-                                (_fsd_s + pd.Timedelta(days=1)).values.astype('datetime64[D]')
-                            )
-                            # active_pct: always relative to real network days of this month
-                            _ap = np.clip(np.maximum(_dias.astype(float), 0) / actual_net_days, 0.0, 1.0) if actual_net_days > 0 else np.zeros(len(df))
+                    st.session_state.calc_data = {
+                        'df_resumen_base':       df_resumen_base,        # backward-compat alias (ideal)
+                        'df_resumen_base_ideal': df_resumen_base,
+                        'df_resumen_base_real':  df_resumen_base_real,
+                        'dict_hrs_per_fte':      dict_hrs_per_fte,
+                        'dict_workable_days':    dict_workable_days,
+                        'clientes_validos':      sorted(df_resumen_base['Client'].unique().tolist())
+                    }
 
-                            # Day-scale: how this month's network days compare to the base month.
-                            #   Fixed days  → scale = 1.0  (requirement stays constant every month)
-                            #   Network days → scale = current / base  (hours flex with day count)
-                            day_scale = 1.0 if calc_mode == "Fixed days per month" \
-                                        else (actual_net_days / base_net_days)
+                    if "final_dashboards" in st.session_state:
+                        del st.session_state.final_dashboards
 
-                            # Vectorised learning_mult
-                            _hgl   = pd.notna(pd.Series(_b_gl)).values
-                            _gl_ts = pd.DatetimeIndex(pd.to_datetime(pd.Series(_b_gl), errors='coerce').fillna(start_m))
-                            _md    = np.where(_hgl, (start_m.year-_gl_ts.year.values)*12+(start_m.month-_gl_ts.month.values), 999).astype(int)
-                            _lc   = np.select(
-                                [~_hgl|(_ap==0), (_md==0)&_hgl&(_ap>0), (_md==1)&_hgl&(_ap>0), (_md==2)&_hgl&(_ap>0)],
-                                [1.0, 1.17, 0.86, 0.99], default=1.0
-                            )
+                    # Reset sync state that depends on the client list (recon + choices).
+                    # NOTE: hs_parsed is intentionally kept — the raw HubSpot file is an
+                    # independent data source and does NOT change when filters or the
+                    # baseline are regenerated. Clearing it forced users to re-upload the
+                    # HubSpot file on every baseline run, which broke "Sync from HubSpot".
+                    st.session_state.hs_sync_choice = None
+                    st.session_state.hs_recon_df = None
+                    st.session_state.hs_client_overrides = {}
+                    st.session_state.hs_onboarding_clients = None
+                    st.session_state.s2_efficiency_choice = None
 
-                            _bp = (_b_ptix * _ap * _b_paht * _lc * day_scale) / 60
-                            _br = (_b_rtix * _ap * _b_raht * _lc * day_scale) / 60
-                            _tp = _bp * (2 - _b_up + absenteeism + attrition)
-                            _tr = _br * (2 - _b_ur + absenteeism + attrition)
+                    _loading_overlay(_s1_ov, "Step 1 · Building Baseline", "⚙️", 5, 5, "Done!")
+                    st.session_state['_s1_calc_done'] = True
 
-                            col_name = f"M{i+1} ({mes_str}) - Base Hours"
-                            col_prod = f"M{i+1} ({mes_str}) - Productive Hours"
-                            _b_month_frames.append(pd.DataFrame({
-                                'POD':           np.concatenate([_b_pod, _b_pod]),
-                                'Client':        np.concatenate([_b_cli, _b_cli]),
-                                'Required Role': np.concatenate([_b_ip,  _b_ir]),
-                                col_name:        np.concatenate([_tp,    _tr]),
-                                col_prod:        np.concatenate([_bp,    _br])
-                            }))
-                            # Real-role base: same productive hours, but shrinkage uses real role utilisation
-                            _tp_real = _bp * (2 - _b_up_real + absenteeism + attrition)
-                            _tr_real = _br * (2 - _b_ur_real + absenteeism + attrition)
-                            _b_month_frames_real.append(pd.DataFrame({
-                                'POD':           np.concatenate([_b_pod,    _b_pod]),
-                                'Client':        np.concatenate([_b_cli,    _b_cli]),
-                                'Required Role': np.concatenate([_b_ip_real, _b_ir_real]),
-                                col_name:        np.concatenate([_tp_real,  _tr_real]),
-                                col_prod:        np.concatenate([_bp,       _br])
-                            }))
+                except Exception as e:
+                    _s1_ov.empty()
+                    st.error(f"❌ Error in baseline calculation: {e}")
+                    import traceback
+                    st.write(traceback.format_exc())
 
-                        df_sum_raw      = pd.concat(_b_month_frames, ignore_index=True)
-                        cols_meses      = [c for c in df_sum_raw.columns if " - Base Hours" in c or " - Productive Hours" in c]
-                        df_resumen_base = df_sum_raw.groupby(['POD', 'Client', 'Required Role'])[cols_meses].sum().reset_index()
-
-                        # Real-role base
-                        df_sum_raw_real      = pd.concat(_b_month_frames_real, ignore_index=True)
-                        cols_meses_real      = [c for c in df_sum_raw_real.columns if " - Base Hours" in c or " - Productive Hours" in c]
-                        df_resumen_base_real = df_sum_raw_real.groupby(['POD', 'Client', 'Required Role'])[cols_meses_real].sum().reset_index()
-
-                        st.session_state.calc_data = {
-                            'df_resumen_base':       df_resumen_base,        # backward-compat alias (ideal)
-                            'df_resumen_base_ideal': df_resumen_base,
-                            'df_resumen_base_real':  df_resumen_base_real,
-                            'dict_hrs_per_fte':      dict_hrs_per_fte,
-                            'dict_workable_days':    dict_workable_days,
-                            'clientes_validos':      sorted(df_resumen_base['Client'].unique().tolist())
-                        }
-
-                        if "final_dashboards" in st.session_state:
-                            del st.session_state.final_dashboards
-
-                        # Reset sync state that depends on the client list (recon + choices).
-                        # NOTE: hs_parsed is intentionally kept — the raw HubSpot file is an
-                        # independent data source and does NOT change when filters or the
-                        # baseline are regenerated. Clearing it forced users to re-upload the
-                        # HubSpot file on every baseline run, which broke "Sync from HubSpot".
-                        st.session_state.hs_sync_choice = None
-                        st.session_state.hs_recon_df = None
-                        st.session_state.hs_client_overrides = {}
-                        st.session_state.hs_onboarding_clients = None
-                        st.session_state.s2_efficiency_choice = None
-
-                        st.success("✅ Baseline calculated.")
-
-                    except Exception as e:
-                        st.error(f"❌ Error in baseline calculation: {e}")
-                        import traceback
-                        st.write(traceback.format_exc())
+        # ── Post-calculation: show Continue button when Step 1 just finished ──────
+        if st.session_state.pop('_s1_calc_done', False):
+            _s1_ov.empty()
+            _inject_scroll_reset()
+            st.success("✅ Baseline calculated successfully!")
+            st.button("▶ Continue →", type="primary", key="s1_continue_btn",
+                      use_container_width=True,
+                      help="Click to proceed after baseline is ready")
 
 # ==========================================
 # HUBSPOT SYNC (optional, after Step 1)
@@ -4722,878 +4808,901 @@ if "calc_data" in st.session_state:
         _s3_use_real = _s3_role_mode.startswith("👥")
 
         _auto_cascade = st.session_state.pop('_auto_run_cascade', False)
+        _s3_ov = st.empty()
         if st.button("🔄 Apply Cascade & Generate Dashboards", type="primary", use_container_width=True) or _auto_cascade:
-            with st.spinner("Calculating financial savings, automations, and final FTEs…"):
+            _loading_overlay(_s3_ov, "Step 3 · Generating Dashboards", "🔄", 0, 5, "Initializing cascade…")
 
-                df               = st.session_state.df_clean.copy()
-                df_clients_unique = st.session_state.df_clients_unique.copy()
+            df               = st.session_state.df_clean.copy()
+            df_clients_unique = st.session_state.df_clients_unique.copy()
+            _loading_overlay(_s3_ov, "Step 3 · Generating Dashboards", "🔄", 1, 5, "Applying data map & client assignments…")
 
-                # ── Apply master map: overwrite POD / Sr. / Go Live / FSD from
-                #    the unified lookup built across Master DB + HubSpot + reconciliation
-                _build_client_master_map()   # ensure map is fresh before cascade
-                _cmap_cas = st.session_state.get('client_master_map', pd.DataFrame())
-                if not _cmap_cas.empty and 'client_name' in df.columns:
-                    _df_key = df['client_name'].astype(str).str.lower().str.strip()
-                    _pod_lkp = dict(zip(_cmap_cas['client_key'], _cmap_cas['pod']))
-                    _sr_lkp  = dict(zip(_cmap_cas['client_key'], _cmap_cas['sr_accountant']))
-                    _gl_lkp  = dict(zip(_cmap_cas['client_key'], _cmap_cas['go_live']))
-                    _fsd_lkp = dict(zip(_cmap_cas['client_key'], _cmap_cas['fsd']))
-                    _mrr_lkp = dict(zip(_cmap_cas['client_key'], _cmap_cas['mrr']))
-                    # POD: fill from map (HubSpot/reconcile beats Master DB blank)
-                    df['POD'] = _df_key.map(_pod_lkp).fillna(df.get('POD', 'No POD'))
-                    df['POD'] = df['POD'].fillna('No POD').astype(str).str.strip()
-                    df['POD'] = df['POD'].where(~df['POD'].str.lower().isin({'nan','none',''}), 'No POD')
-                    # Sr. Accountant: fill gaps from map
-                    if 'Sr. Accountant' not in df.columns:
-                        df['Sr. Accountant'] = ''
-                    _sr_from_map = _df_key.map(_sr_lkp)
-                    _sr_empty = df['Sr. Accountant'].astype(str).str.strip().str.lower().isin({'','nan','none'})
-                    df.loc[_sr_empty, 'Sr. Accountant'] = _sr_from_map[_sr_empty]
-                    # Go Live / FSD: apply reconciliation dates (overrides Master DB)
-                    _gl_from_map  = _df_key.map(_gl_lkp)
-                    _fsd_from_map = _df_key.map(_fsd_lkp)
-                    _mrr_from_map = _df_key.map(_mrr_lkp)
-                    _gl_has_map  = _gl_from_map.notna()
-                    _fsd_has_map = _fsd_from_map.notna()
-                    df.loc[_gl_has_map,  'Go Live']              = pd.to_datetime(_gl_from_map[_gl_has_map],   errors='coerce')
-                    df.loc[_fsd_has_map, 'Final Service Date']   = pd.to_datetime(_fsd_from_map[_fsd_has_map], errors='coerce')
-                    if 'MRR' in df.columns:
-                        _mrr_has_map = _mrr_from_map.notna() & (_mrr_from_map > 0)
-                        df.loc[_mrr_has_map, 'MRR'] = _mrr_from_map[_mrr_has_map]
-                    # Persist the fully-updated df so the Volume Input export captures
-                    # all master-map changes (POD, Sr., Go Live, FSD, MRR, AI clients)
-                    st.session_state['df_vol_export'] = df.copy()
-                    # Also sync df_clients_unique with master map dates/MRR
-                    if not df_clients_unique.empty and 'client_name' in df_clients_unique.columns:
-                        _duc_key = df_clients_unique['client_name'].astype(str).str.lower().str.strip()
-                        for _col_tgt, _lkp_d in [('Go Live', _gl_lkp), ('Final Service Date', _fsd_lkp), ('MRR', _mrr_lkp)]:
-                            if _col_tgt in df_clients_unique.columns:
-                                _mapped = _duc_key.map(_lkp_d)
-                                _has    = _mapped.notna()
-                                if _col_tgt == 'MRR':
-                                    _has = _has & (_mapped > 0)
-                                df_clients_unique.loc[_has, _col_tgt] = _mapped[_has]
-                dict_hrs_per_fte  = st.session_state.calc_data['dict_hrs_per_fte']
-                dict_workable_days = st.session_state.calc_data['dict_workable_days']
+            # ── Apply master map: overwrite POD / Sr. / Go Live / FSD from
+            #    the unified lookup built across Master DB + HubSpot + reconciliation
+            _build_client_master_map()   # ensure map is fresh before cascade
+            _cmap_cas = st.session_state.get('client_master_map', pd.DataFrame())
+            if not _cmap_cas.empty and 'client_name' in df.columns:
+                _df_key = df['client_name'].astype(str).str.lower().str.strip()
+                _pod_lkp = dict(zip(_cmap_cas['client_key'], _cmap_cas['pod']))
+                _sr_lkp  = dict(zip(_cmap_cas['client_key'], _cmap_cas['sr_accountant']))
+                _gl_lkp  = dict(zip(_cmap_cas['client_key'], _cmap_cas['go_live']))
+                _fsd_lkp = dict(zip(_cmap_cas['client_key'], _cmap_cas['fsd']))
+                _mrr_lkp = dict(zip(_cmap_cas['client_key'], _cmap_cas['mrr']))
+                # POD: fill from map (HubSpot/reconcile beats Master DB blank)
+                df['POD'] = _df_key.map(_pod_lkp).fillna(df.get('POD', 'No POD'))
+                df['POD'] = df['POD'].fillna('No POD').astype(str).str.strip()
+                df['POD'] = df['POD'].where(~df['POD'].str.lower().isin({'nan','none',''}), 'No POD')
+                # Sr. Accountant: fill gaps from map
+                if 'Sr. Accountant' not in df.columns:
+                    df['Sr. Accountant'] = ''
+                _sr_from_map = _df_key.map(_sr_lkp)
+                _sr_empty = df['Sr. Accountant'].astype(str).str.strip().str.lower().isin({'','nan','none'})
+                df.loc[_sr_empty, 'Sr. Accountant'] = _sr_from_map[_sr_empty]
+                # Go Live / FSD: apply reconciliation dates (overrides Master DB)
+                _gl_from_map  = _df_key.map(_gl_lkp)
+                _fsd_from_map = _df_key.map(_fsd_lkp)
+                _mrr_from_map = _df_key.map(_mrr_lkp)
+                _gl_has_map  = _gl_from_map.notna()
+                _fsd_has_map = _fsd_from_map.notna()
+                df.loc[_gl_has_map,  'Go Live']              = pd.to_datetime(_gl_from_map[_gl_has_map],   errors='coerce')
+                df.loc[_fsd_has_map, 'Final Service Date']   = pd.to_datetime(_fsd_from_map[_fsd_has_map], errors='coerce')
+                if 'MRR' in df.columns:
+                    _mrr_has_map = _mrr_from_map.notna() & (_mrr_from_map > 0)
+                    df.loc[_mrr_has_map, 'MRR'] = _mrr_from_map[_mrr_has_map]
+                # Persist the fully-updated df so the Volume Input export captures
+                # all master-map changes (POD, Sr., Go Live, FSD, MRR, AI clients)
+                st.session_state['df_vol_export'] = df.copy()
+                # Also sync df_clients_unique with master map dates/MRR
+                if not df_clients_unique.empty and 'client_name' in df_clients_unique.columns:
+                    _duc_key = df_clients_unique['client_name'].astype(str).str.lower().str.strip()
+                    for _col_tgt, _lkp_d in [('Go Live', _gl_lkp), ('Final Service Date', _fsd_lkp), ('MRR', _mrr_lkp)]:
+                        if _col_tgt in df_clients_unique.columns:
+                            _mapped = _duc_key.map(_lkp_d)
+                            _has    = _mapped.notna()
+                            if _col_tgt == 'MRR':
+                                _has = _has & (_mapped > 0)
+                            df_clients_unique.loc[_has, _col_tgt] = _mapped[_has]
+            dict_hrs_per_fte  = st.session_state.calc_data['dict_hrs_per_fte']
+            dict_workable_days = st.session_state.calc_data['dict_workable_days']
 
-                # Resolve role mode BEFORE the main loop.
-                # Use _s3_use_real (set directly from the radio widget return value
-                # at render time) — this is authoritative and avoids any session-state
-                # read ambiguity inside the button callback.
-                _s3_use_real_cas = _s3_use_real
+            # Resolve role mode BEFORE the main loop.
+            # Use _s3_use_real (set directly from the radio widget return value
+            # at render time) — this is authoritative and avoids any session-state
+            # read ambiguity inside the button callback.
+            _s3_use_real_cas = _s3_use_real
 
-                summary_data_auto = []
-                monthly_prod_hrs  = {i: 0.0 for i in range(6)}
-                monthly_util_hrs  = {i: 0.0 for i in range(6)}
-                monthly_abs_hrs   = {i: 0.0 for i in range(6)}
-                monthly_att_hrs   = {i: 0.0 for i in range(6)}
-                # Per-POD productive hours: {pod_name: {month_idx: prod_hrs}}
-                _pod_prod_hrs_m   = {}
+            summary_data_auto = []
+            monthly_prod_hrs  = {i: 0.0 for i in range(6)}
+            monthly_util_hrs  = {i: 0.0 for i in range(6)}
+            monthly_abs_hrs   = {i: 0.0 for i in range(6)}
+            monthly_att_hrs   = {i: 0.0 for i in range(6)}
+            # Per-POD productive hours: {pod_name: {month_idx: prod_hrs}}
+            _pod_prod_hrs_m   = {}
 
-                # 1. RECALCULATE WITH AUTOMATIONS
-                # ── Base month for demand-side day scaling (same reference as baseline) ─
-                _bm_s2      = pd.Timestamp((today.replace(day=1) - relativedelta(months=1)).date())
-                _bm_e2      = pd.Timestamp((_bm_s2 + relativedelta(months=1) - relativedelta(days=1)).date())
-                _base_nd_s2 = max(1, int(np.busday_count(
-                    _bm_s2.strftime('%Y-%m-%d'),
-                    (_bm_e2 + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-                )))
+            # 1. RECALCULATE WITH AUTOMATIONS
+            # ── Base month for demand-side day scaling (same reference as baseline) ─
+            _bm_s2      = pd.Timestamp((today.replace(day=1) - relativedelta(months=1)).date())
+            _bm_e2      = pd.Timestamp((_bm_s2 + relativedelta(months=1) - relativedelta(days=1)).date())
+            _base_nd_s2 = max(1, int(np.busday_count(
+                _bm_s2.strftime('%Y-%m-%d'),
+                (_bm_e2 + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+            )))
 
-                # ── Pre-compute month params ──────────────────────────────────────
-                _month_params = []
-                for _mi, _ms in enumerate(meses_proyeccion):
-                    _md  = today + relativedelta(months=_month_offsets[_mi])
-                    _sm  = pd.Timestamp(_md.replace(day=1).date())
-                    _em  = pd.Timestamp((_sm + relativedelta(months=1) - relativedelta(days=1)).date())
-                    # Actual network days (demand side — always real Mon-Fri count)
-                    _actual_nd = int(np.busday_count(_sm.strftime('%Y-%m-%d'),
-                                                     (_em + pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
-                    # Capacity days (FTE denominator — may be fixed by user)
-                    _nd  = fixed_days if calc_mode == "Fixed days per month" else _actual_nd
-                    # Day-scale: fixed mode keeps hours constant; network mode scales vs base month
-                    _dscale = 1.0 if calc_mode == "Fixed days per month" else (_actual_nd / _base_nd_s2)
-                    _month_params.append((_mi, _ms, _sm, _em, _nd, _actual_nd, _dscale))
+            # ── Pre-compute month params ──────────────────────────────────────
+            _month_params = []
+            for _mi, _ms in enumerate(meses_proyeccion):
+                _md  = today + relativedelta(months=_month_offsets[_mi])
+                _sm  = pd.Timestamp(_md.replace(day=1).date())
+                _em  = pd.Timestamp((_sm + relativedelta(months=1) - relativedelta(days=1)).date())
+                # Actual network days (demand side — always real Mon-Fri count)
+                _actual_nd = int(np.busday_count(_sm.strftime('%Y-%m-%d'),
+                                                 (_em + pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
+                # Capacity days (FTE denominator — may be fixed by user)
+                _nd  = fixed_days if calc_mode == "Fixed days per month" else _actual_nd
+                # Day-scale: fixed mode keeps hours constant; network mode scales vs base month
+                _dscale = 1.0 if calc_mode == "Fixed days per month" else (_actual_nd / _base_nd_s2)
+                _month_params.append((_mi, _ms, _sm, _em, _nd, _actual_nd, _dscale))
 
-                # ── Vectorised active_pct and learning_mult for all rows × months ─
-                _gl_raw  = df['Go Live'].values
-                _fsd_raw = df['Final Service Date'].values
-                _n_rows  = len(df)
-                _apct_m  = {}   # month_idx → np.array(n_rows)
-                _lc_m    = {}   # month_idx → np.array(n_rows)
+            # ── Vectorised active_pct and learning_mult for all rows × months ─
+            _gl_raw  = df['Go Live'].values
+            _fsd_raw = df['Final Service Date'].values
+            _n_rows  = len(df)
+            _apct_m  = {}   # month_idx → np.array(n_rows)
+            _lc_m    = {}   # month_idx → np.array(n_rows)
 
-                for _mi, _ms, _sm, _em, _nd, _actual_nd, _dscale in _month_params:
-                    # pd fillna/clip avoids NPY_ITER_REFS_OK error with object datetime arrays
-                    _gl_s  = pd.to_datetime(pd.Series(_gl_raw),  errors='coerce').fillna(_sm).clip(lower=_sm, upper=_em)
-                    _fsd_s = pd.to_datetime(pd.Series(_fsd_raw), errors='coerce').fillna(_em).clip(lower=_sm, upper=_em)
-                    _dias  = np.busday_count(
-                        _gl_s.values.astype('datetime64[D]'),
-                        (_fsd_s + pd.Timedelta(days=1)).values.astype('datetime64[D]')
-                    )
-                    # Use actual network days (not fixed_days) so active_pct matches baseline
-                    _apct_m[_mi] = np.clip(np.maximum(_dias.astype(float), 0) / _actual_nd, 0.0, 1.0) if _actual_nd > 0 else np.zeros(_n_rows)
-                    # Explicitly zero out clients whose FSD fell BEFORE this month's start.
-                    # The clip(lower=_sm) above would otherwise assign ~1/21 of a month to churned clients.
-                    _fsd_raw_s = pd.to_datetime(pd.Series(_fsd_raw), errors='coerce')
-                    _fully_churned = _fsd_raw_s.notna() & (_fsd_raw_s < _sm)
-                    if _fully_churned.any():
-                        _apct_m[_mi] = np.where(_fully_churned.values, 0.0, _apct_m[_mi])
+            for _mi, _ms, _sm, _em, _nd, _actual_nd, _dscale in _month_params:
+                # pd fillna/clip avoids NPY_ITER_REFS_OK error with object datetime arrays
+                _gl_s  = pd.to_datetime(pd.Series(_gl_raw),  errors='coerce').fillna(_sm).clip(lower=_sm, upper=_em)
+                _fsd_s = pd.to_datetime(pd.Series(_fsd_raw), errors='coerce').fillna(_em).clip(lower=_sm, upper=_em)
+                _dias  = np.busday_count(
+                    _gl_s.values.astype('datetime64[D]'),
+                    (_fsd_s + pd.Timedelta(days=1)).values.astype('datetime64[D]')
+                )
+                # Use actual network days (not fixed_days) so active_pct matches baseline
+                _apct_m[_mi] = np.clip(np.maximum(_dias.astype(float), 0) / _actual_nd, 0.0, 1.0) if _actual_nd > 0 else np.zeros(_n_rows)
+                # Explicitly zero out clients whose FSD fell BEFORE this month's start.
+                # The clip(lower=_sm) above would otherwise assign ~1/21 of a month to churned clients.
+                _fsd_raw_s = pd.to_datetime(pd.Series(_fsd_raw), errors='coerce')
+                _fully_churned = _fsd_raw_s.notna() & (_fsd_raw_s < _sm)
+                if _fully_churned.any():
+                    _apct_m[_mi] = np.where(_fully_churned.values, 0.0, _apct_m[_mi])
 
-                    _has_gl = pd.notna(pd.Series(_gl_raw)).values
-                    _gl_ts  = pd.DatetimeIndex(pd.to_datetime(pd.Series(_gl_raw), errors='coerce').fillna(_sm))
-                    _mdiff  = np.where(_has_gl,
-                                       (_sm.year  - _gl_ts.year.values)  * 12 +
-                                       (_sm.month - _gl_ts.month.values),
-                                       999).astype(int)
-                    _ap     = _apct_m[_mi]
-                    _lc_m[_mi] = np.select(
-                        [~_has_gl | (_ap == 0),
-                         (_mdiff == 0) & _has_gl & (_ap > 0),
-                         (_mdiff == 1) & _has_gl & (_ap > 0),
-                         (_mdiff == 2) & _has_gl & (_ap > 0)],
-                        [1.0, 1.17, 0.86, 0.99],
-                        default=1.0
-                    )
-
-                # ── Pre-compute automation efficiencies per (client, task, pod, pms) ─
-                _autos_raw = st.session_state.automations_df
-                _autos_src = _autos_raw[_autos_raw.get("Confirmed", pd.Series(True, index=_autos_raw.index)) == True].copy() if not _autos_raw.empty else _autos_raw
-                _auto_cache = {}   # (client, task, pod, pms) → list[6] of (vp, vr, ap, ar)
-
-                def _auto_matches_all(v):
-                    return pd.isna(v) or str(v).strip() in ('', 'All')
-
-                if not _autos_src.empty:
-                    _uniq_pairs = (
-                        df.assign(_task=df['type'].astype(str) + ' - ' + df['subtype'].astype(str))
-                          .assign(_pod=df.get('POD', pd.Series('', index=df.index)).fillna('').astype(str).str.strip())
-                          .assign(_pms=df.get('PMS', pd.Series('', index=df.index)).fillna('').astype(str).str.strip())
-                          [['client_name', '_task', '_pod', '_pms']].drop_duplicates()
-                    )
-                    for _, _up in _uniq_pairs.iterrows():
-                        _ck   = str(_up['client_name']).strip()
-                        _tk   = str(_up['_task']).strip()
-                        _pk   = str(_up['_pod']).strip()
-                        _pmsk = str(_up['_pms']).strip()
-                        _mc   = (_autos_src["Client"].apply(_auto_matches_all)) | (_autos_src["Client"] == _ck)
-                        _mt   = (_autos_src["Task (Type - Subtype)"].apply(_auto_matches_all)) | (_autos_src["Task (Type - Subtype)"] == _tk)
-                        _mpod = (_autos_src["POD"].apply(_auto_matches_all)) | (_autos_src["POD"] == _pk)   if "POD" in _autos_src.columns else pd.Series(True, index=_autos_src.index)
-                        _mpms = (_autos_src["PMS"].apply(_auto_matches_all)) | (_autos_src["PMS"] == _pmsk) if "PMS" in _autos_src.columns else pd.Series(True, index=_autos_src.index)
-                        _ap_rows = _autos_src[_mc & _mt & _mpod & _mpms]
-                        _effs = []
-                        for _mi2 in range(6):
-                            _evp = _evr = _eap = _ear = 0.0
-                            if not _ap_rows.empty:
-                                _mc2 = f"M{_mi2+1} (%)"
-                                for _, _au in _ap_rows.iterrows():
-                                    _v = pd.to_numeric(_au.get(_mc2, 0), errors='coerce')
-                                    if pd.isna(_v): _v = 0.0
-                                    _v /= 100.0
-                                    _af = str(_au.get("Affects", ""))
-                                    _ia = _af == "All (Vol + AHT)"
-                                    if "Vol Proc" in _af or _ia: _evp += _v
-                                    if "Vol Rev"  in _af or _ia: _evr += _v
-                                    if "AHT Proc" in _af or _ia: _eap += _v
-                                    if "AHT Rev"  in _af or _ia: _ear += _v
-                            _effs.append((min(1.0,_evp), min(1.0,_evr), min(1.0,_eap), min(1.0,_ear)))
-                        _auto_cache[(_ck, _tk, _pk, _pmsk)] = _effs
-
-                # ── Main loop: rows (outer) × months (inner) ─────────────────────
-                for _ri, (index, row) in enumerate(df.iterrows()):
-                    _ck    = str(row.get('client_name', '')).strip()
-                    _tk    = str(row.get('type', '')) + ' - ' + str(row.get('subtype', ''))
-                    _pk    = str(row.get('POD', '')).strip()
-                    _pmsk  = str(row.get('PMS', '')).strip()
-                    _effs  = _auto_cache.get((_ck, _tk, _pk, _pmsk), [(0.0,0.0,0.0,0.0)]*6)
-
-                    if _s3_use_real_cas:
-                        _ideal_p = str(row.get('Proc Role', '')).strip()
-                        _ideal_r = str(row.get('Rev Role',  '')).strip()
-                        # Fall back to Ideal Proc/Rev when real roles are blank/invalid
-                        if _ideal_p in ['nan', 'None', '']:
-                            _ideal_p = str(row.get('Ideal Proc', row.get('Proc Role', 'Accountant I'))).strip()
-                        if _ideal_r in ['nan', 'None', '']:
-                            _ideal_r = str(row.get('Ideal Rev', row.get('Rev Role', 'Sr. Accountant'))).strip()
-                        if _ideal_p in ['nan', 'None', '']: _ideal_p = 'Accountant I'
-                        if _ideal_r in ['nan', 'None', '']: _ideal_r = 'Sr. Accountant'
-                    else:
-                        _ideal_p = str(row.get('Ideal Proc', row.get('Proc Role', 'Accountant I'))).strip()
-                        _ideal_r = str(row.get('Ideal Rev',  row.get('Rev Role',  'Sr. Accountant'))).strip()
-                        if _ideal_p in ['nan','None','']: _ideal_p = str(row.get('Proc Role','Accountant I')).strip()
-                        if _ideal_r in ['nan','None','']: _ideal_r = str(row.get('Rev Role','Sr. Accountant')).strip()
-
-                    _util_p = utilization_map.get(_ideal_p, util_acc1)
-                    _util_r = utilization_map.get(_ideal_r, util_sr)
-                    _ptix   = float(row.get('Closed tickets with Proc time', 0) or 0)
-                    _rtix   = float(row.get('Closed tickets with rev time',  0) or 0)
-                    _paht   = float(row.get('>>> FINAL Capacity Proc AHT',   0) or 0)
-                    _raht   = float(row.get('>>> FINAL Capacity Rev AHT',    0) or 0)
-                    _pod_raw = row.get('POD', '')
-                    _pod    = str(_pod_raw if pd.notna(_pod_raw) else '').strip()
-                    if _pod.lower() in ('nan', 'none', ''): _pod = 'No POD'
-                    _cli    = str(row.get('client_name', 'Unknown')).strip()
-
-                    for _mi, _ms, _sm, _em, _nd, _actual_nd, _dscale in _month_params:
-                        _apct = float(_apct_m[_mi][_ri])
-                        _lc   = float(_lc_m[_mi][_ri])
-                        _evp, _evr, _eap, _ear = _effs[_mi]
-
-                        # Apply day_scale so post-auto hours match the baseline when no automations exist
-                        _bp = (_ptix * _apct * (1 - _evp) * _paht * (1 - _eap) * _lc * _dscale) / 60
-                        _br = (_rtix * _apct * (1 - _evr) * _raht * (1 - _ear) * _lc * _dscale) / 60
-
-                        _tp = _bp + _bp*(1-_util_p) + _bp*absenteeism + _bp*attrition
-                        _tr = _br + _br*(1-_util_r) + _br*absenteeism + _br*attrition
-
-                        summary_data_auto.append({'POD': _pod, 'Client': _cli, 'Required Role': _ideal_p, f"M{_mi+1} ({_ms}) - Post-Auto Hours": _tp})
-                        summary_data_auto.append({'POD': _pod, 'Client': _cli, 'Required Role': _ideal_r, f"M{_mi+1} ({_ms}) - Post-Auto Hours": _tr})
-
-                        monthly_prod_hrs[_mi] += (_bp + _br)
-                        monthly_util_hrs[_mi] += _bp*(1-_util_p) + _br*(1-_util_r)
-                        monthly_abs_hrs[_mi]  += (_bp + _br) * absenteeism
-                        monthly_att_hrs[_mi]  += (_bp + _br) * attrition
-                        # Accumulate per-POD productive hours for POD-level waterfall
-                        if _pod not in _pod_prod_hrs_m:
-                            _pod_prod_hrs_m[_pod] = {j: 0.0 for j in range(6)}
-                        _pod_prod_hrs_m[_pod][_mi] += (_bp + _br)
-
-                df_sum_auto    = pd.DataFrame(summary_data_auto)
-                cols_auto      = [c for c in df_sum_auto.columns if " - Post-Auto Hours" in c]
-                df_resumen_auto = df_sum_auto.groupby(['POD', 'Client', 'Required Role'])[cols_auto].sum().reset_index()
-
-                # Store per-POD productive hours so the POD waterfall can use them
-                # (includes both baseline and AI clients; covers AI-only PODs where
-                #  df_resumen_base has no 'Productive Hours' entries)
-                st.session_state.calc_data['pod_prod_hrs'] = _pod_prod_hrs_m
-
-                # 2. MERGE BASE AND AUTOMATED
-                # Normalize POD in both frames before merging so NaN/'nan' → 'No POD' consistently
-                def _norm_pod_col(df_arg):
-                    if 'POD' in df_arg.columns:
-                        df_arg = df_arg.copy()
-                        df_arg['POD'] = (
-                            df_arg['POD'].fillna('No POD').astype(str).str.strip()
-                            .where(lambda s: ~s.str.lower().isin({'nan','none',''}), 'No POD')
-                        )
-                    return df_arg
-
-                # Re-use the same flag (already set from radio widget at render time)
-                _s3_use_real_cas = _s3_use_real
-                _rb_base_key = 'df_resumen_base_real' if _s3_use_real_cas else 'df_resumen_base_ideal'
-                _rb_normed  = _norm_pod_col(st.session_state.calc_data.get(_rb_base_key,
-                                            st.session_state.calc_data['df_resumen_base']))
-                _ra_normed  = _norm_pod_col(df_resumen_auto)
-
-                # ── Re-assign POD in df_resumen_base using master map ──────────────
-                # Step 1 builds df_resumen_base from Master DB which may have blank/No POD.
-                # The cascade (Step 3) now enriches df with HubSpot PODs, so df_resumen_auto
-                # has the correct PODs. Without this fix, the outer merge creates split rows:
-                #   "No POD" row (base hours, c_final=0 → filtered) vs
-                #   "POD 1"  row (auto hours, no base) — losing all baseline hours per POD.
-                _pod_lkp_rb = st.session_state.get('_pod_map', {})
-                if _pod_lkp_rb and 'Client' in _rb_normed.columns:
-                    _rb_cli_key  = _rb_normed['Client'].astype(str).str.lower().str.strip()
-                    _rb_map_pod  = _rb_cli_key.map(_pod_lkp_rb)
-                    # Only override where master map has a real POD assignment
-                    _rb_override = _rb_map_pod.notna() & (_rb_map_pod != 'No POD')
-                    if _rb_override.any():
-                        _rb_normed = _rb_normed.copy()
-                        _rb_normed.loc[_rb_override, 'POD'] = _rb_map_pod[_rb_override]
-                        # Re-aggregate: rows that share (POD, Client, Role) after reassignment
-                        # must be summed so hours aren't duplicated
-                        _rb_num_cols = [c for c in _rb_normed.columns
-                                        if c not in ('POD', 'Client', 'Required Role')]
-                        _rb_normed = (_rb_normed
-                                      .groupby(['POD', 'Client', 'Required Role'], as_index=False)
-                                      [_rb_num_cols].sum())
-                        # Persist updated POD assignments back so future cascade runs start clean
-                        st.session_state.calc_data['df_resumen_base'] = _rb_normed.copy()
-                        st.session_state.calc_data[_rb_base_key]      = _rb_normed.copy()
-
-                df_resumen = pd.merge(
-                    _rb_normed,
-                    _ra_normed,
-                    on=['POD', 'Client', 'Required Role'],
-                    how='outer'
-                ).fillna(0.0)
-
-                df_resumen['Monthly_Cost'] = df_resumen['Required Role'].map(cost_map).fillna(0.0)
-
-                # Map Sr. Accountant from master map (single source of truth)
-                _sr_lkp_res = st.session_state.get('_sr_map', {})
-                if not _sr_lkp_res:
-                    # Fallback: build from df if master map not available
-                    if 'Sr. Accountant' in df.columns:
-                        _sr_src = df.dropna(subset=['client_name']).copy()
-                        _sr_src['_key_lower'] = _sr_src['client_name'].astype(str).str.lower().str.strip()
-                        _sr_lkp_res = _sr_src.groupby('_key_lower')['Sr. Accountant'].first().to_dict()
-                df_resumen['Sr. Accountant'] = (
-                    df_resumen['Client'].astype(str).str.lower().str.strip()
-                    .map(_sr_lkp_res).fillna('')
+                _has_gl = pd.notna(pd.Series(_gl_raw)).values
+                _gl_ts  = pd.DatetimeIndex(pd.to_datetime(pd.Series(_gl_raw), errors='coerce').fillna(_sm))
+                _mdiff  = np.where(_has_gl,
+                                   (_sm.year  - _gl_ts.year.values)  * 12 +
+                                   (_sm.month - _gl_ts.month.values),
+                                   999).astype(int)
+                _ap     = _apct_m[_mi]
+                _lc_m[_mi] = np.select(
+                    [~_has_gl | (_ap == 0),
+                     (_mdiff == 0) & _has_gl & (_ap > 0),
+                     (_mdiff == 1) & _has_gl & (_ap > 0),
+                     (_mdiff == 2) & _has_gl & (_ap > 0)],
+                    [1.0, 1.17, 0.86, 0.99],
+                    default=1.0
                 )
 
-                for i, mes_str in enumerate(meses_proyeccion):
-                    df_resumen[f"M{i+1} ({mes_str}) - Adjustments (+) Hrs"] = 0.0
-                    df_resumen[f"M{i+1} ({mes_str}) - Adjustments (-) Hrs"] = 0.0
+            # ── Pre-compute automation efficiencies per (client, task, pod, pms) ─
+            _autos_raw = st.session_state.automations_df
+            _autos_src = _autos_raw[_autos_raw.get("Confirmed", pd.Series(True, index=_autos_raw.index)) == True].copy() if not _autos_raw.empty else _autos_raw
+            _auto_cache = {}   # (client, task, pod, pms) → list[6] of (vp, vr, ap, ar)
 
-                # 3. APPLY (+) HISTORICAL ADJUSTMENTS
-                _hist_raw = st.session_state.historical_df
-                _hist_confirmed = _hist_raw[_hist_raw.get("Confirmed", pd.Series(True, index=_hist_raw.index)) == True] if not _hist_raw.empty else _hist_raw
-                for _, r in _hist_confirmed.iterrows():
-                    c_name, rol = r.get("Client"), r.get("Required Role")
-                    if pd.notna(c_name) and pd.notna(rol):
+            def _auto_matches_all(v):
+                return pd.isna(v) or str(v).strip() in ('', 'All')
+
+            if not _autos_src.empty:
+                _uniq_pairs = (
+                    df.assign(_task=df['type'].astype(str) + ' - ' + df['subtype'].astype(str))
+                      .assign(_pod=df.get('POD', pd.Series('', index=df.index)).fillna('').astype(str).str.strip())
+                      .assign(_pms=df.get('PMS', pd.Series('', index=df.index)).fillna('').astype(str).str.strip())
+                      [['client_name', '_task', '_pod', '_pms']].drop_duplicates()
+                )
+                for _, _up in _uniq_pairs.iterrows():
+                    _ck   = str(_up['client_name']).strip()
+                    _tk   = str(_up['_task']).strip()
+                    _pk   = str(_up['_pod']).strip()
+                    _pmsk = str(_up['_pms']).strip()
+                    _mc   = (_autos_src["Client"].apply(_auto_matches_all)) | (_autos_src["Client"] == _ck)
+                    _mt   = (_autos_src["Task (Type - Subtype)"].apply(_auto_matches_all)) | (_autos_src["Task (Type - Subtype)"] == _tk)
+                    _mpod = (_autos_src["POD"].apply(_auto_matches_all)) | (_autos_src["POD"] == _pk)   if "POD" in _autos_src.columns else pd.Series(True, index=_autos_src.index)
+                    _mpms = (_autos_src["PMS"].apply(_auto_matches_all)) | (_autos_src["PMS"] == _pmsk) if "PMS" in _autos_src.columns else pd.Series(True, index=_autos_src.index)
+                    _ap_rows = _autos_src[_mc & _mt & _mpod & _mpms]
+                    _effs = []
+                    for _mi2 in range(6):
+                        _evp = _evr = _eap = _ear = 0.0
+                        if not _ap_rows.empty:
+                            _mc2 = f"M{_mi2+1} (%)"
+                            for _, _au in _ap_rows.iterrows():
+                                _v = pd.to_numeric(_au.get(_mc2, 0), errors='coerce')
+                                if pd.isna(_v): _v = 0.0
+                                _v /= 100.0
+                                _af = str(_au.get("Affects", ""))
+                                _ia = _af == "All (Vol + AHT)"
+                                if "Vol Proc" in _af or _ia: _evp += _v
+                                if "Vol Rev"  in _af or _ia: _evr += _v
+                                if "AHT Proc" in _af or _ia: _eap += _v
+                                if "AHT Rev"  in _af or _ia: _ear += _v
+                        _effs.append((min(1.0,_evp), min(1.0,_evr), min(1.0,_eap), min(1.0,_ear)))
+                    _auto_cache[(_ck, _tk, _pk, _pmsk)] = _effs
+
+            # ── Main loop: rows (outer) × months (inner) ─────────────────────
+            _loading_overlay(_s3_ov, "Step 3 · Generating Dashboards", "🔄", 2, 5, "Running cascade & computing FTEs…")
+            for _ri, (index, row) in enumerate(df.iterrows()):
+                _ck    = str(row.get('client_name', '')).strip()
+                _tk    = str(row.get('type', '')) + ' - ' + str(row.get('subtype', ''))
+                _pk    = str(row.get('POD', '')).strip()
+                _pmsk  = str(row.get('PMS', '')).strip()
+                _effs  = _auto_cache.get((_ck, _tk, _pk, _pmsk), [(0.0,0.0,0.0,0.0)]*6)
+
+                if _s3_use_real_cas:
+                    _ideal_p = str(row.get('Proc Role', '')).strip()
+                    _ideal_r = str(row.get('Rev Role',  '')).strip()
+                    # Fall back to Ideal Proc/Rev when real roles are blank/invalid
+                    if _ideal_p in ['nan', 'None', '']:
+                        _ideal_p = str(row.get('Ideal Proc', row.get('Proc Role', 'Accountant I'))).strip()
+                    if _ideal_r in ['nan', 'None', '']:
+                        _ideal_r = str(row.get('Ideal Rev', row.get('Rev Role', 'Sr. Accountant'))).strip()
+                    if _ideal_p in ['nan', 'None', '']: _ideal_p = 'Accountant I'
+                    if _ideal_r in ['nan', 'None', '']: _ideal_r = 'Sr. Accountant'
+                else:
+                    _ideal_p = str(row.get('Ideal Proc', row.get('Proc Role', 'Accountant I'))).strip()
+                    _ideal_r = str(row.get('Ideal Rev',  row.get('Rev Role',  'Sr. Accountant'))).strip()
+                    if _ideal_p in ['nan','None','']: _ideal_p = str(row.get('Proc Role','Accountant I')).strip()
+                    if _ideal_r in ['nan','None','']: _ideal_r = str(row.get('Rev Role','Sr. Accountant')).strip()
+
+                _util_p = utilization_map.get(_ideal_p, util_acc1)
+                _util_r = utilization_map.get(_ideal_r, util_sr)
+                _ptix   = float(row.get('Closed tickets with Proc time', 0) or 0)
+                _rtix   = float(row.get('Closed tickets with rev time',  0) or 0)
+                _paht   = float(row.get('>>> FINAL Capacity Proc AHT',   0) or 0)
+                _raht   = float(row.get('>>> FINAL Capacity Rev AHT',    0) or 0)
+                _pod_raw = row.get('POD', '')
+                _pod    = str(_pod_raw if pd.notna(_pod_raw) else '').strip()
+                if _pod.lower() in ('nan', 'none', ''): _pod = 'No POD'
+                _cli    = str(row.get('client_name', 'Unknown')).strip()
+
+                for _mi, _ms, _sm, _em, _nd, _actual_nd, _dscale in _month_params:
+                    _apct = float(_apct_m[_mi][_ri])
+                    _lc   = float(_lc_m[_mi][_ri])
+                    _evp, _evr, _eap, _ear = _effs[_mi]
+
+                    # Apply day_scale so post-auto hours match the baseline when no automations exist
+                    _bp = (_ptix * _apct * (1 - _evp) * _paht * (1 - _eap) * _lc * _dscale) / 60
+                    _br = (_rtix * _apct * (1 - _evr) * _raht * (1 - _ear) * _lc * _dscale) / 60
+
+                    _tp = _bp + _bp*(1-_util_p) + _bp*absenteeism + _bp*attrition
+                    _tr = _br + _br*(1-_util_r) + _br*absenteeism + _br*attrition
+
+                    summary_data_auto.append({'POD': _pod, 'Client': _cli, 'Required Role': _ideal_p, f"M{_mi+1} ({_ms}) - Post-Auto Hours": _tp})
+                    summary_data_auto.append({'POD': _pod, 'Client': _cli, 'Required Role': _ideal_r, f"M{_mi+1} ({_ms}) - Post-Auto Hours": _tr})
+
+                    monthly_prod_hrs[_mi] += (_bp + _br)
+                    monthly_util_hrs[_mi] += _bp*(1-_util_p) + _br*(1-_util_r)
+                    monthly_abs_hrs[_mi]  += (_bp + _br) * absenteeism
+                    monthly_att_hrs[_mi]  += (_bp + _br) * attrition
+                    # Accumulate per-POD productive hours for POD-level waterfall
+                    if _pod not in _pod_prod_hrs_m:
+                        _pod_prod_hrs_m[_pod] = {j: 0.0 for j in range(6)}
+                    _pod_prod_hrs_m[_pod][_mi] += (_bp + _br)
+
+            df_sum_auto    = pd.DataFrame(summary_data_auto)
+            cols_auto      = [c for c in df_sum_auto.columns if " - Post-Auto Hours" in c]
+            df_resumen_auto = df_sum_auto.groupby(['POD', 'Client', 'Required Role'])[cols_auto].sum().reset_index()
+
+            # Store per-POD productive hours so the POD waterfall can use them
+            # (includes both baseline and AI clients; covers AI-only PODs where
+            #  df_resumen_base has no 'Productive Hours' entries)
+            st.session_state.calc_data['pod_prod_hrs'] = _pod_prod_hrs_m
+
+            # 2. MERGE BASE AND AUTOMATED
+            # Normalize POD in both frames before merging so NaN/'nan' → 'No POD' consistently
+            def _norm_pod_col(df_arg):
+                if 'POD' in df_arg.columns:
+                    df_arg = df_arg.copy()
+                    df_arg['POD'] = (
+                        df_arg['POD'].fillna('No POD').astype(str).str.strip()
+                        .where(lambda s: ~s.str.lower().isin({'nan','none',''}), 'No POD')
+                    )
+                return df_arg
+
+            # Re-use the same flag (already set from radio widget at render time)
+            _s3_use_real_cas = _s3_use_real
+            _rb_base_key = 'df_resumen_base_real' if _s3_use_real_cas else 'df_resumen_base_ideal'
+            _rb_normed  = _norm_pod_col(st.session_state.calc_data.get(_rb_base_key,
+                                        st.session_state.calc_data['df_resumen_base']))
+            _ra_normed  = _norm_pod_col(df_resumen_auto)
+
+            # ── Re-assign POD in df_resumen_base using master map ──────────────
+            # Step 1 builds df_resumen_base from Master DB which may have blank/No POD.
+            # The cascade (Step 3) now enriches df with HubSpot PODs, so df_resumen_auto
+            # has the correct PODs. Without this fix, the outer merge creates split rows:
+            #   "No POD" row (base hours, c_final=0 → filtered) vs
+            #   "POD 1"  row (auto hours, no base) — losing all baseline hours per POD.
+            _pod_lkp_rb = st.session_state.get('_pod_map', {})
+            if _pod_lkp_rb and 'Client' in _rb_normed.columns:
+                _rb_cli_key  = _rb_normed['Client'].astype(str).str.lower().str.strip()
+                _rb_map_pod  = _rb_cli_key.map(_pod_lkp_rb)
+                # Only override where master map has a real POD assignment
+                _rb_override = _rb_map_pod.notna() & (_rb_map_pod != 'No POD')
+                if _rb_override.any():
+                    _rb_normed = _rb_normed.copy()
+                    _rb_normed.loc[_rb_override, 'POD'] = _rb_map_pod[_rb_override]
+                    # Re-aggregate: rows that share (POD, Client, Role) after reassignment
+                    # must be summed so hours aren't duplicated
+                    _rb_num_cols = [c for c in _rb_normed.columns
+                                    if c not in ('POD', 'Client', 'Required Role')]
+                    _rb_normed = (_rb_normed
+                                  .groupby(['POD', 'Client', 'Required Role'], as_index=False)
+                                  [_rb_num_cols].sum())
+                    # Persist updated POD assignments back so future cascade runs start clean
+                    st.session_state.calc_data['df_resumen_base'] = _rb_normed.copy()
+                    st.session_state.calc_data[_rb_base_key]      = _rb_normed.copy()
+
+            df_resumen = pd.merge(
+                _rb_normed,
+                _ra_normed,
+                on=['POD', 'Client', 'Required Role'],
+                how='outer'
+            ).fillna(0.0)
+
+            df_resumen['Monthly_Cost'] = df_resumen['Required Role'].map(cost_map).fillna(0.0)
+
+            # Map Sr. Accountant from master map (single source of truth)
+            _sr_lkp_res = st.session_state.get('_sr_map', {})
+            if not _sr_lkp_res:
+                # Fallback: build from df if master map not available
+                if 'Sr. Accountant' in df.columns:
+                    _sr_src = df.dropna(subset=['client_name']).copy()
+                    _sr_src['_key_lower'] = _sr_src['client_name'].astype(str).str.lower().str.strip()
+                    _sr_lkp_res = _sr_src.groupby('_key_lower')['Sr. Accountant'].first().to_dict()
+            df_resumen['Sr. Accountant'] = (
+                df_resumen['Client'].astype(str).str.lower().str.strip()
+                .map(_sr_lkp_res).fillna('')
+            )
+
+            for i, mes_str in enumerate(meses_proyeccion):
+                df_resumen[f"M{i+1} ({mes_str}) - Adjustments (+) Hrs"] = 0.0
+                df_resumen[f"M{i+1} ({mes_str}) - Adjustments (-) Hrs"] = 0.0
+
+            # 3. APPLY (+) HISTORICAL ADJUSTMENTS
+            _hist_raw = st.session_state.historical_df
+            _hist_confirmed = _hist_raw[_hist_raw.get("Confirmed", pd.Series(True, index=_hist_raw.index)) == True] if not _hist_raw.empty else _hist_raw
+            for _, r in _hist_confirmed.iterrows():
+                c_name, rol = r.get("Client"), r.get("Required Role")
+                if pd.notna(c_name) and pd.notna(rol):
+                    mask = (df_resumen["Client"] == c_name) & (df_resumen["Required Role"] == rol)
+                    if not mask.any():
+                        _h_pod = str(r.get("POD", "") or "").strip()
+                        if not _h_pod or _h_pod.lower() in ('nan', 'none', ''):
+                            _h_pod = "Manual/Historical"
+                        new_row = {"POD": _h_pod, "Client": c_name, "Required Role": rol, "Monthly_Cost": cost_map.get(rol, 0)}
+                        for col in df_resumen.columns:
+                            if col not in new_row: new_row[col] = 0.0
+                        df_resumen = pd.concat([df_resumen, pd.DataFrame([new_row])], ignore_index=True)
                         mask = (df_resumen["Client"] == c_name) & (df_resumen["Required Role"] == rol)
-                        if not mask.any():
-                            _h_pod = str(r.get("POD", "") or "").strip()
-                            if not _h_pod or _h_pod.lower() in ('nan', 'none', ''):
-                                _h_pod = "Manual/Historical"
-                            new_row = {"POD": _h_pod, "Client": c_name, "Required Role": rol, "Monthly_Cost": cost_map.get(rol, 0)}
-                            for col in df_resumen.columns:
-                                if col not in new_row: new_row[col] = 0.0
-                            df_resumen = pd.concat([df_resumen, pd.DataFrame([new_row])], ignore_index=True)
-                            mask = (df_resumen["Client"] == c_name) & (df_resumen["Required Role"] == rol)
-
-                        for i, mes_str in enumerate(meses_proyeccion):
-                            val = pd.to_numeric(r.get(f"M{i+1} (Hrs)", 0), errors='coerce')
-                            if pd.notna(val) and val > 0:
-                                df_resumen.loc[mask, f"M{i+1} ({mes_str}) - Adjustments (+) Hrs"] += val
-
-                # 3b. APPLY DOOR COUNT VARIATION
-                # Each confirmed row specifies a % change per month for a client.
-                # The percentage scales that client's Post-Auto Hours for the chosen months.
-                # Positive = more doors (more hours), negative = fewer doors (fewer hours).
-                _dc_raw = st.session_state.get('doorcount_df', pd.DataFrame())
-                if not _dc_raw.empty:
-                    _dc_conf = _dc_raw[_dc_raw.get('Confirmed', pd.Series(True, index=_dc_raw.index)) == True]
-                    for _, _dcr in _dc_conf.iterrows():
-                        _dc_cli = str(_dcr.get('Client', '') or '').strip()
-                        if not _dc_cli or _dc_cli.lower() in ('nan', 'none', ''):
-                            continue
-                        _dc_mask = df_resumen['Client'] == _dc_cli
-                        for _dci, _dcms in enumerate(meses_proyeccion):
-                            _dc_pct = pd.to_numeric(_dcr.get(f"M{_dci+1} (%)", 0), errors='coerce') or 0.0
-                            if _dc_pct == 0.0:
-                                continue
-                            _dc_post_col = f"M{_dci+1} ({_dcms}) - Post-Auto Hours"
-                            _dc_adj_col  = (
-                                f"M{_dci+1} ({_dcms}) - Adjustments (+) Hrs"
-                                if _dc_pct > 0
-                                else f"M{_dci+1} ({_dcms}) - Adjustments (-) Hrs"
-                            )
-                            if _dc_post_col in df_resumen.columns and _dc_mask.any():
-                                _dc_delta = df_resumen.loc[_dc_mask, _dc_post_col] * (abs(_dc_pct) / 100.0)
-                                df_resumen.loc[_dc_mask, _dc_adj_col] += _dc_delta.values
-
-                # 4. APPLY (-) REDUCTION ADJUSTMENTS  (POD-hierarchy)
-                _red_raw = st.session_state.reductions_df
-                _red_confirmed = _red_raw[_red_raw.get("Confirmed", pd.Series(True, index=_red_raw.index)) == True] if not _red_raw.empty else _red_raw
-
-                def _blank(v):
-                    return pd.isna(v) or str(v).strip() in ('', 'nan', 'None', 'All')
-
-                for _, r in _red_confirmed.iterrows():
-                    _pod_v  = r.get("POD", "")
-                    _cli_v  = r.get("Client", "")
-                    _rol_v  = r.get("Required Role", "")
-                    has_pod = not _blank(_pod_v)
-                    has_cli = not _blank(_cli_v)
-                    has_rol = not _blank(_rol_v)
 
                     for i, mes_str in enumerate(meses_proyeccion):
                         val = pd.to_numeric(r.get(f"M{i+1} (Hrs)", 0), errors='coerce')
-                        if pd.isna(val) or val <= 0:
+                        if pd.notna(val) and val > 0:
+                            df_resumen.loc[mask, f"M{i+1} ({mes_str}) - Adjustments (+) Hrs"] += val
+
+            # 3b. APPLY DOOR COUNT VARIATION
+            # Each confirmed row specifies a % change per month for a client.
+            # The percentage scales that client's Post-Auto Hours for the chosen months.
+            # Positive = more doors (more hours), negative = fewer doors (fewer hours).
+            _dc_raw = st.session_state.get('doorcount_df', pd.DataFrame())
+            if not _dc_raw.empty:
+                _dc_conf = _dc_raw[_dc_raw.get('Confirmed', pd.Series(True, index=_dc_raw.index)) == True]
+                for _, _dcr in _dc_conf.iterrows():
+                    _dc_cli = str(_dcr.get('Client', '') or '').strip()
+                    if not _dc_cli or _dc_cli.lower() in ('nan', 'none', ''):
+                        continue
+                    _dc_mask = df_resumen['Client'] == _dc_cli
+                    for _dci, _dcms in enumerate(meses_proyeccion):
+                        _dc_pct = pd.to_numeric(_dcr.get(f"M{_dci+1} (%)", 0), errors='coerce') or 0.0
+                        if _dc_pct == 0.0:
                             continue
-                        col_post = f"M{i+1} ({mes_str}) - Post-Auto Hours"
-                        col_minus = f"M{i+1} ({mes_str}) - Adjustments (-) Hrs"
+                        _dc_post_col = f"M{_dci+1} ({_dcms}) - Post-Auto Hours"
+                        _dc_adj_col  = (
+                            f"M{_dci+1} ({_dcms}) - Adjustments (+) Hrs"
+                            if _dc_pct > 0
+                            else f"M{_dci+1} ({_dcms}) - Adjustments (-) Hrs"
+                        )
+                        if _dc_post_col in df_resumen.columns and _dc_mask.any():
+                            _dc_delta = df_resumen.loc[_dc_mask, _dc_post_col] * (abs(_dc_pct) / 100.0)
+                            df_resumen.loc[_dc_mask, _dc_adj_col] += _dc_delta.values
 
-                        # Build base mask
-                        _m_pod = (df_resumen['POD'].astype(str).str.strip() == str(_pod_v).strip()) if has_pod else pd.Series(True, index=df_resumen.index)
-                        _m_cli = (df_resumen['Client'] == str(_cli_v).strip()) if has_cli else pd.Series(True, index=df_resumen.index)
-                        _m_rol = (df_resumen['Required Role'] == str(_rol_v).strip()) if has_rol else pd.Series(True, index=df_resumen.index)
-                        mask = _m_pod & _m_cli & _m_rol
+            # 4. APPLY (-) REDUCTION ADJUSTMENTS  (POD-hierarchy)
+            _red_raw = st.session_state.reductions_df
+            _red_confirmed = _red_raw[_red_raw.get("Confirmed", pd.Series(True, index=_red_raw.index)) == True] if not _red_raw.empty else _red_raw
 
-                        if has_cli and has_rol:
-                            # Exact match — apply directly
-                            df_resumen.loc[mask, col_minus] += val
-                        else:
-                            # Prorate by each row's share of total hours in the target group
-                            tot = df_resumen.loc[mask, col_post].sum()
-                            if tot > 0:
-                                df_resumen.loc[mask, col_minus] += val * (df_resumen.loc[mask, col_post] / tot)
+            def _blank(v):
+                return pd.isna(v) or str(v).strip() in ('', 'nan', 'None', 'All')
 
-                # 5. BUILD FINAL CASCADE & SAVINGS ($)
-                columnas_ordenadas = ['POD', 'Sr. Accountant', 'Client', 'Required Role']
-
-                # Automation savings are only real if the user actually configured automations.
-                # Without automations, small differences between Step-1 Base Hours and cascade
-                # Post-Auto Hours (caused by master-map date updates changing active_pct) would
-                # produce phantom "savings". Gate on: efficiency was enabled AND the automations
-                # table has at least one confirmed entry.
-                _autos_df_check = st.session_state.get('s2_automations', pd.DataFrame())
-                _has_real_autos = (
-                    st.session_state.get('s2_efficiency_choice') == 'yes'
-                    and not _autos_df_check.empty
-                    and (
-                        _autos_df_check.get('Confirmed', pd.Series(dtype=bool)).any()
-                        if 'Confirmed' in _autos_df_check.columns
-                        else len(_autos_df_check) > 0
-                    )
-                )
+            for _, r in _red_confirmed.iterrows():
+                _pod_v  = r.get("POD", "")
+                _cli_v  = r.get("Client", "")
+                _rol_v  = r.get("Required Role", "")
+                has_pod = not _blank(_pod_v)
+                has_cli = not _blank(_cli_v)
+                has_rol = not _blank(_rol_v)
 
                 for i, mes_str in enumerate(meses_proyeccion):
-                    c_base      = f"M{i+1} ({mes_str}) - Base Hours"
-                    c_post      = f"M{i+1} ({mes_str}) - Post-Auto Hours"
-                    c_save_hrs  = f"M{i+1} ({mes_str}) - Auto Saving (Hrs)"
-                    c_save_usd  = f"M{i+1} ({mes_str}) - Auto Saving ($)"
-                    c_plus      = f"M{i+1} ({mes_str}) - Adjustments (+) Hrs"
-                    c_minus     = f"M{i+1} ({mes_str}) - Adjustments (-) Hrs"
-                    c_final     = f"M{i+1} ({mes_str}) - Final Hours"
-                    c_fte       = f"M{i+1} ({mes_str}) - Final FTEs"
+                    val = pd.to_numeric(r.get(f"M{i+1} (Hrs)", 0), errors='coerce')
+                    if pd.isna(val) or val <= 0:
+                        continue
+                    col_post = f"M{i+1} ({mes_str}) - Post-Auto Hours"
+                    col_minus = f"M{i+1} ({mes_str}) - Adjustments (-) Hrs"
 
-                    # Only compute real automation savings when automations are actually configured;
-                    # otherwise keep it zero to avoid phantom values from date-update drift.
-                    if _has_real_autos:
-                        df_resumen[c_save_hrs] = np.maximum(0, df_resumen[c_base] - df_resumen[c_post])
+                    # Build base mask
+                    _m_pod = (df_resumen['POD'].astype(str).str.strip() == str(_pod_v).strip()) if has_pod else pd.Series(True, index=df_resumen.index)
+                    _m_cli = (df_resumen['Client'] == str(_cli_v).strip()) if has_cli else pd.Series(True, index=df_resumen.index)
+                    _m_rol = (df_resumen['Required Role'] == str(_rol_v).strip()) if has_rol else pd.Series(True, index=df_resumen.index)
+                    mask = _m_pod & _m_cli & _m_rol
+
+                    if has_cli and has_rol:
+                        # Exact match — apply directly
+                        df_resumen.loc[mask, col_minus] += val
                     else:
-                        df_resumen[c_save_hrs] = 0.0
+                        # Prorate by each row's share of total hours in the target group
+                        tot = df_resumen.loc[mask, col_post].sum()
+                        if tot > 0:
+                            df_resumen.loc[mask, col_minus] += val * (df_resumen.loc[mask, col_post] / tot)
 
-                    hrs_fte = dict_hrs_per_fte[i]
-                    df_resumen[c_save_usd] = (
-                        (df_resumen[c_save_hrs] / hrs_fte * df_resumen['Monthly_Cost']).round(2)
-                        if hrs_fte > 0 else 0.0
-                    )
+            # 5. BUILD FINAL CASCADE & SAVINGS ($)
+            columnas_ordenadas = ['POD', 'Sr. Accountant', 'Client', 'Required Role']
 
-                    df_resumen[c_minus] = np.minimum(df_resumen[c_minus], df_resumen[c_post] + df_resumen[c_plus])
-                    df_resumen[c_final] = df_resumen[c_post] + df_resumen[c_plus] - df_resumen[c_minus]
-                    df_resumen[c_fte]   = (df_resumen[c_final] / hrs_fte).round(4) if hrs_fte > 0 else 0.0
+            # Automation savings are only real if the user actually configured automations.
+            # Without automations, small differences between Step-1 Base Hours and cascade
+            # Post-Auto Hours (caused by master-map date updates changing active_pct) would
+            # produce phantom "savings". Gate on: efficiency was enabled AND the automations
+            # table has at least one confirmed entry.
+            _autos_df_check = st.session_state.get('s2_automations', pd.DataFrame())
+            _has_real_autos = (
+                st.session_state.get('s2_efficiency_choice') == 'yes'
+                and not _autos_df_check.empty
+                and (
+                    _autos_df_check.get('Confirmed', pd.Series(dtype=bool)).any()
+                    if 'Confirmed' in _autos_df_check.columns
+                    else len(_autos_df_check) > 0
+                )
+            )
 
-                    for col in [c_base, c_save_hrs, c_post, c_plus, c_minus, c_final]:
-                        df_resumen[col] = df_resumen[col].round(2)
+            for i, mes_str in enumerate(meses_proyeccion):
+                c_base      = f"M{i+1} ({mes_str}) - Base Hours"
+                c_post      = f"M{i+1} ({mes_str}) - Post-Auto Hours"
+                c_save_hrs  = f"M{i+1} ({mes_str}) - Auto Saving (Hrs)"
+                c_save_usd  = f"M{i+1} ({mes_str}) - Auto Saving ($)"
+                c_plus      = f"M{i+1} ({mes_str}) - Adjustments (+) Hrs"
+                c_minus     = f"M{i+1} ({mes_str}) - Adjustments (-) Hrs"
+                c_final     = f"M{i+1} ({mes_str}) - Final Hours"
+                c_fte       = f"M{i+1} ({mes_str}) - Final FTEs"
 
-                    columnas_ordenadas.extend([c_base, c_save_hrs, c_save_usd, c_post, c_plus, c_minus, c_final, c_fte])
+                # Only compute real automation savings when automations are actually configured;
+                # otherwise keep it zero to avoid phantom values from date-update drift.
+                if _has_real_autos:
+                    df_resumen[c_save_hrs] = np.maximum(0, df_resumen[c_base] - df_resumen[c_post])
+                else:
+                    df_resumen[c_save_hrs] = 0.0
 
-                df_resumen = df_resumen[columnas_ordenadas]
-                cols_check  = [c for c in df_resumen.columns if "Final Hours" in c]
-                df_resumen  = df_resumen.loc[(df_resumen[cols_check] > 0.01).any(axis=1)]
-
-                # 5b. BASELINE AUDIT TABLE — all per-row calculated fields
-                # Build bidirectional lookup from HC report:
-                #   _n2email : full_name_lower → email
-                #   _e2name  : email_lower     → full_name   (for display when processor IS an email)
-                _hc_snap = st.session_state.get('hc_data')
-                _n2email = {}
-                _e2name  = {}
-                if _hc_snap:
-                    _hc_det_snap = _hc_snap.get('detail', pd.DataFrame())
-                    if not _hc_det_snap.empty:
-                        for _, _hr in _hc_det_snap.iterrows():
-                            _fn = str(_hr.get('Full name', '')).strip()
-                            _em = str(_hr.get('Work Email', '')).strip()
-                            if _fn and _em and _em.lower() not in ('nan', 'none', ''):
-                                _n2email[_fn.lower()]  = _em
-                                _e2name[_em.lower()]   = _fn
-
-                _audit_rows = []
-                _hrs_fte_m1 = dict_hrs_per_fte.get(0, 1)
-                _wdays_m1   = dict_workable_days.get(0, 21)
-                _m1_start   = pd.Timestamp((today + relativedelta(months=0)).replace(day=1).date())
-                _m1_end     = pd.Timestamp((_m1_start + relativedelta(months=1) - relativedelta(days=1)).date())
-
-                # Case-insensitive column lookup — master DB may use any casing
-                _ci_col = {c.strip().lower(): c for c in df.columns}
-
-                def _get_ci(row, col_lower, default=''):
-                    actual = _ci_col.get(col_lower)
-                    if actual is None:
-                        return default
-                    v = row.get(actual, default)
-                    return default if (v is None or (isinstance(v, float) and pd.isna(v))) else v
-
-                for _idx, _row in df.iterrows():
-                    _cli   = str(_row.get('client_name', 'Unknown')).strip()
-                    _pod_r = _row.get('POD', '')
-                    _pod   = str(_pod_r if pd.notna(_pod_r) else '').strip()
-                    if _pod.lower() in ('nan', 'none', ''): _pod = 'No POD'
-                    _sr    = str(_row.get('Sr. Accountant', '')).strip()
-                    _mrr   = float(_row.get('MRR', 0) or 0)
-                    _gl    = _row['Go Live']
-                    _fsd   = _row['Final Service Date']
-
-                    if _s3_use_real_cas:
-                        _ip = str(_row.get('Proc Role', 'Accountant I')).strip()
-                        _ir = str(_row.get('Rev Role',  'Sr. Accountant')).strip()
-                        if _ip in ['nan','None','']: _ip = 'Accountant I'
-                        if _ir in ['nan','None','']: _ir = 'Sr. Accountant'
-                    else:
-                        _ip = str(_row.get('Ideal Proc', _row.get('Proc Role', 'Accountant I'))).strip()
-                        _ir = str(_row.get('Ideal Rev',  _row.get('Rev Role',  'Sr. Accountant'))).strip()
-                        if _ip in ['nan','None','']: _ip = str(_row.get('Proc Role','Accountant I')).strip()
-                        if _ir in ['nan','None','']: _ir = str(_row.get('Rev Role','Sr. Accountant')).strip()
-
-                    _ptix = float(_row.get('Closed tickets with Proc time', 0) or 0)
-                    _rtix = float(_row.get('Closed tickets with rev time',  0) or 0)
-                    _paht = float(_row.get('>>> FINAL Capacity Proc AHT', 0) or 0)
-                    _raht = float(_row.get('>>> FINAL Capacity Rev AHT',  0) or 0)
-
-                    _as = _m1_start if pd.isna(_gl) else max(_m1_start, _gl)
-                    _ae = _m1_end   if pd.isna(_fsd) else min(_m1_end, _fsd)
-                    if _as <= _ae:
-                        _da = np.busday_count(_as.strftime('%Y-%m-%d'), (_ae + pd.Timedelta(days=1)).strftime('%Y-%m-%d'))
-                        _apct = max(0.0, min(1.0, _da / _wdays_m1)) if _wdays_m1 > 0 else 0.0
-                    else:
-                        _apct = 0.0
-
-                    _lc = 1.0
-                    if pd.notna(_gl) and _apct > 0:
-                        _md = (_m1_start.year - _gl.year) * 12 + (_m1_start.month - _gl.month)
-                        if   _md == 0: _lc = 1.17
-                        elif _md == 1: _lc = 0.86
-                        elif _md == 2: _lc = 0.99
-
-                    _bp = (_ptix * _apct * _paht * _lc) / 60
-                    _br = (_rtix * _apct * _raht * _lc) / 60
-                    _up = utilization_map.get(_ip, util_acc1)
-                    _ur = utilization_map.get(_ir, util_sr)
-                    _tp = _bp + (_bp * (1 - _up)) + (_bp * absenteeism) + (_bp * attrition)
-                    _tr = _br + (_br * (1 - _ur)) + (_br * absenteeism) + (_br * attrition)
-
-                    # Resolve processor / reviewer names and emails.
-                    # The Master DB 'processor' / 'reviewer' columns may contain either:
-                    #   (a) an email address directly  → maria.tamayo@proper.ai
-                    #   (b) a full name                → Maria Tamayo
-                    # Detect by presence of '@' and handle both cases.
-                    _proc_raw  = str(_get_ci(_row, 'processor')).strip()
-                    _rev_raw   = str(_get_ci(_row, 'reviewer')).strip()
-                    if _proc_raw.lower() in ('nan', 'none'): _proc_raw = ''
-                    if _rev_raw.lower()  in ('nan', 'none'): _rev_raw  = ''
-
-                    if '@' in _proc_raw:                      # field already is an email
-                        _proc_email = _proc_raw.lower()
-                        _proc_name  = _e2name.get(_proc_email, _proc_raw)
-                    else:                                     # field is a name
-                        _proc_name  = _proc_raw
-                        _proc_email = str(_get_ci(_row, 'processor email')).strip()
-                        if not _proc_email or _proc_email.lower() in ('nan', 'none'):
-                            _proc_email = _n2email.get(_proc_name.lower(), '')
-
-                    if '@' in _rev_raw:
-                        _rev_email = _rev_raw.lower()
-                        _rev_name  = _e2name.get(_rev_email, _rev_raw)
-                    else:
-                        _rev_name  = _rev_raw
-                        _rev_email = str(_get_ci(_row, 'reviewer email')).strip()
-                        if not _rev_email or _rev_email.lower() in ('nan', 'none'):
-                            _rev_email = _n2email.get(_rev_name.lower(), '')
-
-                    _audit_rows.append({
-                        'POD':                          _pod,
-                        'Sr. Accountant':               _sr,
-                        'Client':                       _cli,
-                        'Process':                      str(_row.get('type',    '')).strip(),
-                        'Sub-process':                  str(_row.get('subtype', '')).strip(),
-                        'Processor':                    _proc_name,
-                        'Processor Email':              _proc_email,
-                        'Processor Role':               _ip,
-                        'Reviewer':                     _rev_name,
-                        'Reviewer Email':               _rev_email,
-                        'Reviewer Role':                _ir,
-                        'Closed Tix (Proc)':            round(_ptix, 0),
-                        'AHT Proc (min)':               round(_paht, 2),
-                        'Closed Tix (Rev)':             round(_rtix, 0),
-                        'AHT Rev (min)':                round(_raht, 2),
-                        'MRR ($)':                      round(_mrr, 2),
-                        'Res Doors':                    _row.get('Res doors', ''),
-                        'Res Prop':                     _row.get('Res Prop', ''),
-                        'Comm Doors':                   _row.get('Commercial Doors', ''),
-                        'Comm Properties':              _row.get('Commercial Properties', ''),
-                        'SQFT':                         _row.get('SQFT Commercial', ''),
-                        'Corp Books':                   _row.get('Corp Books', ''),
-                        'PMS':                          str(_row.get('PMS', '')).strip(),
-                        'Go Live':                      str(_gl)[:10] if pd.notna(_gl) else '',
-                        'Final Service Date':           str(_fsd)[:10] if pd.notna(_fsd) else '',
-                        'Active % (M1)':                round(_apct * 100, 1),
-                        'Learning Curve (M1)':          round(_lc, 2),
-                        'Prod Hrs Proc (M1)':           round(_bp, 2),
-                        'Prod Hrs Rev (M1)':            round(_br, 2),
-                        'Total Hrs Proc w/ Shrinkage':  round(_tp, 2),
-                        'Total Hrs Rev w/ Shrinkage':   round(_tr, 2),
-                        'Total Hrs (M1)':               round(_tp + _tr, 2),
-                        'FTEs (M1)':                    round((_tp + _tr) / _hrs_fte_m1, 4) if _hrs_fte_m1 > 0 else 0,
-                        'Util Rate Proc':               round(_up * 100, 1),
-                        'Util Rate Rev':                round(_ur * 100, 1),
-                        'Absenteeism Rate':             round(absenteeism * 100, 1),
-                        'Attrition Rate':               round(attrition * 100, 1),
-                        'Working Days (M1)':            _wdays_m1,
-                    })
-
-                df_baseline_audit = pd.DataFrame(_audit_rows)
-
-                # 6. SUMMARY BY POD
-                todas_cols     = [c for c in df_resumen.columns if "M" in c]
-                df_pod_roles   = df_resumen.groupby(['POD', 'Required Role'])[todas_cols].sum().reset_index()
-                df_pod_totales = df_resumen.groupby(['POD'])[todas_cols].sum().reset_index()
-                df_pod_totales['Required Role'] = '>>> POD TOTAL'
-                df_pod_final   = (
-                    pd.concat([df_pod_roles, df_pod_totales], ignore_index=True)
-                    .sort_values(by=['POD', 'Required Role'])
-                    .reset_index(drop=True)
+                hrs_fte = dict_hrs_per_fte[i]
+                df_resumen[c_save_usd] = (
+                    (df_resumen[c_save_hrs] / hrs_fte * df_resumen['Monthly_Cost']).round(2)
+                    if hrs_fte > 0 else 0.0
                 )
 
-                # 7. EXECUTIVE GENERAL DASHBOARD
-                resumen_ejecutivo        = []
-                _pod_churn_store         = {}   # {mes_str: {pod_name: churn_hrs (required)}}
-                _pod_churn_prod_store    = {}   # {mes_str: {pod_name: churn_hrs (productive)}}
-                _pod_new_hrs_store       = {}   # {mes_str: {pod_name: new_client_hrs (required)}}
-                _pod_new_prod_hrs_store  = {}   # {mes_str: {pod_name: new_client_hrs (productive)}}
-                _pod_new_mrr_store       = {}   # {mes_str: {pod_name: new_mrr}}
-                _pod_churn_mrr_store     = {}   # {mes_str: {pod_name: churn_mrr}}
+                df_resumen[c_minus] = np.minimum(df_resumen[c_minus], df_resumen[c_post] + df_resumen[c_plus])
+                df_resumen[c_final] = df_resumen[c_post] + df_resumen[c_plus] - df_resumen[c_minus]
+                df_resumen[c_fte]   = (df_resumen[c_final] / hrs_fte).round(4) if hrs_fte > 0 else 0.0
 
-                # Build client→POD mapping once (for per-POD MRR look-ups)
-                _cli_pod_map = {}
-                if 'Client' in df_resumen.columns and 'POD' in df_resumen.columns:
-                    _tmp_cpod = df_resumen.dropna(subset=['Client']).groupby('Client')['POD'].first()
-                    _cli_pod_map = {str(k).strip().lower(): str(v) for k, v in _tmp_cpod.items()}
+                for col in [c_base, c_save_hrs, c_post, c_plus, c_minus, c_final]:
+                    df_resumen[col] = df_resumen[col].round(2)
 
-                for i, mes_str in enumerate(meses_proyeccion):
-                    c_base      = f"M{i+1} ({mes_str}) - Base Hours"
-                    c_prod      = f"M{i+1} ({mes_str}) - Productive Hours"
-                    c_post      = f"M{i+1} ({mes_str}) - Post-Auto Hours"
-                    c_save_hrs  = f"M{i+1} ({mes_str}) - Auto Saving (Hrs)"
-                    c_save_usd  = f"M{i+1} ({mes_str}) - Auto Saving ($)"
-                    c_plus      = f"M{i+1} ({mes_str}) - Adjustments (+) Hrs"
-                    c_minus     = f"M{i+1} ({mes_str}) - Adjustments (-) Hrs"
-                    c_final     = f"M{i+1} ({mes_str}) - Final Hours"
-                    c_fte       = f"M{i+1} ({mes_str}) - Final FTEs"
+                columnas_ordenadas.extend([c_base, c_save_hrs, c_save_usd, c_post, c_plus, c_minus, c_final, c_fte])
 
-                    tot_base      = df_resumen[c_base].sum()     if c_base     in df_resumen.columns else 0
-                    tot_save_hrs  = df_resumen[c_save_hrs].sum() if c_save_hrs in df_resumen.columns else 0
-                    tot_save_usd  = df_resumen[c_save_usd].sum() if c_save_usd in df_resumen.columns else 0
-                    tot_plus      = df_resumen[c_plus].sum()     if c_plus     in df_resumen.columns else 0
-                    tot_minus     = df_resumen[c_minus].sum()    if c_minus    in df_resumen.columns else 0
-                    tot_final     = df_resumen[c_final].sum()    if c_final    in df_resumen.columns else 0
-                    tot_fte       = df_resumen[c_fte].sum()      if c_fte      in df_resumen.columns else 0
+            df_resumen = df_resumen[columnas_ordenadas]
+            cols_check  = [c for c in df_resumen.columns if "Final Hours" in c]
+            df_resumen  = df_resumen.loc[(df_resumen[cols_check] > 0.01).any(axis=1)]
 
-                    fte_acc1 = df_resumen[df_resumen['Required Role'] == 'Accountant I'][c_fte].sum()
-                    fte_acc2 = df_resumen[df_resumen['Required Role'] == 'Accountant II'][c_fte].sum()
-                    fte_gen  = df_resumen[df_resumen['Required Role'] == 'General Accountant'][c_fte].sum()
-                    fte_sr   = df_resumen[df_resumen['Required Role'] == 'Sr. Accountant'][c_fte].sum()
+            # 5b. BASELINE AUDIT TABLE — all per-row calculated fields
+            # Build bidirectional lookup from HC report:
+            #   _n2email : full_name_lower → email
+            #   _e2name  : email_lower     → full_name   (for display when processor IS an email)
+            _hc_snap = st.session_state.get('hc_data')
+            _n2email = {}
+            _e2name  = {}
+            if _hc_snap:
+                _hc_det_snap = _hc_snap.get('detail', pd.DataFrame())
+                if not _hc_det_snap.empty:
+                    for _, _hr in _hc_det_snap.iterrows():
+                        _fn = str(_hr.get('Full name', '')).strip()
+                        _em = str(_hr.get('Work Email', '')).strip()
+                        if _fn and _em and _em.lower() not in ('nan', 'none', ''):
+                            _n2email[_fn.lower()]  = _em
+                            _e2name[_em.lower()]   = _fn
 
-                    mes_date = today + relativedelta(months=_month_offsets[i])
-                    start_m  = pd.Timestamp(mes_date.replace(day=1).date())
-                    end_m    = pd.Timestamp((start_m + relativedelta(months=1) - relativedelta(days=1)).date())
+            _audit_rows = []
+            _hrs_fte_m1 = dict_hrs_per_fte.get(0, 1)
+            _wdays_m1   = dict_workable_days.get(0, 21)
+            _m1_start   = pd.Timestamp((today + relativedelta(months=0)).replace(day=1).date())
+            _m1_end     = pd.Timestamp((_m1_start + relativedelta(months=1) - relativedelta(days=1)).date())
 
-                    mask_active_mrr = (
-                        (df_clients_unique['Go Live'] <= end_m)   | df_clients_unique['Go Live'].isna()
-                    ) & (
-                        (df_clients_unique['Final Service Date'] >= start_m) | df_clients_unique['Final Service Date'].isna()
-                    )
-                    total_mrr = df_clients_unique.loc[mask_active_mrr, 'MRR'].sum()
+            # Case-insensitive column lookup — master DB may use any casing
+            _ci_col = {c.strip().lower(): c for c in df.columns}
 
-                    mask_churn  = (df_clients_unique['Final Service Date'] >= start_m) & (df_clients_unique['Final Service Date'] <= end_m)
-                    churn_count = mask_churn.sum()
-                    churn_mrr   = df_clients_unique.loc[mask_churn, 'MRR'].sum()
+            def _get_ci(row, col_lower, default=''):
+                actual = _ci_col.get(col_lower)
+                if actual is None:
+                    return default
+                v = row.get(actual, default)
+                return default if (v is None or (isinstance(v, float) and pd.isna(v))) else v
 
-                    # Hours from churning clients (base hours for clients leaving this month)
-                    _churn_names = set(
-                        df_clients_unique.loc[mask_churn, 'client_name']
-                        .astype(str).str.strip().str.lower()
-                    )
-                    _churn_row_mask = (
-                        df_resumen['Client'].astype(str).str.strip().str.lower().isin(_churn_names)
-                    ) if _churn_names else pd.Series(False, index=df_resumen.index)
-                    # Use c_final so AI-predicted churning clients (c_base=0) are counted correctly
-                    churn_hrs_val = (
-                        df_resumen.loc[_churn_row_mask, c_final].sum()
-                        if c_final in df_resumen.columns and _churn_names else 0.0
-                    )
-                    churn_prod_hrs_val = (
-                        df_resumen.loc[_churn_row_mask, c_post].sum()
-                        if c_post in df_resumen.columns and _churn_names else 0.0
-                    )
+            for _idx, _row in df.iterrows():
+                _cli   = str(_row.get('client_name', 'Unknown')).strip()
+                _pod_r = _row.get('POD', '')
+                _pod   = str(_pod_r if pd.notna(_pod_r) else '').strip()
+                if _pod.lower() in ('nan', 'none', ''): _pod = 'No POD'
+                _sr    = str(_row.get('Sr. Accountant', '')).strip()
+                _mrr   = float(_row.get('MRR', 0) or 0)
+                _gl    = _row['Go Live']
+                _fsd   = _row['Final Service Date']
 
-                    # Per-POD churn hours for the Capacity Overview POD tabs
-                    _pod_churn_mes      = {}
-                    _pod_churn_prod_mes = {}
-                    if _churn_names and 'POD' in df_resumen.columns:
-                        for _pn in df_resumen['POD'].dropna().astype(str).unique():
-                            _pmask = _churn_row_mask & (df_resumen['POD'].astype(str) == _pn)
-                            _pod_churn_mes[_pn]      = float(df_resumen.loc[_pmask, c_final].sum()) if c_final in df_resumen.columns else 0.0
-                            _pod_churn_prod_mes[_pn] = float(df_resumen.loc[_pmask, c_post].sum())  if c_post  in df_resumen.columns else 0.0
-                    _pod_churn_store[mes_str]      = _pod_churn_mes
-                    _pod_churn_prod_store[mes_str] = _pod_churn_prod_mes
+                if _s3_use_real_cas:
+                    _ip = str(_row.get('Proc Role', 'Accountant I')).strip()
+                    _ir = str(_row.get('Rev Role',  'Sr. Accountant')).strip()
+                    if _ip in ['nan','None','']: _ip = 'Accountant I'
+                    if _ir in ['nan','None','']: _ir = 'Sr. Accountant'
+                else:
+                    _ip = str(_row.get('Ideal Proc', _row.get('Proc Role', 'Accountant I'))).strip()
+                    _ir = str(_row.get('Ideal Rev',  _row.get('Rev Role',  'Sr. Accountant'))).strip()
+                    if _ip in ['nan','None','']: _ip = str(_row.get('Proc Role','Accountant I')).strip()
+                    if _ir in ['nan','None','']: _ir = str(_row.get('Rev Role','Sr. Accountant')).strip()
 
-                    mask_new     = (df_clients_unique['Go Live'] >= start_m) & (df_clients_unique['Go Live'] <= end_m)
-                    new_count    = mask_new.sum()
-                    new_mrr      = df_clients_unique.loc[mask_new, 'MRR'].sum()
+                _ptix = float(_row.get('Closed tickets with Proc time', 0) or 0)
+                _rtix = float(_row.get('Closed tickets with rev time',  0) or 0)
+                _paht = float(_row.get('>>> FINAL Capacity Proc AHT', 0) or 0)
+                _raht = float(_row.get('>>> FINAL Capacity Rev AHT',  0) or 0)
 
-                    # Hours from new clients going live this month
-                    # Use c_final (not c_base) so AI-predicted clients are included.
-                    # AI clients only exist in df_resumen_auto → c_base = 0 after outer merge,
-                    # but c_final = c_post + adjustments is correctly non-zero.
-                    _new_names = set(
-                        df_clients_unique.loc[mask_new, 'client_name']
-                        .astype(str).str.strip().str.lower()
-                    )
-                    _new_row_mask = (
-                        df_resumen['Client'].astype(str).str.strip().str.lower().isin(_new_names)
-                    ) if _new_names else pd.Series(False, index=df_resumen.index)
-                    new_hrs_val = float(
-                        df_resumen.loc[_new_row_mask, c_final].sum()
+                _as = _m1_start if pd.isna(_gl) else max(_m1_start, _gl)
+                _ae = _m1_end   if pd.isna(_fsd) else min(_m1_end, _fsd)
+                if _as <= _ae:
+                    _da = np.busday_count(_as.strftime('%Y-%m-%d'), (_ae + pd.Timedelta(days=1)).strftime('%Y-%m-%d'))
+                    _apct = max(0.0, min(1.0, _da / _wdays_m1)) if _wdays_m1 > 0 else 0.0
+                else:
+                    _apct = 0.0
+
+                _lc = 1.0
+                if pd.notna(_gl) and _apct > 0:
+                    _md = (_m1_start.year - _gl.year) * 12 + (_m1_start.month - _gl.month)
+                    if   _md == 0: _lc = 1.17
+                    elif _md == 1: _lc = 0.86
+                    elif _md == 2: _lc = 0.99
+
+                _bp = (_ptix * _apct * _paht * _lc) / 60
+                _br = (_rtix * _apct * _raht * _lc) / 60
+                _up = utilization_map.get(_ip, util_acc1)
+                _ur = utilization_map.get(_ir, util_sr)
+                _tp = _bp + (_bp * (1 - _up)) + (_bp * absenteeism) + (_bp * attrition)
+                _tr = _br + (_br * (1 - _ur)) + (_br * absenteeism) + (_br * attrition)
+
+                # Resolve processor / reviewer names and emails.
+                # The Master DB 'processor' / 'reviewer' columns may contain either:
+                #   (a) an email address directly  → maria.tamayo@proper.ai
+                #   (b) a full name                → Maria Tamayo
+                # Detect by presence of '@' and handle both cases.
+                _proc_raw  = str(_get_ci(_row, 'processor')).strip()
+                _rev_raw   = str(_get_ci(_row, 'reviewer')).strip()
+                if _proc_raw.lower() in ('nan', 'none'): _proc_raw = ''
+                if _rev_raw.lower()  in ('nan', 'none'): _rev_raw  = ''
+
+                if '@' in _proc_raw:                      # field already is an email
+                    _proc_email = _proc_raw.lower()
+                    _proc_name  = _e2name.get(_proc_email, _proc_raw)
+                else:                                     # field is a name
+                    _proc_name  = _proc_raw
+                    _proc_email = str(_get_ci(_row, 'processor email')).strip()
+                    if not _proc_email or _proc_email.lower() in ('nan', 'none'):
+                        _proc_email = _n2email.get(_proc_name.lower(), '')
+
+                if '@' in _rev_raw:
+                    _rev_email = _rev_raw.lower()
+                    _rev_name  = _e2name.get(_rev_email, _rev_raw)
+                else:
+                    _rev_name  = _rev_raw
+                    _rev_email = str(_get_ci(_row, 'reviewer email')).strip()
+                    if not _rev_email or _rev_email.lower() in ('nan', 'none'):
+                        _rev_email = _n2email.get(_rev_name.lower(), '')
+
+                _audit_rows.append({
+                    'POD':                          _pod,
+                    'Sr. Accountant':               _sr,
+                    'Client':                       _cli,
+                    'Process':                      str(_row.get('type',    '')).strip(),
+                    'Sub-process':                  str(_row.get('subtype', '')).strip(),
+                    'Processor':                    _proc_name,
+                    'Processor Email':              _proc_email,
+                    'Processor Role':               _ip,
+                    'Reviewer':                     _rev_name,
+                    'Reviewer Email':               _rev_email,
+                    'Reviewer Role':                _ir,
+                    'Closed Tix (Proc)':            round(_ptix, 0),
+                    'AHT Proc (min)':               round(_paht, 2),
+                    'Closed Tix (Rev)':             round(_rtix, 0),
+                    'AHT Rev (min)':                round(_raht, 2),
+                    'MRR ($)':                      round(_mrr, 2),
+                    'Res Doors':                    _row.get('Res doors', ''),
+                    'Res Prop':                     _row.get('Res Prop', ''),
+                    'Comm Doors':                   _row.get('Commercial Doors', ''),
+                    'Comm Properties':              _row.get('Commercial Properties', ''),
+                    'SQFT':                         _row.get('SQFT Commercial', ''),
+                    'Corp Books':                   _row.get('Corp Books', ''),
+                    'PMS':                          str(_row.get('PMS', '')).strip(),
+                    'Go Live':                      str(_gl)[:10] if pd.notna(_gl) else '',
+                    'Final Service Date':           str(_fsd)[:10] if pd.notna(_fsd) else '',
+                    'Active % (M1)':                round(_apct * 100, 1),
+                    'Learning Curve (M1)':          round(_lc, 2),
+                    'Prod Hrs Proc (M1)':           round(_bp, 2),
+                    'Prod Hrs Rev (M1)':            round(_br, 2),
+                    'Total Hrs Proc w/ Shrinkage':  round(_tp, 2),
+                    'Total Hrs Rev w/ Shrinkage':   round(_tr, 2),
+                    'Total Hrs (M1)':               round(_tp + _tr, 2),
+                    'FTEs (M1)':                    round((_tp + _tr) / _hrs_fte_m1, 4) if _hrs_fte_m1 > 0 else 0,
+                    'Util Rate Proc':               round(_up * 100, 1),
+                    'Util Rate Rev':                round(_ur * 100, 1),
+                    'Absenteeism Rate':             round(absenteeism * 100, 1),
+                    'Attrition Rate':               round(attrition * 100, 1),
+                    'Working Days (M1)':            _wdays_m1,
+                })
+
+            df_baseline_audit = pd.DataFrame(_audit_rows)
+
+            _loading_overlay(_s3_ov, "Step 3 · Generating Dashboards", "🔄", 3, 5, "Building dashboards…")
+            # 6. SUMMARY BY POD
+            todas_cols     = [c for c in df_resumen.columns if "M" in c]
+            df_pod_roles   = df_resumen.groupby(['POD', 'Required Role'])[todas_cols].sum().reset_index()
+            df_pod_totales = df_resumen.groupby(['POD'])[todas_cols].sum().reset_index()
+            df_pod_totales['Required Role'] = '>>> POD TOTAL'
+            df_pod_final   = (
+                pd.concat([df_pod_roles, df_pod_totales], ignore_index=True)
+                .sort_values(by=['POD', 'Required Role'])
+                .reset_index(drop=True)
+            )
+
+            # 7. EXECUTIVE GENERAL DASHBOARD
+            resumen_ejecutivo        = []
+            _pod_churn_store         = {}   # {mes_str: {pod_name: churn_hrs (required)}}
+            _pod_churn_prod_store    = {}   # {mes_str: {pod_name: churn_hrs (productive)}}
+            _pod_new_hrs_store       = {}   # {mes_str: {pod_name: new_client_hrs (required)}}
+            _pod_new_prod_hrs_store  = {}   # {mes_str: {pod_name: new_client_hrs (productive)}}
+            _pod_new_mrr_store       = {}   # {mes_str: {pod_name: new_mrr}}
+            _pod_churn_mrr_store     = {}   # {mes_str: {pod_name: churn_mrr}}
+
+            # Build client→POD mapping once (for per-POD MRR look-ups)
+            _cli_pod_map = {}
+            if 'Client' in df_resumen.columns and 'POD' in df_resumen.columns:
+                _tmp_cpod = df_resumen.dropna(subset=['Client']).groupby('Client')['POD'].first()
+                _cli_pod_map = {str(k).strip().lower(): str(v) for k, v in _tmp_cpod.items()}
+
+            for i, mes_str in enumerate(meses_proyeccion):
+                c_base      = f"M{i+1} ({mes_str}) - Base Hours"
+                c_prod      = f"M{i+1} ({mes_str}) - Productive Hours"
+                c_post      = f"M{i+1} ({mes_str}) - Post-Auto Hours"
+                c_save_hrs  = f"M{i+1} ({mes_str}) - Auto Saving (Hrs)"
+                c_save_usd  = f"M{i+1} ({mes_str}) - Auto Saving ($)"
+                c_plus      = f"M{i+1} ({mes_str}) - Adjustments (+) Hrs"
+                c_minus     = f"M{i+1} ({mes_str}) - Adjustments (-) Hrs"
+                c_final     = f"M{i+1} ({mes_str}) - Final Hours"
+                c_fte       = f"M{i+1} ({mes_str}) - Final FTEs"
+
+                tot_base      = df_resumen[c_base].sum()     if c_base     in df_resumen.columns else 0
+                tot_save_hrs  = df_resumen[c_save_hrs].sum() if c_save_hrs in df_resumen.columns else 0
+                tot_save_usd  = df_resumen[c_save_usd].sum() if c_save_usd in df_resumen.columns else 0
+                tot_plus      = df_resumen[c_plus].sum()     if c_plus     in df_resumen.columns else 0
+                tot_minus     = df_resumen[c_minus].sum()    if c_minus    in df_resumen.columns else 0
+                tot_final     = df_resumen[c_final].sum()    if c_final    in df_resumen.columns else 0
+                tot_fte       = df_resumen[c_fte].sum()      if c_fte      in df_resumen.columns else 0
+
+                fte_acc1 = df_resumen[df_resumen['Required Role'] == 'Accountant I'][c_fte].sum()
+                fte_acc2 = df_resumen[df_resumen['Required Role'] == 'Accountant II'][c_fte].sum()
+                fte_gen  = df_resumen[df_resumen['Required Role'] == 'General Accountant'][c_fte].sum()
+                fte_sr   = df_resumen[df_resumen['Required Role'] == 'Sr. Accountant'][c_fte].sum()
+
+                mes_date = today + relativedelta(months=_month_offsets[i])
+                start_m  = pd.Timestamp(mes_date.replace(day=1).date())
+                end_m    = pd.Timestamp((start_m + relativedelta(months=1) - relativedelta(days=1)).date())
+
+                mask_active_mrr = (
+                    (df_clients_unique['Go Live'] <= end_m)   | df_clients_unique['Go Live'].isna()
+                ) & (
+                    (df_clients_unique['Final Service Date'] >= start_m) | df_clients_unique['Final Service Date'].isna()
+                )
+                total_mrr = df_clients_unique.loc[mask_active_mrr, 'MRR'].sum()
+
+                mask_churn  = (df_clients_unique['Final Service Date'] >= start_m) & (df_clients_unique['Final Service Date'] <= end_m)
+                churn_count = mask_churn.sum()
+                churn_mrr   = df_clients_unique.loc[mask_churn, 'MRR'].sum()
+
+                # Hours from churning clients (base hours for clients leaving this month)
+                _churn_names = set(
+                    df_clients_unique.loc[mask_churn, 'client_name']
+                    .astype(str).str.strip().str.lower()
+                )
+                _churn_row_mask = (
+                    df_resumen['Client'].astype(str).str.strip().str.lower().isin(_churn_names)
+                ) if _churn_names else pd.Series(False, index=df_resumen.index)
+                # Use c_final so AI-predicted churning clients (c_base=0) are counted correctly
+                churn_hrs_val = (
+                    df_resumen.loc[_churn_row_mask, c_final].sum()
+                    if c_final in df_resumen.columns and _churn_names else 0.0
+                )
+                churn_prod_hrs_val = (
+                    df_resumen.loc[_churn_row_mask, c_post].sum()
+                    if c_post in df_resumen.columns and _churn_names else 0.0
+                )
+
+                # Per-POD churn hours for the Capacity Overview POD tabs
+                _pod_churn_mes      = {}
+                _pod_churn_prod_mes = {}
+                if _churn_names and 'POD' in df_resumen.columns:
+                    for _pn in df_resumen['POD'].dropna().astype(str).unique():
+                        _pmask = _churn_row_mask & (df_resumen['POD'].astype(str) == _pn)
+                        _pod_churn_mes[_pn]      = float(df_resumen.loc[_pmask, c_final].sum()) if c_final in df_resumen.columns else 0.0
+                        _pod_churn_prod_mes[_pn] = float(df_resumen.loc[_pmask, c_post].sum())  if c_post  in df_resumen.columns else 0.0
+                _pod_churn_store[mes_str]      = _pod_churn_mes
+                _pod_churn_prod_store[mes_str] = _pod_churn_prod_mes
+
+                mask_new     = (df_clients_unique['Go Live'] >= start_m) & (df_clients_unique['Go Live'] <= end_m)
+                new_count    = mask_new.sum()
+                new_mrr      = df_clients_unique.loc[mask_new, 'MRR'].sum()
+
+                # Hours from new clients going live this month
+                # Use c_final (not c_base) so AI-predicted clients are included.
+                # AI clients only exist in df_resumen_auto → c_base = 0 after outer merge,
+                # but c_final = c_post + adjustments is correctly non-zero.
+                _new_names = set(
+                    df_clients_unique.loc[mask_new, 'client_name']
+                    .astype(str).str.strip().str.lower()
+                )
+                _new_row_mask = (
+                    df_resumen['Client'].astype(str).str.strip().str.lower().isin(_new_names)
+                ) if _new_names else pd.Series(False, index=df_resumen.index)
+                new_hrs_val = float(
+                    df_resumen.loc[_new_row_mask, c_final].sum()
+                ) if c_final in df_resumen.columns else 0.0
+                new_prod_hrs_val = float(
+                    df_resumen.loc[_new_row_mask, c_post].sum()
+                ) if c_post in df_resumen.columns else 0.0
+
+                # Per-POD new hours, new MRR, churn MRR
+                _all_pods = (df_resumen['POD'].dropna().astype(str).unique().tolist()
+                             if 'POD' in df_resumen.columns else [])
+                _pod_new_mes, _pod_new_prod_mes, _pod_new_mrr_mes, _pod_churn_mrr_mes = {}, {}, {}, {}
+                for _pn in _all_pods:
+                    _pod_mask = df_resumen['POD'].astype(str) == _pn
+                    _pod_new_mes[_pn] = float(
+                        df_resumen.loc[_new_row_mask & _pod_mask, c_final].sum()
                     ) if c_final in df_resumen.columns else 0.0
-                    new_prod_hrs_val = float(
-                        df_resumen.loc[_new_row_mask, c_post].sum()
+                    _pod_new_prod_mes[_pn] = float(
+                        df_resumen.loc[_new_row_mask & _pod_mask, c_post].sum()
                     ) if c_post in df_resumen.columns else 0.0
+                    _pn_new_cli   = {k for k, v in _cli_pod_map.items() if v == _pn} & _new_names
+                    _pn_churn_cli = {k for k, v in _cli_pod_map.items() if v == _pn} & _churn_names
+                    _pod_new_mrr_mes[_pn] = float(
+                        df_clients_unique.loc[
+                            mask_new & df_clients_unique['client_name']
+                            .astype(str).str.strip().str.lower().isin(_pn_new_cli), 'MRR'
+                        ].sum()
+                    )
+                    _pod_churn_mrr_mes[_pn] = float(
+                        df_clients_unique.loc[
+                            mask_churn & df_clients_unique['client_name']
+                            .astype(str).str.strip().str.lower().isin(_pn_churn_cli), 'MRR'
+                        ].sum()
+                    )
+                _pod_new_hrs_store[mes_str]      = _pod_new_mes
+                _pod_new_prod_hrs_store[mes_str] = _pod_new_prod_mes
+                _pod_new_mrr_store[mes_str]      = _pod_new_mrr_mes
+                _pod_churn_mrr_store[mes_str]    = _pod_churn_mrr_mes
 
-                    # Per-POD new hours, new MRR, churn MRR
-                    _all_pods = (df_resumen['POD'].dropna().astype(str).unique().tolist()
-                                 if 'POD' in df_resumen.columns else [])
-                    _pod_new_mes, _pod_new_prod_mes, _pod_new_mrr_mes, _pod_churn_mrr_mes = {}, {}, {}, {}
-                    for _pn in _all_pods:
-                        _pod_mask = df_resumen['POD'].astype(str) == _pn
-                        _pod_new_mes[_pn] = float(
-                            df_resumen.loc[_new_row_mask & _pod_mask, c_final].sum()
-                        ) if c_final in df_resumen.columns else 0.0
-                        _pod_new_prod_mes[_pn] = float(
-                            df_resumen.loc[_new_row_mask & _pod_mask, c_post].sum()
-                        ) if c_post in df_resumen.columns else 0.0
-                        _pn_new_cli   = {k for k, v in _cli_pod_map.items() if v == _pn} & _new_names
-                        _pn_churn_cli = {k for k, v in _cli_pod_map.items() if v == _pn} & _churn_names
-                        _pod_new_mrr_mes[_pn] = float(
-                            df_clients_unique.loc[
-                                mask_new & df_clients_unique['client_name']
-                                .astype(str).str.strip().str.lower().isin(_pn_new_cli), 'MRR'
-                            ].sum()
+                prod_hrs        = monthly_prod_hrs[i]
+                u_hrs, a_hrs, att_hrs = monthly_util_hrs[i], monthly_abs_hrs[i], monthly_att_hrs[i]
+                shrinkage_total = u_hrs + a_hrs + att_hrs
+
+                resumen_ejecutivo.append({
+                    "Projected Month":                   mes_str,
+                    "Total MRR ($)":                     round(total_mrr, 2),
+                    "Working Days (Used)":               dict_workable_days[i],
+                    "1. Productive Hours (Pure Base)":   round(prod_hrs, 2),
+                    "2. Total Shrinkage (Hrs)":          round(shrinkage_total, 2),
+                    "3. Total Hours (Pre-Auto)":         round(tot_base, 2),
+                    "4. Automation Saving (Hrs)":        round(tot_save_hrs, 2),
+                    "4.1 Cost Saving ($)":               round(tot_save_usd, 2),
+                    "5. Manual Adjustments (+) Hrs":     round(tot_plus, 2),
+                    "6. Manual Adjustments (-) Hrs":     round(tot_minus, 2),
+                    "7. Total Required Hours (Final)":   round(tot_final, 2),
+                    "Total FTEs":                        round(tot_fte, 2),
+                    "FTEs Accountant I":                 round(fte_acc1, 2),
+                    "FTEs Accountant II":                round(fte_acc2, 2),
+                    "FTEs General Acc.":                 round(fte_gen, 2),
+                    "FTEs Sr. Accountant":               round(fte_sr, 2),
+                    "New MRR ($)":                       round(new_mrr, 2),
+                    "New Clients (Go Live)":             new_count,
+                    "New Clients Hours":                 round(new_hrs_val, 2),
+                    "New Clients Prod Hours":            round(new_prod_hrs_val, 2),
+                    "Lost MRR (Churn) ($)":              round(churn_mrr, 2),
+                    "Clients Ending (#)":                churn_count,
+                    "Confirmed Churn (Hrs)":             round(churn_hrs_val, 2),
+                    "Confirmed Churn Prod Hrs":          round(churn_prod_hrs_val, 2),
+                })
+
+            df_resumen_general = pd.DataFrame(resumen_ejecutivo)
+
+            st.session_state.final_dashboards = {
+                'general':    df_resumen_general,
+                'pod':        df_pod_final,
+                'cliente':    df_resumen,
+                'baseline':   df_baseline_audit,
+                'pod_churn':          _pod_churn_store,         # {mes_str: {pod_name: churn_hrs (required)}}
+                'pod_churn_prod':     _pod_churn_prod_store,    # {mes_str: {pod_name: churn_hrs (productive)}}
+                'pod_new_hrs':        _pod_new_hrs_store,       # {mes_str: {pod_name: new_client_hrs (required)}}
+                'pod_new_prod_hrs':   _pod_new_prod_hrs_store,  # {mes_str: {pod_name: new_client_hrs (productive)}}
+                'pod_new_mrr':        _pod_new_mrr_store,       # {mes_str: {pod_name: new_mrr}}
+                'pod_churn_mrr': _pod_churn_mrr_store, # {mes_str: {pod_name: churn_mrr}}
+            }
+            # ── Tag the role mode used for this cascade run ───────────────────────
+            _mode_tag = 'real' if _s3_use_real_cas else 'ideal'
+            st.session_state['_cascade_role_mode'] = _mode_tag
+            st.session_state[f'final_dashboards_{_mode_tag}'] = st.session_state.final_dashboards
+
+            # ── Build Client MRR per month table ──────────────────────────────────
+            _duc_mrr = st.session_state.get('df_clients_unique', pd.DataFrame()).copy()
+            if not _duc_mrr.empty and 'client_name' in _duc_mrr.columns:
+                # Join POD from df_resumen (POD→Client map, deduplicated).
+                # Drop any existing POD column first to avoid pandas creating
+                # POD_x / POD_y conflicts that make _crow.get('POD') return ''.
+                if 'POD' in df_resumen.columns and 'Client' in df_resumen.columns:
+                    _duc_mrr = _duc_mrr.drop(columns=[c for c in ['POD'] if c in _duc_mrr.columns])
+                    _cli_pod_map_mrr = (
+                        df_resumen[['POD', 'Client']].drop_duplicates()
+                        .rename(columns={'Client': 'client_name'})
+                    )
+                    _duc_mrr = _duc_mrr.merge(_cli_pod_map_mrr, on='client_name', how='left')
+                _cli_mrr_rows = []
+                for _, _crow in _duc_mrr.iterrows():
+                    _cm_name = str(_crow.get('client_name', '')).strip()
+                    _cm_mrr  = float(_crow.get('MRR', 0) or 0)
+                    _cm_gl   = pd.to_datetime(_crow.get('Go Live'), errors='coerce')
+                    _cm_fsd  = pd.to_datetime(_crow.get('Final Service Date'), errors='coerce')
+                    _cm_pod  = str(_crow.get('POD', '')).strip()
+                    _mrr_row = {'Client': _cm_name, 'POD': _cm_pod, 'MRR (Base)': _cm_mrr}
+                    for _moi, _msi in enumerate(meses_proyeccion):
+                        _mdi  = today + relativedelta(months=_month_offsets[_moi])
+                        _smi  = pd.Timestamp(_mdi.replace(day=1).date())
+                        _emi  = pd.Timestamp((_smi + relativedelta(months=1) - relativedelta(days=1)).date())
+                        _active = (
+                            (pd.isna(_cm_gl)  or _cm_gl  <= _emi) and
+                            (pd.isna(_cm_fsd) or _cm_fsd >= _smi)
                         )
-                        _pod_churn_mrr_mes[_pn] = float(
-                            df_clients_unique.loc[
-                                mask_churn & df_clients_unique['client_name']
-                                .astype(str).str.strip().str.lower().isin(_pn_churn_cli), 'MRR'
-                            ].sum()
-                        )
-                    _pod_new_hrs_store[mes_str]      = _pod_new_mes
-                    _pod_new_prod_hrs_store[mes_str] = _pod_new_prod_mes
-                    _pod_new_mrr_store[mes_str]      = _pod_new_mrr_mes
-                    _pod_churn_mrr_store[mes_str]    = _pod_churn_mrr_mes
+                        _mrr_row[_msi] = round(_cm_mrr, 2) if _active else 0.0
+                    _cli_mrr_rows.append(_mrr_row)
+                df_client_mrr = pd.DataFrame(_cli_mrr_rows)
+                _cmrr_sort = [c for c in ['POD', 'Client'] if c in df_client_mrr.columns]
+                df_client_mrr = df_client_mrr.sort_values(_cmrr_sort).reset_index(drop=True)
+            else:
+                df_client_mrr = pd.DataFrame()
+            st.session_state.final_dashboards['client_mrr'] = df_client_mrr
 
-                    prod_hrs        = monthly_prod_hrs[i]
-                    u_hrs, a_hrs, att_hrs = monthly_util_hrs[i], monthly_abs_hrs[i], monthly_att_hrs[i]
-                    shrinkage_total = u_hrs + a_hrs + att_hrs
+            # ── Save filter context for view-level rendering ──────────────────────
+            # Always read from session state so this works even in pipeline flow
+            # where the uploaded-file block (and its local variables) never ran.
+            _cas_pods    = st.session_state.get('_filt_pods',    selected_pods)
+            _cas_srs     = st.session_state.get('_filt_srs',     selected_srs)
+            _cas_clients = st.session_state.get('_filt_clients', selected_clients_final)
 
-                    resumen_ejecutivo.append({
-                        "Projected Month":                   mes_str,
-                        "Total MRR ($)":                     round(total_mrr, 2),
-                        "Working Days (Used)":               dict_workable_days[i],
-                        "1. Productive Hours (Pure Base)":   round(prod_hrs, 2),
-                        "2. Total Shrinkage (Hrs)":          round(shrinkage_total, 2),
-                        "3. Total Hours (Pre-Auto)":         round(tot_base, 2),
-                        "4. Automation Saving (Hrs)":        round(tot_save_hrs, 2),
-                        "4.1 Cost Saving ($)":               round(tot_save_usd, 2),
-                        "5. Manual Adjustments (+) Hrs":     round(tot_plus, 2),
-                        "6. Manual Adjustments (-) Hrs":     round(tot_minus, 2),
-                        "7. Total Required Hours (Final)":   round(tot_final, 2),
-                        "Total FTEs":                        round(tot_fte, 2),
-                        "FTEs Accountant I":                 round(fte_acc1, 2),
-                        "FTEs Accountant II":                round(fte_acc2, 2),
-                        "FTEs General Acc.":                 round(fte_gen, 2),
-                        "FTEs Sr. Accountant":               round(fte_sr, 2),
-                        "New MRR ($)":                       round(new_mrr, 2),
-                        "New Clients (Go Live)":             new_count,
-                        "New Clients Hours":                 round(new_hrs_val, 2),
-                        "New Clients Prod Hours":            round(new_prod_hrs_val, 2),
-                        "Lost MRR (Churn) ($)":              round(churn_mrr, 2),
-                        "Clients Ending (#)":                churn_count,
-                        "Confirmed Churn (Hrs)":             round(churn_hrs_val, 2),
-                        "Confirmed Churn Prod Hrs":          round(churn_prod_hrs_val, 2),
-                    })
+            st.session_state['_dash_sel_pods']    = list(_cas_pods)
+            st.session_state['_dash_sel_srs']     = list(_cas_srs)
+            st.session_state['_dash_sel_clients'] = list(_cas_clients)
 
-                df_resumen_general = pd.DataFrame(resumen_ejecutivo)
+            # Compute dashboard view level from applied filters
+            _n_sc = len(_cas_clients)
+            # Sr. filter takes priority — client list auto-populates from Sr. selection
+            if _cas_srs and not _cas_pods:
+                _dlvl = 'sr'
+            elif len(_cas_pods) == 1 and not _cas_srs:
+                _dlvl = 'pod'
+            elif len(_cas_pods) > 1 and not _cas_srs:
+                _dlvl = 'multi_pod'
+            elif _n_sc == 1 and not _cas_srs and not _cas_pods:
+                _dlvl = 'client'
+            elif _n_sc > 1 and not _cas_srs and not _cas_pods:
+                _aff_pods = df[df['client_name'].isin(_cas_clients)]['POD'].dropna().unique().tolist() if 'POD' in df.columns else []
+                _dlvl = 'multi_pod' if len(_aff_pods) > 1 else ('pod' if len(_aff_pods) == 1 else 'overall')
+            else:
+                _dlvl = 'overall'
+            _loading_overlay(_s3_ov, "Step 3 · Generating Dashboards", "🔄", 4, 5, "Adjusting display sizes…")
+            st.session_state['_dash_level'] = _dlvl
+            # ── Size adjustment: compute optimal heights for key tables ──────────
+            _fd_cli_sz   = st.session_state.get('final_dashboards', {}).get('cliente', pd.DataFrame())
+            _fd_pod_sz   = st.session_state.get('final_dashboards', {}).get('pod',     pd.DataFrame())
+            _fd_sr_sz    = st.session_state.get('final_dashboards', {}).get('pod_sr',  pd.DataFrame())
+            _fd_gral_sz  = st.session_state.get('final_dashboards', {}).get('general', pd.DataFrame())
+            st.session_state['_df_heights'] = {
+                'cliente':  _df_height(len(_fd_cli_sz)),
+                'pod':      _df_height(len(_fd_pod_sz)),
+                'pod_sr':   _df_height(len(_fd_sr_sz)),
+                'general':  _df_height(len(_fd_gral_sz)),
+            }
+            _loading_overlay(_s3_ov, "Step 3 · Generating Dashboards", "🔄", 5, 5, "Done!")
+            st.session_state['_s3_calc_done'] = True
+            # Bump version so waterfall cache knows to rebuild
+            st.session_state['_fd_version'] = st.session_state.get('_fd_version', 0) + 1
+            # Collapse Step 3 after cascade completes so dashboards come into view
+            st.session_state['_s3_exp_open'] = False
 
-                st.session_state.final_dashboards = {
-                    'general':    df_resumen_general,
-                    'pod':        df_pod_final,
-                    'cliente':    df_resumen,
-                    'baseline':   df_baseline_audit,
-                    'pod_churn':          _pod_churn_store,         # {mes_str: {pod_name: churn_hrs (required)}}
-                    'pod_churn_prod':     _pod_churn_prod_store,    # {mes_str: {pod_name: churn_hrs (productive)}}
-                    'pod_new_hrs':        _pod_new_hrs_store,       # {mes_str: {pod_name: new_client_hrs (required)}}
-                    'pod_new_prod_hrs':   _pod_new_prod_hrs_store,  # {mes_str: {pod_name: new_client_hrs (productive)}}
-                    'pod_new_mrr':        _pod_new_mrr_store,       # {mes_str: {pod_name: new_mrr}}
-                    'pod_churn_mrr': _pod_churn_mrr_store, # {mes_str: {pod_name: churn_mrr}}
-                }
-                # ── Tag the role mode used for this cascade run ───────────────────────
-                _mode_tag = 'real' if _s3_use_real_cas else 'ideal'
-                st.session_state['_cascade_role_mode'] = _mode_tag
-                st.session_state[f'final_dashboards_{_mode_tag}'] = st.session_state.final_dashboards
-
-                # ── Build Client MRR per month table ──────────────────────────────────
-                _duc_mrr = st.session_state.get('df_clients_unique', pd.DataFrame()).copy()
-                if not _duc_mrr.empty and 'client_name' in _duc_mrr.columns:
-                    # Join POD from df_resumen (POD→Client map, deduplicated).
-                    # Drop any existing POD column first to avoid pandas creating
-                    # POD_x / POD_y conflicts that make _crow.get('POD') return ''.
-                    if 'POD' in df_resumen.columns and 'Client' in df_resumen.columns:
-                        _duc_mrr = _duc_mrr.drop(columns=[c for c in ['POD'] if c in _duc_mrr.columns])
-                        _cli_pod_map_mrr = (
-                            df_resumen[['POD', 'Client']].drop_duplicates()
-                            .rename(columns={'Client': 'client_name'})
-                        )
-                        _duc_mrr = _duc_mrr.merge(_cli_pod_map_mrr, on='client_name', how='left')
-                    _cli_mrr_rows = []
-                    for _, _crow in _duc_mrr.iterrows():
-                        _cm_name = str(_crow.get('client_name', '')).strip()
-                        _cm_mrr  = float(_crow.get('MRR', 0) or 0)
-                        _cm_gl   = pd.to_datetime(_crow.get('Go Live'), errors='coerce')
-                        _cm_fsd  = pd.to_datetime(_crow.get('Final Service Date'), errors='coerce')
-                        _cm_pod  = str(_crow.get('POD', '')).strip()
-                        _mrr_row = {'Client': _cm_name, 'POD': _cm_pod, 'MRR (Base)': _cm_mrr}
-                        for _moi, _msi in enumerate(meses_proyeccion):
-                            _mdi  = today + relativedelta(months=_month_offsets[_moi])
-                            _smi  = pd.Timestamp(_mdi.replace(day=1).date())
-                            _emi  = pd.Timestamp((_smi + relativedelta(months=1) - relativedelta(days=1)).date())
-                            _active = (
-                                (pd.isna(_cm_gl)  or _cm_gl  <= _emi) and
-                                (pd.isna(_cm_fsd) or _cm_fsd >= _smi)
-                            )
-                            _mrr_row[_msi] = round(_cm_mrr, 2) if _active else 0.0
-                        _cli_mrr_rows.append(_mrr_row)
-                    df_client_mrr = pd.DataFrame(_cli_mrr_rows)
-                    _cmrr_sort = [c for c in ['POD', 'Client'] if c in df_client_mrr.columns]
-                    df_client_mrr = df_client_mrr.sort_values(_cmrr_sort).reset_index(drop=True)
-                else:
-                    df_client_mrr = pd.DataFrame()
-                st.session_state.final_dashboards['client_mrr'] = df_client_mrr
-
-                # ── Save filter context for view-level rendering ──────────────────────
-                # Always read from session state so this works even in pipeline flow
-                # where the uploaded-file block (and its local variables) never ran.
-                _cas_pods    = st.session_state.get('_filt_pods',    selected_pods)
-                _cas_srs     = st.session_state.get('_filt_srs',     selected_srs)
-                _cas_clients = st.session_state.get('_filt_clients', selected_clients_final)
-
-                st.session_state['_dash_sel_pods']    = list(_cas_pods)
-                st.session_state['_dash_sel_srs']     = list(_cas_srs)
-                st.session_state['_dash_sel_clients'] = list(_cas_clients)
-
-                # Compute dashboard view level from applied filters
-                _n_sc = len(_cas_clients)
-                # Sr. filter takes priority — client list auto-populates from Sr. selection
-                if _cas_srs and not _cas_pods:
-                    _dlvl = 'sr'
-                elif len(_cas_pods) == 1 and not _cas_srs:
-                    _dlvl = 'pod'
-                elif len(_cas_pods) > 1 and not _cas_srs:
-                    _dlvl = 'multi_pod'
-                elif _n_sc == 1 and not _cas_srs and not _cas_pods:
-                    _dlvl = 'client'
-                elif _n_sc > 1 and not _cas_srs and not _cas_pods:
-                    _aff_pods = df[df['client_name'].isin(_cas_clients)]['POD'].dropna().unique().tolist() if 'POD' in df.columns else []
-                    _dlvl = 'multi_pod' if len(_aff_pods) > 1 else ('pod' if len(_aff_pods) == 1 else 'overall')
-                else:
-                    _dlvl = 'overall'
-                st.session_state['_dash_level'] = _dlvl
-                # Bump version so waterfall cache knows to rebuild
-                st.session_state['_fd_version'] = st.session_state.get('_fd_version', 0) + 1
-                # Collapse Step 3 after cascade completes so dashboards come into view
-                st.session_state['_s3_exp_open'] = False
+        # ── Post-calculation: show Continue button when Step 3 just finished ──────
+        if st.session_state.pop('_s3_calc_done', False):
+            _s3_ov.empty()
+            _inject_scroll_reset()
 
     # ==========================================
     # RENDER DASHBOARDS IF AVAILABLE
