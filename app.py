@@ -8321,6 +8321,8 @@ if "calc_data" in st.session_state:
                         .sort_values(['POD', 'Sr. Accountant'])
                         .reset_index(drop=True)
                     )
+                    # Persist so download buttons can include it
+                    st.session_state['_s3_sr_ratios_df'] = _sr_df.copy()
                     _mode_lbl = "Real Roles" if _s3_real else "Ideal Pairs"
                     st.caption(f"Role mode: **{_mode_lbl}** (follows Step 3 selection)")
                     st.dataframe(
@@ -9991,6 +9993,10 @@ if (
                 _df_resbase_s4 = st.session_state.get('calc_data', {}).get('df_resumen_base', pd.DataFrame())
                 if not _df_resbase_s4.empty:
                     _df_resbase_s4.to_excel(_xw, sheet_name='Base_Hours_by_Role', index=False)
+                # Sr. Ratios
+                _sr_rat_dl = st.session_state.get('_s3_sr_ratios_df', pd.DataFrame())
+                if not _sr_rat_dl.empty:
+                    _sr_rat_dl.to_excel(_xw, sheet_name='Sr_Ratios', index=False)
                 # Scenario inputs
                 st.session_state.s4v2_hc_adj_df.to_excel(_xw, sheet_name='HC_Adjustments', index=False)
                 st.session_state.s4v2_mrr_adj_df.to_excel(_xw, sheet_name='MRR_Adjustments', index=False)
@@ -10044,6 +10050,10 @@ if (
                 _el_df_all = st.session_state.get('_s3_emp_level_df', pd.DataFrame())
                 if not _el_df_all.empty:
                     _el_df_all.to_excel(_xw_all, sheet_name='3_Employee_Level', index=False)
+                # Tab: Sr. Ratios
+                _sr_rat_all = st.session_state.get('_s3_sr_ratios_df', pd.DataFrame())
+                if not _sr_rat_all.empty:
+                    _sr_rat_all.to_excel(_xw_all, sheet_name='3_Sr_Ratios', index=False)
                 # ── Step 2 inputs ─────────────────────────────────────────────
                 if not st.session_state.automations_df.empty:
                     st.session_state.automations_df.to_excel(_xw_all, sheet_name='2_Automations', index=False)
