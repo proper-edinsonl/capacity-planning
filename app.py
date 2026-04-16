@@ -8214,6 +8214,45 @@ if "calc_data" in st.session_state:
                             float(_proc_map.get(_em, 0.0)) + float(_rev_map.get(_em, 0.0))
                         )
 
+                # ── Pre-compute MEC & Other review hrs from df_clean ─────────
+                # Logic: rows where Sr. Accountant email (col AD) matches the Sr.
+                #        AND Ideal Proc OR Ideal Rev == 'Sr. Accountant'
+                #        Grouped by type (col B: 'MEC' vs 'Other')
+                #        Sum of Capacity reviewing hours (col M)
+                _mec_rev_by_email   = {}   # type == 'MEC'  → {sr_email: hrs}
+                _other_rev_by_email = {}   # type == 'Other'→ {sr_email: hrs}
+                if not _df_c.empty:
+                    _ip_col  = 'Ideal Proc'
+                    _ir_col  = 'Ideal Rev'
+                    _rev_col = 'Capacity reviewing hours'
+                    _type_col = 'type'
+                    _sr_col_dc = 'Sr. Accountant'
+                    _has_cols = all(c in _df_c.columns for c in [_ip_col, _ir_col, _rev_col, _type_col, _sr_col_dc])
+                    if _has_cols:
+                        _dc_ip   = _df_c[_ip_col].astype(str).str.strip()
+                        _dc_ir   = _df_c[_ir_col].astype(str).str.strip()
+                        _sr_mask_dc = (_dc_ip == 'Sr. Accountant') | (_dc_ir == 'Sr. Accountant')
+                        _df_sr_rows = _df_c[_sr_mask_dc].copy()
+                        _df_sr_rows['_sr_key']  = _df_sr_rows[_sr_col_dc].astype(str).str.lower().str.strip()
+                        _df_sr_rows['_type_key'] = _df_sr_rows[_type_col].astype(str).str.strip().str.upper()
+                        _df_sr_rows['_rev_h']   = pd.to_numeric(_df_sr_rows[_rev_col], errors='coerce').fillna(0.0)
+                        # MEC rows
+                        _mec_rev_by_email = (
+                            _df_sr_rows[_df_sr_rows['_type_key'] == 'MEC']
+                            .groupby('_sr_key')['_rev_h'].sum().to_dict()
+                        )
+                        # Other rows
+                        _other_rev_by_email = (
+                            _df_sr_rows[_df_sr_rows['_type_key'] == 'OTHER']
+                            .groupby('_sr_key')['_rev_h'].sum().to_dict()
+                        )
+
+                # ── Status helper (defined once, used for both status columns) ──
+                def _sr_status(pct):
+                    if pct > _THRESHOLD_PCT:   return '🟢 Available'
+                    if pct >= -_THRESHOLD_PCT: return '✅ On Track'
+                    return '🔴 Potential Burnout'
+
                 # Build table rows — keyed entirely by email
                 _sr_table_rows = []
                 for _sr_em, _sr_inf in _hc_sr.get('by_sr_email', {}).items():
@@ -8231,90 +8270,36 @@ if "calc_data" in st.session_state:
                     _rem_hrs  = _cap_hrs - _prod_hrs
                     _pct_rem  = (_rem_hrs / _cap_hrs * 100) if _cap_hrs > 0 else 0.0
 
-                    # Status (current productive hrs)
-                    def _sr_status(pct):
-                        if pct > _THRESHOLD_PCT:   return '🟢 Available'
-                        if pct >= -_THRESHOLD_PCT: return '✅ On Track'
-                        return '🔴 Potential Burnout'
+                    # MEC & Other review hours for this Sr.
+                    _mec_hrs   = float(_mec_rev_by_email.get(_sr_em, 0.0))
+                    _other_hrs = float(_other_rev_by_email.get(_sr_em, 0.0))
+                    _rem_mec   = _cap_hrs - _mec_hrs
+                    _pct_mec   = (_rem_mec / _cap_hrs * 100) if _cap_hrs > 0 else 0.0
 
                     # Ratio flags
                     _dr_flag  = '✅' if _DR_MIN  <= _dr_cnt  <= _DR_MAX  else ('⬇️' if _dr_cnt  < _DR_MIN  else '⬆️')
                     _cli_flag = '✅' if _CLI_MIN <= _cli_cnt <= _CLI_MAX else ('⬇️' if _cli_cnt < _CLI_MIN else '⬆️')
 
                     _sr_table_rows.append({
-                        'POD':                          _pod_v,
-                        'Sr. Accountant':               _sr_em,
-                        'Hire Date':                    pd.Timestamp(_start_dt).strftime('%Y-%m-%d') if pd.notna(_start_dt) else '—',
-                        'Tenure':                       _sr_tenure(_start_dt),
-                        'Direct Reports':               f"{_dr_cnt} {_dr_flag}",
-                        'Clients Assigned':             f"{_cli_cnt} {_cli_flag}",
-                        'Productive Hrs':               round(_prod_hrs, 1),
-                        'Total Work Hours':             round(_tot_hrs, 1),
-                        'Ops Rhythm Hrs':               round(_ops_hrs, 1),
+                        'POD':                               _pod_v,
+                        'Sr. Accountant':                    _sr_em,
+                        'Hire Date':                         pd.Timestamp(_start_dt).strftime('%Y-%m-%d') if pd.notna(_start_dt) else '—',
+                        'Tenure':                            _sr_tenure(_start_dt),
+                        'Direct Reports':                    f"{_dr_cnt} {_dr_flag}",
+                        'Clients Assigned':                  f"{_cli_cnt} {_cli_flag}",
+                        'Productive Hrs':                    round(_prod_hrs, 1),
+                        'Total Work Hours':                  round(_tot_hrs, 1),
+                        'Ops Rhythm Hrs':                    round(_ops_hrs, 1),
                         'Productive Capacity (After Ops R)': round(_cap_hrs, 1),
-                        'Remaining Hrs':                round(_rem_hrs, 1),
-                        '% Remaining':                  round(_pct_rem, 1),
-                        'Status':                       _sr_status(_pct_rem),
-                        '_cap_hrs':                     _cap_hrs,   # internal — for MEC calc
+                        'Remaining Hrs':                     round(_rem_hrs, 1),
+                        '% Remaining':                       round(_pct_rem, 1),
+                        'Status':                            _sr_status(_pct_rem),
+                        'MEC Review Hrs':                    round(_mec_hrs, 1),
+                        'Other Review Hrs':                  round(_other_hrs, 1),
+                        'Remaining Hrs (MEC)':               round(_rem_mec, 1),
+                        '% Remaining (MEC)':                 round(_pct_mec, 1),
+                        'Status (MEC)':                      _sr_status(_pct_mec),
                     })
-
-                # ── MEC Review Hours — cascade reviewer hrs per Sr. ───────────
-                # Reviewer rows in df_resumen_base have Required Role == 'Sr. Accountant'
-                # (true in both ideal and real modes since rev role defaults to Sr. Accountant)
-                # Mode follows Step 3 radio selection.
-                _s3_real = st.session_state.get('s3_role_mode_radio', '').startswith("👥")
-                _rb_key  = 'df_resumen_base_real' if _s3_real else 'df_resumen_base'
-                _rb_mec  = _cd_sr.get(_rb_key, pd.DataFrame())
-                _mec_by_email = {}
-
-                # Build client → Sr. email map from final_dashboards['cliente']
-                _name_to_email_mec = {
-                    str(k).strip().lower(): str(v.get('email', '')).strip().lower()
-                    for k, v in _hc_sr.get('by_sr', {}).items()
-                }
-                _fd_cli_mec = _fd_sr.get('cliente', pd.DataFrame())
-                _client_to_sr_email = {}
-                if ('Sr. Accountant' in _fd_cli_mec.columns
-                        and 'Client' in _fd_cli_mec.columns):
-                    _fd_cli_mec_w = _fd_cli_mec.copy()
-                    _fd_cli_mec_w['_sr_email'] = (
-                        _fd_cli_mec_w['Sr. Accountant']
-                        .astype(str).str.strip().str.lower()
-                        .map(_name_to_email_mec).fillna('')
-                    )
-                    _client_to_sr_email = (
-                        _fd_cli_mec_w[_fd_cli_mec_w['_sr_email'].ne('')]
-                        .groupby(_fd_cli_mec_w['Client'].astype(str).str.lower().str.strip())
-                        ['_sr_email'].first().to_dict()
-                    )
-
-                if (not _rb_mec.empty and 'Client' in _rb_mec.columns
-                        and 'Required Role' in _rb_mec.columns
-                        and _sr_prod_col in _rb_mec.columns
-                        and _client_to_sr_email):
-                    # Keep only reviewer rows
-                    _rb_rev = _rb_mec[_rb_mec['Required Role'] == 'Sr. Accountant'].copy()
-                    _rb_rev['_sr_email'] = (
-                        _rb_rev['Client'].astype(str).str.lower().str.strip()
-                        .map(_client_to_sr_email).fillna('')
-                    )
-                    _mec_by_email = (
-                        _rb_rev[_rb_rev['_sr_email'].ne('')]
-                        .groupby('_sr_email')[_sr_prod_col].sum()
-                        .to_dict()
-                    )
-
-                # Add MEC columns to each row
-                for _row in _sr_table_rows:
-                    _em_r     = _row['Sr. Accountant']
-                    _mec_hrs  = float(_mec_by_email.get(_em_r, 0.0))
-                    _cap_r    = _row.pop('_cap_hrs')   # remove internal key
-                    _rem_mec  = _cap_r - _mec_hrs
-                    _pct_mec  = (_rem_mec / _cap_r * 100) if _cap_r > 0 else 0.0
-                    _row['MEC Review Hrs']        = round(_mec_hrs, 1)
-                    _row['Remaining Hrs (MEC)']   = round(_rem_mec, 1)
-                    _row['% Remaining (MEC)']     = round(_pct_mec, 1)
-                    _row['Status (MEC)']          = _sr_status(_pct_mec)
 
                 if _sr_table_rows:
                     _sr_df = (
@@ -8335,9 +8320,10 @@ if "calc_data" in st.session_state:
                             'Productive Capacity (After Ops R)': st.column_config.NumberColumn('Productive Capacity (After Ops R)', format='%.1f'),
                             'Remaining Hrs':                     st.column_config.NumberColumn('Remaining Hrs',                     format='%.1f'),
                             '% Remaining':                       st.column_config.NumberColumn('% Remaining',                      format='%.1f%%'),
-                            'MEC Review Hrs':                    st.column_config.NumberColumn('MEC Review Hrs',                    format='%.1f'),
-                            'Remaining Hrs (MEC)':               st.column_config.NumberColumn('Remaining Hrs (MEC)',               format='%.1f'),
-                            '% Remaining (MEC)':                 st.column_config.NumberColumn('% Remaining (MEC)',                 format='%.1f%%'),
+                            'MEC Review Hrs':                    st.column_config.NumberColumn('MEC Review Hrs',    format='%.1f'),
+                            'Other Review Hrs':                  st.column_config.NumberColumn('Other Review Hrs',  format='%.1f'),
+                            'Remaining Hrs (MEC)':               st.column_config.NumberColumn('Remaining Hrs (MEC)', format='%.1f'),
+                            '% Remaining (MEC)':                 st.column_config.NumberColumn('% Remaining (MEC)',   format='%.1f%%'),
                         }
                     )
                     st.caption(
@@ -8345,7 +8331,7 @@ if "calc_data" in st.session_state:
                         f"**Ops Rhythm:** {_SR_OPS_FIXED_MONTHLY} hrs/mo fixed + {_SR_OPS_VAR_PER_DR} hrs × DR (scaled to period)  \n"
                         f"**Ratios:** Direct Reports ideal 7–9 · Clients ideal 3–5  \n"
                         f"**Status:** 🟢 Available (>+7%) · ✅ On Track (±7%) · 🔴 Potential Burnout (<−7%)  \n"
-                        f"**MEC columns:** Sr. capacity if they personally reviewed all client MEC work this period"
+                        f"**MEC / Other hrs:** Capacity reviewing hours (col M) where Ideal Proc or Ideal Rev = Sr. Accountant, grouped by type (col B)"
                     )
                 else:
                     st.warning("No Sr. Accountant data found in the HC report.")
