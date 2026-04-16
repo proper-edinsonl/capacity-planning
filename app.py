@@ -3772,10 +3772,12 @@ if "calc_data" in st.session_state:
                             )
 
         # ── D. Onboarding New Clients ─────────────────────────────────────
-        # Any HubSpot client not in baseline — regardless of lifecycle — should be
-        # available for AI projection (e.g. lifecycle="Client" but never in master DB)
+        # Any HubSpot client not in baseline — exclude Churn and blank lifecycle
+        _ob_lc_excl = {'churn', 'churned', '—', '', 'none', 'nan'}
         _df_onboard = _df_hs_view[
-            ~_df_hs_view['client_name'].str.lower().str.strip().isin(_baseline_clients)
+            ~_df_hs_view['client_name'].str.lower().str.strip().isin(_baseline_clients) &
+            ~_df_hs_view['_lifecycle'].astype(str).str.lower().str.strip().isin(_ob_lc_excl) &
+            _df_hs_view['_lifecycle'].astype(str).str.strip().ne('')
         ].copy()
 
         if not _df_onboard.empty:
