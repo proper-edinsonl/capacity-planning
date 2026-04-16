@@ -5708,6 +5708,22 @@ if "calc_data" in st.session_state:
                                 (_duc_fsd_o.isna() | (_duc_fsd_o >= _aht_start_m))
                             )
                             _m_cli_count = int(_m_cli_mask.sum())
+                        # ── Per-month properties/doors/sqft (active clients only) ──
+                        if not _df_m.empty:
+                            _m_snap = _df_m.groupby('client_name', as_index=False).agg({
+                                c: 'first' for c in ['Res Prop','Commercial Properties','Res doors','Commercial Doors','SQFT Commercial']
+                                if c in _df_m.columns
+                            })
+                            _res_prop_count  = int(_safe_num(_m_snap.get('Res Prop', pd.Series(dtype=float))).sum())
+                            _comm_prop_count = int(_safe_num(_m_snap.get('Commercial Properties', pd.Series(dtype=float))).sum())
+                            _prop_count      = _res_prop_count + _comm_prop_count
+                            _res_door_count  = int(_safe_num(_m_snap.get('Res doors', pd.Series(dtype=float))).sum())
+                            _comm_door_count = int(_safe_num(_m_snap.get('Commercial Doors', pd.Series(dtype=float))).sum())
+                            _door_count      = _res_door_count + _comm_door_count
+                            _sqft_count      = int(_safe_num(_m_snap.get('SQFT Commercial', pd.Series(dtype=float))).sum())
+                        else:
+                            _res_prop_count = _comm_prop_count = _prop_count = 0
+                            _res_door_count = _comm_door_count = _door_count = _sqft_count = 0
                         rows.setdefault("━ Property Count",               {})[col] = _fmt(_prop_count, 'n')
                         rows.setdefault("  Res Properties",               {})[col] = _fmt(_res_prop_count if _res_prop_count else None, 'n')
                         rows.setdefault("  Comm Properties",              {})[col] = _fmt(_comm_prop_count if _comm_prop_count else None, 'n')
@@ -6134,6 +6150,22 @@ if "calc_data" in st.session_state:
                                             (_duc['client_name'].astype(str).str.strip().str.lower().isin(_pod_clients_lower))
                                         )
                                         _p_cli_count = int(_pcl_mask.sum())
+                                    # ── Per-month properties/doors/sqft (active clients only) ──
+                                    if not _pdf_m.empty:
+                                        _pm_snap = _pdf_m.groupby('client_name', as_index=False).agg({
+                                            c: 'first' for c in ['Res Prop','Commercial Properties','Res doors','Commercial Doors','SQFT Commercial']
+                                            if c in _pdf_m.columns
+                                        })
+                                        _p_res_prop_count  = int(_safe_num(_pm_snap.get('Res Prop', pd.Series(dtype=float))).sum())
+                                        _p_comm_prop_count = int(_safe_num(_pm_snap.get('Commercial Properties', pd.Series(dtype=float))).sum())
+                                        _p_prop_count      = _p_res_prop_count + _p_comm_prop_count
+                                        _p_res_door_count  = int(_safe_num(_pm_snap.get('Res doors', pd.Series(dtype=float))).sum())
+                                        _p_comm_door_count = int(_safe_num(_pm_snap.get('Commercial Doors', pd.Series(dtype=float))).sum())
+                                        _p_door_count      = _p_res_door_count + _p_comm_door_count
+                                        _p_sqft_count      = int(_safe_num(_pm_snap.get('SQFT Commercial', pd.Series(dtype=float))).sum())
+                                    else:
+                                        _p_res_prop_count = _p_comm_prop_count = _p_prop_count = 0
+                                        _p_res_door_count = _p_comm_door_count = _p_door_count = _p_sqft_count = 0
                                     _pod_rows.setdefault("━ Property Count",               {})[col] = _fmt(_p_prop_count, 'n')
                                     _pod_rows.setdefault("  Res Properties",               {})[col] = _fmt(_p_res_prop_count if _p_res_prop_count else None, 'n')
                                     _pod_rows.setdefault("  Comm Properties",              {})[col] = _fmt(_p_comm_prop_count if _p_comm_prop_count else None, 'n')
@@ -6502,6 +6534,22 @@ if "calc_data" in st.session_state:
                                         (_duc['client_name'].isin(_sr_clients_set))
                                     )
                                     _sr_cli_count = int(_sc_mask.sum())
+                                # ── Per-month properties/doors/sqft (active clients only) ──
+                                if not _sr_m.empty:
+                                    _sm_snap = _sr_m.groupby('client_name', as_index=False).agg({
+                                        c: 'first' for c in ['Res Prop','Commercial Properties','Res doors','Commercial Doors','SQFT Commercial']
+                                        if c in _sr_m.columns
+                                    })
+                                    _sr_res_prop_count  = int(_safe_num(_sm_snap.get('Res Prop', pd.Series(dtype=float))).sum())
+                                    _sr_comm_prop_count = int(_safe_num(_sm_snap.get('Commercial Properties', pd.Series(dtype=float))).sum())
+                                    _srp_count          = _sr_res_prop_count + _sr_comm_prop_count
+                                    _sr_res_door_count  = int(_safe_num(_sm_snap.get('Res doors', pd.Series(dtype=float))).sum())
+                                    _sr_comm_door_count = int(_safe_num(_sm_snap.get('Commercial Doors', pd.Series(dtype=float))).sum())
+                                    _srd_count          = _sr_res_door_count + _sr_comm_door_count
+                                    _srs_count          = int(_safe_num(_sm_snap.get('SQFT Commercial', pd.Series(dtype=float))).sum())
+                                else:
+                                    _sr_res_prop_count = _sr_comm_prop_count = _srp_count = 0
+                                    _sr_res_door_count = _sr_comm_door_count = _srd_count = _srs_count = 0
                                 _sr_rows.setdefault("━ Property Count",               {})[col] = _fmt(_srp_count, 'n')
                                 _sr_rows.setdefault("  Res Properties",               {})[col] = _fmt(_sr_res_prop_count if _sr_res_prop_count else None, 'n')
                                 _sr_rows.setdefault("  Comm Properties",              {})[col] = _fmt(_sr_comm_prop_count if _sr_comm_prop_count else None, 'n')
@@ -8477,6 +8525,20 @@ if (
                     _s4_cli_count = int(_active_c.sum())
                 elif _pod_clients_lower_set:
                     _s4_cli_count = int((_active_c & _duc_name_lower.isin(_pod_clients_lower_set)).sum())
+            # ── Per-month properties/doors/sqft (active clients only) ──────
+            if _i in _duc_mrr_by_month and not _duc.empty and 'client_name' in _duc.columns and not _csn.empty:
+                _sm_s4p, _em_s4p, _act_s4p = _duc_mrr_by_month[_i]
+                _act_names_s4 = set(_duc.loc[_act_s4p, 'client_name'].astype(str).str.strip().str.lower())
+                if _pod_clients_lower_set:
+                    _act_names_s4 &= _pod_clients_lower_set
+                _csn_m = _csn[_csn['client_name'].astype(str).str.strip().str.lower().isin(_act_names_s4)]
+                _s_res_prop  = int(_safe_num_s4(_csn_m.get('Res Prop', pd.Series(dtype=float))).sum())
+                _s_comm_prop = int(_safe_num_s4(_csn_m.get('Commercial Properties', pd.Series(dtype=float))).sum())
+                _s_prop      = _s_res_prop + _s_comm_prop
+                _s_res_door  = int(_safe_num_s4(_csn_m.get('Res doors', pd.Series(dtype=float))).sum())
+                _s_comm_door = int(_safe_num_s4(_csn_m.get('Commercial Doors', pd.Series(dtype=float))).sum())
+                _s_door      = _s_res_door + _s_comm_door
+                _s_sqft      = int(_safe_num_s4(_csn_m.get('SQFT Commercial', pd.Series(dtype=float))).sum())
             _scen_rows.setdefault("━ Property Count",            {})[_col] = _fmt(_s_prop, 'n')
             _scen_rows.setdefault("  Res Properties",            {})[_col] = _fmt(_s_res_prop if _s_res_prop else None, 'n')
             _scen_rows.setdefault("  Comm Properties",           {})[_col] = _fmt(_s_comm_prop if _s_comm_prop else None, 'n')
