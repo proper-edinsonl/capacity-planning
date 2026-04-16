@@ -1910,12 +1910,21 @@ def _process_hc_report(file_bytes: bytes):
         _sr_roles = dict(_dr_roles)
         _sr_roles['Sr. Accountant'] = 1          # always exactly 1 (themselves)
         _sr_total = _dr_total + 1
+        # Hire date & POD for this Sr. (used by Sr. Ratios tab)
+        _sr_own_row = _sr_staff[_sr_staff['Work Email'].astype(str).str.strip().str.lower() == _email]
+        _sr_start   = pd.to_datetime(
+            _sr_own_row['Start Date'].iloc[0] if not _sr_own_row.empty and 'Start Date' in _sr_own_row.columns else pd.NaT,
+            errors='coerce'
+        )
+        _sr_pod_v   = str(_sr_own_row['POD'].iloc[0]) if not _sr_own_row.empty else ''
         _sr_data  = {
-            'total':    _sr_total,
-            'dr_total': _dr_total,               # direct reports only (no Sr.)
-            'by_role':  _sr_roles,
-            'managers': _sr_mgrs,
-            'email':    _email,
+            'total':      _sr_total,
+            'dr_total':   _dr_total,               # direct reports only (no Sr.)
+            'by_role':    _sr_roles,
+            'managers':   _sr_mgrs,
+            'email':      _email,
+            'start_date': _sr_start,               # hire date for tenure calc
+            'pod':        _sr_pod_v,               # POD assignment
         }
         by_sr[_sn]                  = _sr_data
         by_sr_norm[_norm_name(_sn)] = _sr_data
@@ -5436,6 +5445,7 @@ if "calc_data" in st.session_state:
             "💰 Client MRR by Month",
             "🔬 Baseline Audit",
             "👤 Employee Level",
+            "👩‍💼 Sr. Ratios",
         ]
         _s3_tab_prev = st.session_state.get('_s3_tab_jump_prev')
         _s3_tab_sel  = st.selectbox(
@@ -5462,7 +5472,7 @@ if "calc_data" in st.session_state:
 </script>""", height=0)
 
         # (Tab scrolling handled by global CSS at page top)
-        t_overview, t_gral, t_pod, t_pod_sr, t_cli, t_cli_mrr, t_baseline, t_employee = st.tabs([
+        t_overview, t_gral, t_pod, t_pod_sr, t_cli, t_cli_mrr, t_baseline, t_employee, t_sr_ratios = st.tabs([
             "📋 Capacity Overview",
             "🌎 General Waterfall Summary",
             "🚀 Summary by POD (Cascade)",
@@ -5471,6 +5481,7 @@ if "calc_data" in st.session_state:
             "💰 Client MRR by Month",
             "🔬 Baseline Audit",
             "👤 Employee Level",
+            "👩‍💼 Sr. Ratios",
         ])
 
         # Column configs for monetary/FTE columns in the general dashboard
@@ -7727,6 +7738,170 @@ if "calc_data" in st.session_state:
                 help="Re-loadable volume file with all HubSpot, reconciliation, and AI-client updates baked in. "
                      "Upload this as the Master DB next time to skip the sync steps.",
             )
+
+        # ── SR. RATIOS ──────────────────────────────────────────────────────────
+        with t_sr_ratios:
+            st.markdown("### 👩‍💼 Sr. Accountant Ratios & Capacity")
+
+            # ── Ops Rhythm constants (from Srs Ops Rhythm.xlsx) ────────────────
+            # Fixed activities total: Daily AM + Daily PM + Weekly early/later +
+            # Bi-weekly team review + Quarterly QBR = 35.0 hrs/month (20-day base)
+            _SR_OPS_FIXED_MONTHLY = 35.0   # hrs/month at 20-day reference period
+            # Variable: 1:1 with each DR (0.5 hr/DR) + SOP review (1.0 hr/DR) = 1.5 hr/DR/month
+            _SR_OPS_VAR_PER_DR    = 1.5
+            _SR_HRS_PER_DAY       = 7.5
+            _SR_OPS_BASE_DAYS     = 20.0   # reference period for ops rhythm constants
+
+            # Ideal ratio thresholds
+            _DR_MIN, _DR_MAX   = 7, 9
+            _CLI_MIN, _CLI_MAX = 3, 5
+            _THRESHOLD_PCT     = 7.0       # ±7% boundary
+
+            _hc_sr       = st.session_state.get('hc_data')
+            _cd_sr       = st.session_state.get('calc_data', {})
+            _df_clean_sr = st.session_state.get('df_clean', pd.DataFrame())
+            _df_rb       = _cd_sr.get('df_resumen_base', pd.DataFrame())
+            _meses_sr    = _cd_sr.get('meses_proyeccion', [])
+            _wdays_sr    = _cd_sr.get('dict_workable_days', {})
+
+            if _hc_sr is None:
+                st.info("ℹ️ Upload the **HC Weekly Report** in Step 0 to enable Sr. Ratios.")
+            elif not _meses_sr:
+                st.info("ℹ️ Run **Step 1** first to compute capacity data.")
+            else:
+                # Month selector
+                _sr_month_opts = [f"M{i+1} — {m}" for i, m in enumerate(_meses_sr)]
+                _sr_sel_label  = st.selectbox("Period", _sr_month_opts, key="_sr_ratios_month")
+                _sr_mi         = _sr_month_opts.index(_sr_sel_label)
+                _sr_mes_str    = _meses_sr[_sr_mi]
+                _sr_net_days   = _wdays_sr.get(_sr_mi, 20)
+                _sr_prod_col   = f"M{_sr_mi+1} ({_sr_mes_str}) - Productive Hours"
+
+                # Tenure formatter
+                def _sr_tenure(start_dt):
+                    if pd.isna(start_dt):
+                        return '—'
+                    try:
+                        _d = relativedelta(pd.Timestamp.today().normalize(),
+                                           pd.Timestamp(start_dt).normalize())
+                        _parts = []
+                        if _d.years:  _parts.append(f"{_d.years} Yr{'s' if _d.years != 1 else ''}")
+                        if _d.months: _parts.append(f"{_d.months} Mo")
+                        if _d.days:   _parts.append(f"{_d.days} Day{'s' if _d.days != 1 else ''}")
+                        return ', '.join(_parts) if _parts else '< 1 Day'
+                    except Exception:
+                        return '—'
+
+                # Client count per Sr. from df_clean
+                _sr_cli_count = {}
+                if not _df_clean_sr.empty and 'Sr. Accountant' in _df_clean_sr.columns and 'client_name' in _df_clean_sr.columns:
+                    _sr_cli_count = (
+                        _df_clean_sr[_df_clean_sr['Sr. Accountant'].notna()]
+                        .groupby('Sr. Accountant')['client_name'].nunique()
+                        .to_dict()
+                    )
+
+                # Productive hours per Sr. — join df_resumen_base with df_clean via Client
+                _sr_prod_hrs_map = {}
+                if (not _df_rb.empty and 'Client' in _df_rb.columns and _sr_prod_col in _df_rb.columns
+                        and not _df_clean_sr.empty and 'Sr. Accountant' in _df_clean_sr.columns
+                        and 'client_name' in _df_clean_sr.columns):
+                    _sr_cli_lkp = (
+                        _df_clean_sr[['client_name', 'Sr. Accountant']].drop_duplicates()
+                        .assign(_ckey=lambda d: d['client_name'].astype(str).str.lower().str.strip())
+                    )
+                    _df_rb_j = _df_rb.copy()
+                    _df_rb_j['_ckey'] = _df_rb_j['Client'].astype(str).str.lower().str.strip()
+                    _df_rb_j = _df_rb_j.merge(_sr_cli_lkp[['_ckey', 'Sr. Accountant']],
+                                               on='_ckey', how='left')
+                    _sr_prod_hrs_map = (
+                        _df_rb_j[_df_rb_j['Sr. Accountant'].notna()]
+                        .groupby('Sr. Accountant')[_sr_prod_col].sum()
+                        .to_dict()
+                    )
+
+                # Build email → display name lookup
+                _email_to_name = {
+                    v.get('email', ''): k
+                    for k, v in _hc_sr.get('by_sr', {}).items()
+                }
+
+                # Build table rows
+                _sr_table_rows = []
+                for _sr_em, _sr_inf in _hc_sr.get('by_sr_email', {}).items():
+                    _sr_nm    = _email_to_name.get(_sr_em, _sr_em)
+                    _dr_cnt   = int(_sr_inf.get('dr_total', 0))
+                    _pod_v    = str(_sr_inf.get('pod', ''))
+                    _start_dt = _sr_inf.get('start_date', pd.NaT)
+                    _cli_cnt  = int(_sr_cli_count.get(_sr_nm, 0))
+                    _prod_hrs = float(_sr_prod_hrs_map.get(_sr_nm, 0.0))
+
+                    # Capacity math
+                    _scale    = _sr_net_days / _SR_OPS_BASE_DAYS
+                    _ops_hrs  = (_SR_OPS_FIXED_MONTHLY + _SR_OPS_VAR_PER_DR * _dr_cnt) * _scale
+                    _tot_hrs  = _SR_HRS_PER_DAY * _sr_net_days
+                    _cap_hrs  = max(_tot_hrs - _ops_hrs, 0.0)
+                    _rem_hrs  = _cap_hrs - _prod_hrs
+                    _pct_rem  = (_rem_hrs / _cap_hrs * 100) if _cap_hrs > 0 else 0.0
+
+                    # Status
+                    if _pct_rem > _THRESHOLD_PCT:
+                        _status = '🟢 Available'
+                    elif _pct_rem >= -_THRESHOLD_PCT:
+                        _status = '✅ On Track'
+                    else:
+                        _status = '🔴 Potential Burnout'
+
+                    # Ratio flags
+                    _dr_flag  = '✅' if _DR_MIN  <= _dr_cnt  <= _DR_MAX  else ('⬇️' if _dr_cnt  < _DR_MIN  else '⬆️')
+                    _cli_flag = '✅' if _CLI_MIN <= _cli_cnt <= _CLI_MAX else ('⬇️' if _cli_cnt < _CLI_MIN else '⬆️')
+
+                    _sr_table_rows.append({
+                        'POD':                 _pod_v,
+                        'Sr. Accountant':      _sr_nm,
+                        'Hire Date':           pd.Timestamp(_start_dt).strftime('%Y-%m-%d') if pd.notna(_start_dt) else '—',
+                        'Tenure':              _sr_tenure(_start_dt),
+                        'Direct Reports':      f"{_dr_cnt} {_dr_flag}",
+                        'Clients Assigned':    f"{_cli_cnt} {_cli_flag}",
+                        'Productive Hrs':      round(_prod_hrs, 1),
+                        'Total Hrs':           round(_tot_hrs, 1),
+                        'Ops Rhythm Hrs':      round(_ops_hrs, 1),
+                        'Productive Capacity': round(_cap_hrs, 1),
+                        'Remaining Hrs':       round(_rem_hrs, 1),
+                        '% Remaining':         round(_pct_rem, 1),
+                        'Status':              _status,
+                    })
+
+                if _sr_table_rows:
+                    _sr_df = (
+                        pd.DataFrame(_sr_table_rows)
+                        .sort_values(['POD', 'Sr. Accountant'])
+                        .reset_index(drop=True)
+                    )
+                    st.dataframe(
+                        _sr_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            'Productive Hrs':      st.column_config.NumberColumn('Productive Hrs',      format='%.1f'),
+                            'Total Hrs':           st.column_config.NumberColumn('Total Hrs',           format='%.1f'),
+                            'Ops Rhythm Hrs':      st.column_config.NumberColumn('Ops Rhythm Hrs',      format='%.1f'),
+                            'Productive Capacity': st.column_config.NumberColumn('Productive Capacity', format='%.1f'),
+                            'Remaining Hrs':       st.column_config.NumberColumn('Remaining Hrs',       format='%.1f'),
+                            '% Remaining':         st.column_config.NumberColumn('% Remaining',         format='%.1f%%'),
+                        }
+                    )
+                    st.caption(
+                        f"**Period:** {_sr_mes_str} · {_sr_net_days} network days · "
+                        f"{_SR_HRS_PER_DAY} hrs/day  \n"
+                        f"**Ops Rhythm:** {_SR_OPS_FIXED_MONTHLY} hrs/mo fixed + "
+                        f"{_SR_OPS_VAR_PER_DR} hrs × DR variable (scaled to period)  \n"
+                        f"**Ratios:** Direct Reports ideal 7–9 · Clients ideal 3–5  \n"
+                        f"**Status:** 🟢 Available (>+7% remaining) · "
+                        f"✅ On Track (±7%) · 🔴 Potential Burnout (<−7%)"
+                    )
+                else:
+                    st.warning("No Sr. Accountant data found in the HC report.")
 
 
 # ==========================================
