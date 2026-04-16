@@ -3001,82 +3001,56 @@ with tab1:
                                   'Proc Hrs', 'Rev Hrs', 'Total Hrs']
                     st.dataframe(_ob_disp_df[_disp_cols], use_container_width=True, hide_index=True)
 
-                    # Clients WITH existing hours → offer to replace
                     if _n_ob_w_data > 0:
                         st.warning(
                             f"⚠️ **{_n_ob_w_data} of these client(s)** already have hours in the input file. "
-                            "Select below to queue them for AI prediction (their existing hours are shown for reference)."
+                            "Click below to queue them for AI prediction — their existing hours will be replaced."
                         )
-                        _clients_w_data_l = _ob_disp_df[_has_data_m]['Client'].tolist()
-                        # Dynamic key: resets widget when client list changes (e.g. filter change)
-                        # so stale session_state from a previous scope never conflicts with
-                        # current options — prevents React error #185 infinite reconciliation loop
-                        _rep_ms_key = f"_ob_replace_ms_{abs(hash(tuple(sorted(_clients_w_data_l))))}"
-                        _cur_rep_list = st.multiselect(
-                            "🔄 Select clients to replace with AI Prediction:",
-                            options=_clients_w_data_l,
-                            default=_clients_w_data_l,
-                            key=_rep_ms_key,
+
+                    # Single Queue All button — no multiselect/checkbox widgets that can loop
+                    _all_ob_clients = _ob_disp_df['Client'].tolist()
+                    if st.button(
+                        f"🤖 Queue All {_n_ob_total} Client(s) for AI Prediction",
+                        key="btn_ob_queue_all", type="primary"
+                    ):
+                        st.session_state['_ob_replace_set'] = set(_ob_disp_df[_has_data_m]['Client'].tolist())
+                        _existing_ai2 = st.session_state.get('ai_manual_clients', pd.DataFrame())
+                        _new_ai_rows2 = []
+                        for _, _ob_r in _ob_disp_df.iterrows():
+                            _gl_ai_s = pd.to_datetime(_ob_r['_gl_raw'], errors='coerce')
+                            _new_ai_rows2.append({
+                                'Company Name':    _ob_r['Client'],
+                                'POD':             _ob_r['_pod'],
+                                'Go Live Date':    _gl_ai_s.strftime('%Y-%m-%d') if pd.notna(_gl_ai_s) else '',
+                                'MRR ($)':         float(_ob_r['_mrr'] or 0),
+                                'PMS':             _ob_r['_pms'],
+                                'Res Doors':       0,
+                                'Res Properties':  0,
+                                'Comm Doors':      0,
+                                'Comm Properties': 0,
+                                'SQFT Commercial': 0,
+                                'Corp Books':      '',
+                            })
+                        _new_ai_df2 = pd.DataFrame(_new_ai_rows2)
+                        _new_ai_df2 = _enrich_ai_from_hs(_new_ai_df2, st.session_state.get('hs_parsed'))
+                        if not _existing_ai2.empty and 'Company Name' in _existing_ai2.columns:
+                            _ex2_keys = set(_existing_ai2['Company Name'].astype(str).str.lower().str.strip())
+                            _truly_new2 = [r for _, r in _new_ai_df2.iterrows()
+                                           if str(r['Company Name']).lower().strip() not in _ex2_keys]
+                            if _truly_new2:
+                                st.session_state.ai_manual_clients = pd.concat(
+                                    [_existing_ai2, pd.DataFrame(_truly_new2)], ignore_index=True)
+                            _q_count = len(_truly_new2)
+                        else:
+                            st.session_state.ai_manual_clients = _new_ai_df2
+                            _q_count = len(_new_ai_df2)
+                        st.success(
+                            f"✅ {_q_count} client(s) queued for AI Prediction.  \n"
+                            "👇 Run AI Prediction below, then click **Add to Baseline** to apply."
                         )
-                        _cur_rep = set(_cur_rep_list)
+                        st.rerun()
 
-                        if _cur_rep:
-                            if st.button(
-                                f"🤖 Queue {len(_cur_rep)} client(s) for AI Prediction",
-                                key="_ob_queue_ai_btn", type="primary"
-                            ):
-                                # Write _ob_replace_set only inside button callback — never during render
-                                st.session_state['_ob_replace_set'] = _cur_rep
-                                _existing_ai2 = st.session_state.get('ai_manual_clients', pd.DataFrame())
-                                _new_ai_rows2 = []
-                                for _, _ob_r in _ob_disp_df[_ob_disp_df['Client'].isin(_cur_rep)].iterrows():
-                                    _gl_ai_s = pd.to_datetime(_ob_r['_gl_raw'], errors='coerce')
-                                    _new_ai_rows2.append({
-                                        'Company Name':    _ob_r['Client'],
-                                        'POD':             _ob_r['_pod'],
-                                        'Go Live Date':    _gl_ai_s.strftime('%Y-%m-%d') if pd.notna(_gl_ai_s) else '',
-                                        'MRR ($)':         float(_ob_r['_mrr'] or 0),
-                                        'PMS':             _ob_r['_pms'],
-                                        'Res Doors':       0,
-                                        'Res Properties':  0,
-                                        'Comm Doors':      0,
-                                        'Comm Properties': 0,
-                                        'SQFT Commercial': 0,
-                                        'Corp Books':      '',
-                                    })
-                                _new_ai_df2 = pd.DataFrame(_new_ai_rows2)
-                                # Enrich with HubSpot data before adding to queue
-                                _new_ai_df2 = _enrich_ai_from_hs(
-                                    _new_ai_df2, st.session_state.get('hs_parsed')
-                                )
-                                if not _existing_ai2.empty and 'Company Name' in _existing_ai2.columns:
-                                    _ex2_keys = set(
-                                        _existing_ai2['Company Name'].astype(str).str.lower().str.strip()
-                                    )
-                                    _truly_new2 = [
-                                        r for _, r in _new_ai_df2.iterrows()
-                                        if str(r['Company Name']).lower().strip() not in _ex2_keys
-                                    ]
-                                    if _truly_new2:
-                                        st.session_state.ai_manual_clients = pd.concat(
-                                            [_existing_ai2, pd.DataFrame(_truly_new2)], ignore_index=True
-                                        )
-                                    _q_count = len(_truly_new2)
-                                else:
-                                    st.session_state.ai_manual_clients = _new_ai_df2
-                                    _q_count = len(_new_ai_df2)
-                                # Keep _ob_replace_set alive — "Add to Baseline" uses it to
-                                # purge old Step-1 hours and replace with AI projection.
-                                # It will be cleared automatically after cascade runs.
-                                st.success(
-                                    f"✅ {_q_count} client(s) queued — their existing data will be "
-                                    "**replaced** by the AI projection.  \n"
-                                    "👇 Run AI Prediction in the section below, then click "
-                                    "**Add to Baseline** to apply the replacement automatically."
-                                )
-                                st.rerun()
-
-                    # Clients WITHOUT hours
+                    # Clients WITHOUT hours — informational note
                     _no_data_list = _ob_disp_df[~_has_data_m]['Client'].tolist()
                     if _no_data_list:
                         st.info(
