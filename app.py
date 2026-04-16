@@ -3627,11 +3627,13 @@ if "calc_data" in st.session_state:
                 _new_gl  = _hr['_start_date'].strftime('%Y-%m-%d') if pd.notna(_hr['_start_date']) else (
                                _cur_gl.strftime('%Y-%m-%d') if pd.notna(_cur_gl) else '')
                 _new_fsd = _hr['_fsd'].strftime('%Y-%m-%d') if pd.notna(_hr['_fsd']) else ''
+                _cur_fsd_str = str(_cur_fsd.date()) if pd.notna(_cur_fsd) else ''
                 _pod_diff = bool(_hs_pod) and _hs_pod.lower() != _cur_pod.lower()
-                _has_diff = (_status != 'In Both') or abs(_new_mrr - _cur_mrr) > 0.01 or (
-                                pd.notna(_hr['_start_date']) and pd.notna(_cur_gl) and
-                                _hr['_start_date'].date() != pd.Timestamp(_cur_gl).date()
-                            ) or bool(_new_fsd) or _pod_diff
+                _mrr_diff = abs(_new_mrr - _cur_mrr) > 0.01
+                _gl_diff  = (pd.notna(_hr['_start_date']) and pd.notna(_cur_gl) and
+                             _hr['_start_date'].date() != pd.Timestamp(_cur_gl).date())
+                _fsd_diff = bool(_new_fsd) and _new_fsd != _cur_fsd_str  # only diff if FSD actually changed
+                _has_diff = (_status != 'In Both') or _mrr_diff or _gl_diff or _fsd_diff or _pod_diff
 
                 _recon_rows.append({
                     'Apply':              _has_diff,
@@ -3772,9 +3774,33 @@ if "calc_data" in st.session_state:
                                 _dcu = pd.concat([_dcu, pd.DataFrame([_new_row])], ignore_index=True)
                         st.session_state.df_clients_unique = _dcu
                     _build_client_master_map()   # re-sync maps with reconciliation overrides
+                    # ── Patch df_vol_export immediately so the download reflects
+                    # the reconciled values without needing a cascade re-run ──────
+                    _vol_exp_now = st.session_state.get('df_vol_export', pd.DataFrame())
+                    if not _vol_exp_now.empty and 'client_name' in _vol_exp_now.columns:
+                        _ve = _vol_exp_now.copy()
+                        _ve_key = _ve['client_name'].astype(str).str.lower().str.strip()
+                        for _ov_cn, _ov_v in _overrides.items():
+                            _ov_k = _ov_cn.lower().strip()
+                            _ve_m = _ve_key == _ov_k
+                            if not _ve_m.any():
+                                continue
+                            if _ov_v.get('mrr') and 'MRR' in _ve.columns:
+                                _ve.loc[_ve_m, 'MRR'] = float(_ov_v['mrr'])
+                            if _ov_v.get('start_date') and 'Go Live' in _ve.columns:
+                                try: _ve.loc[_ve_m, 'Go Live'] = pd.to_datetime(_ov_v['start_date'])
+                                except Exception: pass
+                            if _ov_v.get('fsd') and 'Final Service Date' in _ve.columns:
+                                try: _ve.loc[_ve_m, 'Final Service Date'] = pd.to_datetime(_ov_v['fsd'])
+                                except Exception: pass
+                            if _ov_v.get('pod') and 'POD' in _ve.columns:
+                                _ve.loc[_ve_m, 'POD'] = str(_ov_v['pod']).strip()
+                        st.session_state['df_vol_export'] = _ve
+                    # Also force reconciliation rebuild so it reflects the applied values
+                    st.session_state['hs_recon_df'] = None
                     st.success(
                         f"✅ Applied changes for {len(_overrides)} client(s). "
-                        "Note: Go Live / FSD date changes will take full effect on the next baseline run."
+                        "Volume export updated — download reflects the latest reconciliation."
                     )
                     if _overrides:
                         _term_count = sum(1 for v in _overrides.values() if v['is_terminating'])
