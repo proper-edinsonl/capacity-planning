@@ -3635,6 +3635,30 @@ if "calc_data" in st.session_state:
                         'New Start Date':  '',
                         'Final Svc Date':  '',
                     })
+            # HubSpot clients not in baseline at all — show as "New in HubSpot"
+            # These are clients that exist in HubSpot but were never in the master DB/upload.
+            # Vertus-type case: lifecycle = "Client" but not yet in baseline.
+            for _, _hr in _df_hs.iterrows():
+                _hname_low = _hr['client_name'].lower().strip()
+                if _hname_low not in _baseline_clients:
+                    _hs_pod  = str(_hr.get('_pod', '') or '').strip()
+                    _hs_mrr  = float(_hr['_mrr']) if pd.notna(_hr['_mrr']) else 0.0
+                    _new_gl  = _hr['_start_date'].strftime('%Y-%m-%d') if pd.notna(_hr['_start_date']) else ''
+                    _new_fsd = _hr['_fsd'].strftime('%Y-%m-%d') if pd.notna(_hr['_fsd']) else ''
+                    _recon_rows.append({
+                        'Apply':           False,
+                        'Client':          _hr['client_name'],
+                        'Current POD':     '—',
+                        'New POD':         _hs_pod or '',
+                        'Status':          'New in HubSpot',
+                        'Lifecycle':       _hr['_lifecycle'],
+                        'Terminating':     bool(_hr['_is_terminating']),
+                        'Current MRR ($)': 0.0,
+                        'New MRR ($)':     _hs_mrr,
+                        'Current Start Date': '',
+                        'New Start Date':  _new_gl,
+                        'Final Svc Date':  _new_fsd,
+                    })
             st.session_state.hs_recon_df = pd.DataFrame(_recon_rows) if _recon_rows else pd.DataFrame()
 
         with st.expander("📋 Client Reconciliation", expanded=True):
@@ -3703,6 +3727,7 @@ if "calc_data" in st.session_state:
                         for _cname, _ov in _overrides.items():
                             _mask = _dcu['client_name'].str.lower().str.strip() == _cname.lower().strip()
                             if _mask.any():
+                                # Existing client — update in place
                                 if _ov['mrr'] is not None:
                                     _dcu.loc[_mask, 'MRR'] = _ov['mrr']
                                 if _ov['start_date']:
@@ -3717,6 +3742,21 @@ if "calc_data" in st.session_state:
                                         pass
                                 if _ov.get('pod'):
                                     _dcu.loc[_mask, 'POD'] = str(_ov['pod']).strip()
+                            else:
+                                # "New in HubSpot" client — add a new row to baseline
+                                _new_row = {c: None for c in _dcu.columns}
+                                _new_row['client_name'] = _cname
+                                _new_row['MRR']         = _ov.get('mrr', 0.0)
+                                _new_row['POD']         = str(_ov.get('pod', '') or '').strip()
+                                try:
+                                    _new_row['Go Live'] = pd.to_datetime(_ov.get('start_date')) if _ov.get('start_date') else pd.NaT
+                                except Exception:
+                                    _new_row['Go Live'] = pd.NaT
+                                try:
+                                    _new_row['Final Service Date'] = pd.to_datetime(_ov.get('fsd')) if _ov.get('fsd') else pd.NaT
+                                except Exception:
+                                    _new_row['Final Service Date'] = pd.NaT
+                                _dcu = pd.concat([_dcu, pd.DataFrame([_new_row])], ignore_index=True)
                         st.session_state.df_clients_unique = _dcu
                     _build_client_master_map()   # re-sync maps with reconciliation overrides
                     st.success(
