@@ -5481,7 +5481,7 @@ if "calc_data" in st.session_state:
 
                 if not _df_raw.empty:
                     _client_snap = _df_raw.groupby('client_name', as_index=False).agg({
-                        c: 'first' for c in ['Res Prop','Commercial Properties','Res doors','Commercial Doors']
+                        c: 'first' for c in ['Res Prop','Commercial Properties','Res doors','Commercial Doors','SQFT Commercial']
                         if c in _df_raw.columns
                     })
                     _prop_count  = int(
@@ -5492,8 +5492,9 @@ if "calc_data" in st.session_state:
                         _safe_num(_client_snap.get('Res doors', 0)).sum() +
                         _safe_num(_client_snap.get('Commercial Doors', 0)).sum()
                     )
+                    _sqft_count  = int(_safe_num(_client_snap.get('SQFT Commercial', 0)).sum())
                 else:
-                    _prop_count = _door_count = 0
+                    _prop_count = _door_count = _sqft_count = 0
 
                 # (AI results kept in _ai for other uses, but not shown in the waterfall rows)
                 _ai_base_wdays = st.session_state.get('calc_data', {}).get('dict_workable_days', {}).get(0, 21)
@@ -5710,7 +5711,8 @@ if "calc_data" in st.session_state:
                             _m_cli_count = int(_m_cli_mask.sum())
                         rows.setdefault("━ Property Count",               {})[col] = _fmt(_prop_count, 'n')
                         rows.setdefault("  Client Count",                 {})[col] = _fmt(_m_cli_count, 'n')
-                        rows.setdefault("  Door Count Equivalent",        {})[col] = _fmt(_door_count, 'n')
+                        rows.setdefault("  Doors",                        {})[col] = _fmt(_door_count, 'n')
+                        rows.setdefault("  SQFT (Comm)",                  {})[col] = _fmt(_sqft_count if _sqft_count else None, 'n')
                         rows.setdefault("  Tickets to Process",           {})[col] = _fmt(_aht_proc_tix, 'n')
                         rows.setdefault("  Tickets to Review",            {})[col] = _fmt(_aht_rev_tix,  'n')
                         rows.setdefault("  AHT (min)",                    {})[col] = _fmt(_avg_aht, 'dec')
@@ -5757,7 +5759,7 @@ if "calc_data" in st.session_state:
                     "━ MRR ($)":                  ["  (+) New MRR ($)", "  (-) Churn MRR ($)", "  Revenue / HC ($)"],
                     "━ Cost & Margin":            ["  Capacity Cost ($)", "  Capacity Margin ($)", "  Capacity Margin (%)",
                                                    "  Expected Cost ($)", "  Expected Margin ($)", "  Expected Margin (%)"],
-                    "━ Property Count":           ["  Client Count", "  Door Count Equivalent"],
+                    "━ Property Count":           ["  Client Count", "  Doors", "  SQFT (Comm)"],
                     "━ Working Days":             ["  Holidays"],
                 }
                 _ov_groups_nohc = {
@@ -5765,7 +5767,7 @@ if "calc_data" in st.session_state:
                     "━ Required HC (FTEs)":       ["  · Accountant I", "  · Accountant II", "  · General Accountant", "  · Sr. Accountant"],
                     "━ MRR ($)":                  ["  (+) New MRR ($)", "  (-) Churn MRR ($)"],
                     "━ Cost & Margin":            ["  Capacity Cost ($)", "  Capacity Margin ($)", "  Capacity Margin (%)"],
-                    "━ Property Count":           ["  Client Count", "  Door Count Equivalent"],
+                    "━ Property Count":           ["  Client Count", "  Doors", "  SQFT (Comm)"],
                     "━ Working Days":             ["  Holidays"],
                 }
                 _ov_groups = _ov_groups_nohc if _hide_actual_hc else _ov_groups_full
@@ -5905,7 +5907,7 @@ if "calc_data" in st.session_state:
                                     _pdf_raw = pd.DataFrame()
                                 if not _pdf_raw.empty:
                                     _p_client_snap = _pdf_raw.groupby('client_name', as_index=False).agg({
-                                        c: 'first' for c in ['Res Prop','Commercial Properties','Res doors','Commercial Doors']
+                                        c: 'first' for c in ['Res Prop','Commercial Properties','Res doors','Commercial Doors','SQFT Commercial']
                                         if c in _pdf_raw.columns
                                     })
                                     _p_prop_count = int(
@@ -5916,8 +5918,9 @@ if "calc_data" in st.session_state:
                                         _safe_num(_p_client_snap.get('Res doors', 0)).sum() +
                                         _safe_num(_p_client_snap.get('Commercial Doors', 0)).sum()
                                     )
+                                    _p_sqft_count = int(_safe_num(_p_client_snap.get('SQFT Commercial', 0)).sum())
                                 else:
-                                    _p_prop_count = _p_door_count = 0
+                                    _p_prop_count = _p_door_count = _p_sqft_count = 0
 
                                 _pm_all  = _pod_df[(_pod_df['POD'] == _pod_name) & (_pod_df['Required Role'] == '>>> POD TOTAL')]
                                 _proles_all = _pod_df[(_pod_df['POD'] == _pod_name) & (_pod_df['Required Role'] != '>>> POD TOTAL')]
@@ -6132,7 +6135,8 @@ if "calc_data" in st.session_state:
                                         _p_cli_count = int(_pcl_mask.sum())
                                     _pod_rows.setdefault("━ Property Count",               {})[col] = _fmt(_p_prop_count, 'n')
                                     _pod_rows.setdefault("  Client Count",                 {})[col] = _fmt(_p_cli_count, 'n')
-                                    _pod_rows.setdefault("  Door Count Equivalent",        {})[col] = _fmt(_p_door_count, 'n')
+                                    _pod_rows.setdefault("  Doors",                        {})[col] = _fmt(_p_door_count, 'n')
+                                    _pod_rows.setdefault("  SQFT (Comm)",                  {})[col] = _fmt(_p_sqft_count if _p_sqft_count else None, 'n')
                                     _pod_rows.setdefault("  Tickets to Process",           {})[col] = _fmt(_p_proc_tix, 'n')
                                     _pod_rows.setdefault("  Tickets to Review",            {})[col] = _fmt(_p_rev_tix,  'n')
                                     _pod_rows.setdefault("  AHT (min)",                    {})[col] = _fmt(_p_avg_aht, 'dec')
@@ -6152,7 +6156,7 @@ if "calc_data" in st.session_state:
                                     "━ MRR ($)":                  ["  (+) New MRR ($)", "  (-) Churn MRR ($)", "  Revenue / HC ($)"],
                                     "━ Cost & Margin":            ["  Capacity Cost ($)", "  Capacity Margin ($)", "  Capacity Margin (%)",
                                                                    "  Expected Cost ($)", "  Expected Margin ($)", "  Expected Margin (%)"],
-                                    "━ Property Count":           ["  Client Count", "  Door Count Equivalent"],
+                                    "━ Property Count":           ["  Client Count", "  Doors", "  SQFT (Comm)"],
                                     "━ Working Days":             ["  Holidays"],
                                 }
                                 for _gh in _pod_grp_defs:
@@ -6293,15 +6297,16 @@ if "calc_data" in st.session_state:
                             )
                             if not _sr_raw.empty:
                                 _sr_snap = _sr_raw.groupby('client_name', as_index=False).agg({
-                                    c: 'first' for c in ['Res Prop','Commercial Properties','Res doors','Commercial Doors']
+                                    c: 'first' for c in ['Res Prop','Commercial Properties','Res doors','Commercial Doors','SQFT Commercial']
                                     if c in _sr_raw.columns
                                 })
                                 _srp_count = int(_safe_num(_sr_snap.get('Res Prop', 0)).sum() +
                                                  _safe_num(_sr_snap.get('Commercial Properties', 0)).sum())
                                 _srd_count = int(_safe_num(_sr_snap.get('Res doors', 0)).sum() +
                                                  _safe_num(_sr_snap.get('Commercial Doors', 0)).sum())
+                                _srs_count = int(_safe_num(_sr_snap.get('SQFT Commercial', 0)).sum())
                             else:
-                                _srp_count = _srd_count = 0
+                                _srp_count = _srd_count = _srs_count = 0
 
                             _duc = st.session_state.get('df_clients_unique', pd.DataFrame())
 
@@ -6492,7 +6497,8 @@ if "calc_data" in st.session_state:
                                     _sr_cli_count = int(_sc_mask.sum())
                                 _sr_rows.setdefault("━ Property Count",               {})[col] = _fmt(_srp_count, 'n')
                                 _sr_rows.setdefault("  Client Count",                 {})[col] = _fmt(_sr_cli_count, 'n')
-                                _sr_rows.setdefault("  Door Count Equivalent",        {})[col] = _fmt(_srd_count, 'n')
+                                _sr_rows.setdefault("  Doors",                        {})[col] = _fmt(_srd_count, 'n')
+                                _sr_rows.setdefault("  SQFT (Comm)",                  {})[col] = _fmt(_srs_count if _srs_count else None, 'n')
                                 _sr_rows.setdefault("  Tickets to Process",           {})[col] = _fmt(_sr_proc_tix, 'n')
                                 _sr_rows.setdefault("  Tickets to Review",            {})[col] = _fmt(_sr_rev_tix,  'n')
                                 _sr_rows.setdefault("  AHT (min)",                    {})[col] = _fmt(_sr_avg_aht, 'dec')
@@ -6526,7 +6532,7 @@ if "calc_data" in st.session_state:
                                     "━ MRR ($)":                  ["  (+) New MRR ($)", "  (-) Churn MRR ($)", "  Revenue / HC ($)"],
                                     "━ Cost & Margin":            ["  Capacity Cost ($)", "  Capacity Margin ($)", "  Capacity Margin (%)",
                                                                    "  Expected Cost ($)", "  Expected Margin ($)", "  Expected Margin (%)"],
-                                    "━ Property Count":           ["  Client Count", "  Door Count Equivalent"],
+                                    "━ Property Count":           ["  Client Count", "  Doors", "  SQFT (Comm)"],
                                     "━ Working Days":             ["  Holidays"],
                                 }
                                 # Client rows are also collapsible
@@ -7402,7 +7408,7 @@ if "calc_data" in st.session_state:
                         _rows_x.setdefault("  (+) New MRR ($)",              {})[_col_x] = round(_sr_new_mrr, 2) if _sr_new_mrr else None
                         _rows_x.setdefault("  (-) Churn MRR ($)",            {})[_col_x] = round(_sr_churn_mrr, 2) if _sr_churn_mrr else None
                         _rows_x.setdefault("━ Property Count",               {})[_col_x] = _prop_cx or None
-                        _rows_x.setdefault("  Door Count Equivalent",        {})[_col_x] = _door_cx or None
+                        _rows_x.setdefault("  Doors",                        {})[_col_x] = _door_cx or None
                         _rows_x.setdefault("  Tickets to Process",           {})[_col_x] = int(_ptix) if _ptix else None
                         _rows_x.setdefault("  Tickets to Review",            {})[_col_x] = int(_rtix) if _rtix else None
                         _rows_x.setdefault("  AHT (min)",                    {})[_col_x] = round(_avg_aht, 1) if _avg_aht else None
@@ -7818,14 +7824,15 @@ if (
         _src_raw = _pdf_raw if ((_scope_is_pod or _scope_is_sr) and not _pdf_raw.empty) else _df_raw
         if not _src_raw.empty:
             _csn = _src_raw.groupby('client_name', as_index=False).agg({
-                c: 'first' for c in ['Res Prop', 'Commercial Properties', 'Res doors', 'Commercial Doors']
+                c: 'first' for c in ['Res Prop', 'Commercial Properties', 'Res doors', 'Commercial Doors', 'SQFT Commercial']
                 if c in _src_raw.columns
             })
             def _safe_num_s4(s): return pd.to_numeric(s, errors='coerce').fillna(0)
             _s_prop = int(_safe_num_s4(_csn.get('Res Prop', 0)).sum()  + _safe_num_s4(_csn.get('Commercial Properties', 0)).sum())
             _s_door = int(_safe_num_s4(_csn.get('Res doors', 0)).sum() + _safe_num_s4(_csn.get('Commercial Doors', 0)).sum())
+            _s_sqft = int(_safe_num_s4(_csn.get('SQFT Commercial', 0)).sum())
         else:
-            _s_prop = _s_door = 0; _s_aht = 0.0
+            _s_prop = _s_door = _s_sqft = 0; _s_aht = 0.0
 
         # ── Read adjustments (only confirmed rows) ───────────────────────────
         _hc_adj_df  = st.session_state.s4v2_hc_adj_df
@@ -8458,7 +8465,8 @@ if (
                     _s4_cli_count = int((_active_c & _duc_name_lower.isin(_pod_clients_lower_set)).sum())
             _scen_rows.setdefault("━ Property Count",            {})[_col] = _fmt(_s_prop, 'n')
             _scen_rows.setdefault("  Client Count",              {})[_col] = _fmt(_s4_cli_count, 'n')
-            _scen_rows.setdefault("  Door Count Equivalent",     {})[_col] = _fmt(_s_door, 'n')
+            _scen_rows.setdefault("  Doors",                     {})[_col] = _fmt(_s_door, 'n')
+            _scen_rows.setdefault("  SQFT (Comm)",               {})[_col] = _fmt(_s_sqft if _s_sqft else None, 'n')
             _scen_rows.setdefault("  Tickets to Process",        {})[_col] = _fmt(_s4_proc_tix, 'n')
             _scen_rows.setdefault("  Tickets to Review",         {})[_col] = _fmt(_s4_rev_tix,  'n')
             _scen_rows.setdefault("  AHT (min)",                 {})[_col] = _fmt(_s_aht,        'dec')
@@ -8578,7 +8586,7 @@ if (
             "━ MRR ($)":                  ["  (+) New MRR ($)", "  (-) Churn MRR ($)", "  Revenue / HC ($)"],
             "━ Cost & Margin":            ["  Capacity Cost ($)", "  Capacity Margin ($)", "  Capacity Margin (%)",
                                            "  Expected Cost ($)", "  Expected Margin ($)", "  Expected Margin (%)"],
-            "━ Property Count":           ["  Client Count", "  Door Count Equivalent"],
+            "━ Property Count":           ["  Client Count", "  Doors", "  SQFT (Comm)"],
             "━ Working Days":             ["  Holidays"],
         }
         for _gh in _s4_groups:
