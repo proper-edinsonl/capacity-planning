@@ -8024,7 +8024,11 @@ if "calc_data" in st.session_state:
             _el_df_exp = st.session_state.get('_s3_emp_level_df', pd.DataFrame())
             if not _el_df_exp.empty:
                 _el_df_exp.to_excel(writer, index=False, sheet_name='Employee_Level')
-            # Tab 8: Client MRR by Month
+            # Tab 8: Sr. Ratios
+            _sr_rat_exp = st.session_state.get('_s3_sr_ratios_df', pd.DataFrame())
+            if not _sr_rat_exp.empty:
+                _sr_rat_exp.to_excel(writer, index=False, sheet_name='Sr_Ratios')
+            # Tab 9: Client MRR by Month
             _cmrr_exp = st.session_state.final_dashboards.get('client_mrr', pd.DataFrame())
             if not _cmrr_exp.empty:
                 _cmrr_exp.to_excel(writer, index=False, sheet_name='Client_MRR')
