@@ -7761,12 +7761,12 @@ if "calc_data" in st.session_state:
             _cd_sr       = st.session_state.get('calc_data', {})
             _df_clean_sr = st.session_state.get('df_clean', pd.DataFrame())
             _df_rb       = _cd_sr.get('df_resumen_base', pd.DataFrame())
-            _meses_sr    = _cd_sr.get('meses_proyeccion', [])
+            _meses_sr    = meses_proyeccion          # global variable — always defined
             _wdays_sr    = _cd_sr.get('dict_workable_days', {})
 
             if _hc_sr is None:
                 st.info("ℹ️ Upload the **HC Weekly Report** in Step 0 to enable Sr. Ratios.")
-            elif not _meses_sr:
+            elif not _wdays_sr:
                 st.info("ℹ️ Run **Step 1** first to compute capacity data.")
             else:
                 # Month selector
