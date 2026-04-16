@@ -8214,6 +8214,9 @@ if "calc_data" in st.session_state:
                             float(_proc_map.get(_em, 0.0)) + float(_rev_map.get(_em, 0.0))
                         )
 
+                # Role mode (follows Step 3 selection)
+                _s3_real = st.session_state.get('s3_role_mode_radio', '').startswith("👥")
+
                 # ── Pre-compute MEC & Other hrs from df_clean ────────────────
                 # For clients where Sr. Accountant (col AD) = sr_email:
                 #   · If Ideal Proc == 'Sr. Accountant' → add Capacity Processing Hours (col L)
