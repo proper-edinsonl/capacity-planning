@@ -8214,38 +8214,49 @@ if "calc_data" in st.session_state:
                             float(_proc_map.get(_em, 0.0)) + float(_rev_map.get(_em, 0.0))
                         )
 
-                # ── Pre-compute MEC & Other review hrs from df_clean ─────────
-                # Logic: rows where Sr. Accountant email (col AD) matches the Sr.
-                #        AND Ideal Proc OR Ideal Rev == 'Sr. Accountant'
-                #        Grouped by type (col B: 'MEC' vs 'Other')
-                #        Sum of Capacity reviewing hours (col M)
-                _mec_rev_by_email   = {}   # type == 'MEC'  → {sr_email: hrs}
-                _other_rev_by_email = {}   # type == 'Other'→ {sr_email: hrs}
-                if not _df_c.empty:
-                    _ip_col  = 'Ideal Proc'
-                    _ir_col  = 'Ideal Rev'
-                    _rev_col = 'Capacity reviewing hours'
-                    _type_col = 'type'
-                    _sr_col_dc = 'Sr. Accountant'
-                    _has_cols = all(c in _df_c.columns for c in [_ip_col, _ir_col, _rev_col, _type_col, _sr_col_dc])
-                    if _has_cols:
-                        _dc_ip   = _df_c[_ip_col].astype(str).str.strip()
-                        _dc_ir   = _df_c[_ir_col].astype(str).str.strip()
-                        _sr_mask_dc = (_dc_ip == 'Sr. Accountant') | (_dc_ir == 'Sr. Accountant')
-                        _df_sr_rows = _df_c[_sr_mask_dc].copy()
-                        _df_sr_rows['_sr_key']  = _df_sr_rows[_sr_col_dc].astype(str).str.lower().str.strip()
-                        _df_sr_rows['_type_key'] = _df_sr_rows[_type_col].astype(str).str.strip().str.upper()
-                        _df_sr_rows['_rev_h']   = pd.to_numeric(_df_sr_rows[_rev_col], errors='coerce').fillna(0.0)
-                        # MEC rows
-                        _mec_rev_by_email = (
-                            _df_sr_rows[_df_sr_rows['_type_key'] == 'MEC']
-                            .groupby('_sr_key')['_rev_h'].sum().to_dict()
+                # ── Pre-compute MEC & Other hrs from df_clean ────────────────
+                # For clients where Sr. Accountant (col AD) = sr_email:
+                #   · If Ideal Proc == 'Sr. Accountant' → add Capacity Processing Hours (col L)
+                #   · If Ideal Rev  == 'Sr. Accountant' → add Capacity reviewing hours  (col M)
+                # Split by type (col B): 'MEC' vs 'Other'
+                _mec_rev_by_email   = {}
+                _other_rev_by_email = {}
+                _need_cols = ['Ideal Proc', 'Ideal Rev',
+                              'Capacity Processing Hours', 'Capacity reviewing hours',
+                              'type', 'Sr. Accountant']
+                if not _df_c.empty and all(c in _df_c.columns for c in _need_cols):
+                    _sr_key  = _df_c['Sr. Accountant'].astype(str).str.lower().str.strip()
+                    _ip      = _df_c['Ideal Proc'].astype(str).str.strip()
+                    _ir      = _df_c['Ideal Rev'].astype(str).str.strip()
+                    _typ     = _df_c['type'].astype(str).str.strip().str.upper()
+                    _proc_h  = pd.to_numeric(_df_c['Capacity Processing Hours'], errors='coerce').fillna(0.0)
+                    _rev_h   = pd.to_numeric(_df_c['Capacity reviewing hours'],  errors='coerce').fillna(0.0)
+
+                    # Proc contribution: Ideal Proc = 'Sr. Accountant' → processing hours
+                    _p_mask = _ip == 'Sr. Accountant'
+                    _proc_contrib = pd.DataFrame({
+                        '_sr': _sr_key[_p_mask],
+                        '_ty': _typ[_p_mask],
+                        '_h':  _proc_h[_p_mask],
+                    })
+
+                    # Rev contribution: Ideal Rev = 'Sr. Accountant' → reviewing hours
+                    _r_mask = _ir == 'Sr. Accountant'
+                    _rev_contrib = pd.DataFrame({
+                        '_sr': _sr_key[_r_mask],
+                        '_ty': _typ[_r_mask],
+                        '_h':  _rev_h[_r_mask],
+                    })
+
+                    # Combine, group by Sr. email × type, pivot
+                    _combined = pd.concat([_proc_contrib, _rev_contrib], ignore_index=True)
+                    if not _combined.empty:
+                        _pivoted = (
+                            _combined.groupby(['_sr', '_ty'])['_h'].sum()
+                            .unstack(fill_value=0.0)
                         )
-                        # Other rows
-                        _other_rev_by_email = (
-                            _df_sr_rows[_df_sr_rows['_type_key'] == 'OTHER']
-                            .groupby('_sr_key')['_rev_h'].sum().to_dict()
-                        )
+                        _mec_rev_by_email   = _pivoted.get('MEC',   pd.Series(dtype=float)).to_dict()
+                        _other_rev_by_email = _pivoted.get('OTHER',  pd.Series(dtype=float)).to_dict()
 
                 # ── Status helper (defined once, used for both status columns) ──
                 def _sr_status(pct):
