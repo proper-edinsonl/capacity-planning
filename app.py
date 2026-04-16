@@ -8603,17 +8603,82 @@ if (
                 except Exception:
                     st.rerun()
 
-        # ── Scenario Automation (same structure as Step 2) ───────────────────
+        # ── Scenario Automation (full replica of Step 2 Automations tab) ────
         with st.expander("⚙️ Scenario Automations", expanded=False):
-            st.caption(
-                "Same logic as Step 2 automations — choose **Client, Task, POD, PMS** and which factor is affected. "
-                "Values are applied from the pre-automation base, replacing Step 3 automation for this scenario. "
+            st.markdown(
+                "**Choose Client, Task, and the metric(s) this automation reduces (%).** "
+                "Use the **Affects** dropdown to select which factors are impacted. "
+                "Values are applied from the pre-automation base (independent of Step 2). "
                 "Cumulative roll-over: each month's % cannot be less than the previous month."
             )
             _s4a_pods_opts = ["", "All"] + (lista_pods or st.session_state.get('_lista_pods', []))
             _s4a_pms_opts  = _get_pms_opts(include_all=True)
             _s4a_cli_opts  = lista_clientes
             _s4a_tsk_opts  = lista_tareas
+
+            # ── Template download ─────────────────────────────────────────────
+            _s4a_tmpl = pd.DataFrame([
+                {"Initiative Name": "AP Automation", "Client": "All",
+                 "Task (Type - Subtype)": "AP - Invoice Processing",
+                 "Affects": "Vol Proc + Vol Rev",
+                 "M1 (%)": 10, "M2 (%)": 15, "M3 (%)": 20,
+                 "M4 (%)": 20, "M5 (%)": 20, "M6 (%)": 20},
+                {"Initiative Name": "AI Coding", "Client": "Acme Corp",
+                 "Task (Type - Subtype)": "All",
+                 "Affects": "AHT Proc",
+                 "M1 (%)": 5, "M2 (%)": 5, "M3 (%)": 10,
+                 "M4 (%)": 10, "M5 (%)": 10, "M6 (%)": 10},
+            ])
+            _s4a_tmpl_buf = BytesIO()
+            _s4a_tmpl.to_excel(_s4a_tmpl_buf, index=False)
+            _s4a_dl_col, _s4a_ul_col = st.columns([1, 1])
+            with _s4a_dl_col:
+                st.download_button(
+                    "📄 Download Automations Template",
+                    _s4a_tmpl_buf.getvalue(),
+                    file_name="S4_Automations_Template.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_s4a_tmpl",
+                )
+            with _s4a_ul_col:
+                _s4a_upload = st.file_uploader(
+                    "📂 Load automations from Excel (optional)",
+                    type=["xlsx", "xls"],
+                    key="s4a_file_load",
+                    label_visibility="collapsed",
+                )
+                st.caption("📂 Load automations from Excel (optional)")
+                if _s4a_upload:
+                    try:
+                        _s4a_loaded = pd.read_excel(_s4a_upload)
+                        _s4a_need_cols = [
+                            "Initiative Name", "POD", "PMS", "Client",
+                            "Task (Type - Subtype)", "Affects",
+                            "M1 (%)", "M2 (%)", "M3 (%)", "M4 (%)", "M5 (%)", "M6 (%)",
+                        ]
+                        for _s4nc in _s4a_need_cols:
+                            if _s4nc not in _s4a_loaded.columns:
+                                _s4a_loaded[_s4nc] = None
+                        _s4a_loaded = _s4a_loaded[_s4a_need_cols].copy()
+                        # Normalise % columns
+                        for _s4pc in ["M1 (%)", "M2 (%)", "M3 (%)", "M4 (%)", "M5 (%)", "M6 (%)"]:
+                            _s4a_loaded[_s4pc] = pd.to_numeric(_s4a_loaded[_s4pc], errors='coerce').fillna(0.0)
+                        # All uploaded rows confirmed by default
+                        _s4a_loaded.insert(0, "Confirmed", True)
+                        st.session_state.s4v2_auto_df = _s4a_loaded
+                        st.success(f"✅ Loaded {len(_s4a_loaded)} automation row(s) — all marked Confirmed.")
+                    except Exception as _s4ae:
+                        st.error(f"❌ Could not load file: {_s4ae}")
+
+            # ── Ensure required columns exist ─────────────────────────────────
+            for _s4col, _s4pos, _s4def in [
+                ("Confirmed",      0, True),
+                ("POD",            2, ""),
+                ("PMS",            3, ""),
+            ]:
+                if _s4col not in st.session_state.s4v2_auto_df.columns:
+                    st.session_state.s4v2_auto_df.insert(_s4pos, _s4col, _s4def)
+
             st.caption("☑️ Check **Confirmed** to include a row. Leave **POD / PMS / Client / Task** blank or 'All' to apply broadly.")
             st.session_state.s4v2_auto_df = st.data_editor(
                 st.session_state.s4v2_auto_df,
@@ -8621,20 +8686,21 @@ if (
                 use_container_width=True,
                 key="s4v2_auto_ed",
                 column_config={
-                    "Confirmed":             st.column_config.CheckboxColumn("✅", default=False, help="Only confirmed rows are applied"),
+                    "Confirmed":             st.column_config.CheckboxColumn("✅", default=True, help="Only confirmed rows are applied"),
                     "Initiative Name":       st.column_config.TextColumn("Initiative Name"),
                     "POD":                   st.column_config.SelectboxColumn("POD",    options=_s4a_pods_opts, default=""),
                     "PMS":                   st.column_config.SelectboxColumn("PMS",    options=_s4a_pms_opts,  default=""),
                     "Client":                st.column_config.SelectboxColumn("Client", options=_s4a_cli_opts,  default="All"),
                     "Task (Type - Subtype)": st.column_config.SelectboxColumn("Task",   options=_s4a_tsk_opts,  default="All"),
-                    "Affects":               st.column_config.SelectboxColumn("Affects", options=AFFECTS_OPTIONS, default="All (Vol + AHT)"),
+                    "Affects":               st.column_config.SelectboxColumn("Affects", options=AFFECTS_OPTIONS, default="All (Vol + AHT)",
+                        help="Vol Proc = Processing Volume | Vol Rev = Review Volume | AHT Proc = Processing Handle Time | AHT Rev = Review Handle Time"),
                     "M1 (%)": st.column_config.NumberColumn("M1 (%)", min_value=0.0, max_value=100.0, default=0.0, format="%.1f%%"),
                     "M2 (%)": st.column_config.NumberColumn("M2 (%)", min_value=0.0, max_value=100.0, default=0.0, format="%.1f%%"),
                     "M3 (%)": st.column_config.NumberColumn("M3 (%)", min_value=0.0, max_value=100.0, default=0.0, format="%.1f%%"),
                     "M4 (%)": st.column_config.NumberColumn("M4 (%)", min_value=0.0, max_value=100.0, default=0.0, format="%.1f%%"),
                     "M5 (%)": st.column_config.NumberColumn("M5 (%)", min_value=0.0, max_value=100.0, default=0.0, format="%.1f%%"),
                     "M6 (%)": st.column_config.NumberColumn("M6 (%)", min_value=0.0, max_value=100.0, default=0.0, format="%.1f%%"),
-                }
+                },
             )
             # Enforce cumulative roll-over (same as Step 2)
             _s4a_pct_cols = ["M1 (%)", "M2 (%)", "M3 (%)", "M4 (%)", "M5 (%)", "M6 (%)"]
