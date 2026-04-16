@@ -3008,13 +3008,15 @@ with tab1:
                             "Select below to queue them for AI prediction (their existing hours are shown for reference)."
                         )
                         _clients_w_data_l = _ob_disp_df[_has_data_m]['Client'].tolist()
-                        # Use multiselect — avoids per-render session_state writes
-                        # that caused React error #185 (infinite update loop)
+                        # Dynamic key: resets widget when client list changes (e.g. filter change)
+                        # so stale session_state from a previous scope never conflicts with
+                        # current options — prevents React error #185 infinite reconciliation loop
+                        _rep_ms_key = f"_ob_replace_ms_{abs(hash(tuple(sorted(_clients_w_data_l))))}"
                         _cur_rep_list = st.multiselect(
                             "🔄 Select clients to replace with AI Prediction:",
                             options=_clients_w_data_l,
                             default=_clients_w_data_l,
-                            key="_ob_replace_multiselect",
+                            key=_rep_ms_key,
                         )
                         _cur_rep = set(_cur_rep_list)
 
@@ -3822,11 +3824,12 @@ if "calc_data" in st.session_state:
                     },
                 )
                 _ob_all_clients = _ob_disp['Client'].tolist()
+                _hs_ob_ms_key = f"hs_ob_ms_{abs(hash(tuple(sorted(_ob_all_clients))))}"
                 _sel_clients = st.multiselect(
                     "Select clients to queue:",
                     options=_ob_all_clients,
                     default=_ob_all_clients,
-                    key="hs_ob_multiselect",
+                    key=_hs_ob_ms_key,
                 )
                 _sel_ob = _ob_disp[_ob_disp['Client'].isin(_sel_clients)]
                 if st.button(
