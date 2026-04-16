@@ -7791,53 +7791,40 @@ if "calc_data" in st.session_state:
                     except Exception:
                         return '—'
 
-                # ── Build name→email map from HC (email is the reliable key) ──
-                # by_sr is keyed by full name; each value has 'email'
-                _name_to_email = {
-                    k.strip().lower(): v.get('email', '').strip().lower()
-                    for k, v in _hc_sr.get('by_sr', {}).items()
-                }
+                # ── Read directly from df_clean — the source of truth ────────
+                # processor (col D) = processing email
+                # reviewer  (col F) = reviewing email
+                # Sr. Accountant (col AD) = Sr. email → unique client count
+                _df_c = st.session_state.get('df_clean', pd.DataFrame())
 
-                # ── final_dashboards['cliente'] has Sr. Accountant (name) + Client ──
-                # Use it to: (a) count clients per Sr. email, (b) build client→email map
-                _fd_cli = _fd_sr.get('cliente', pd.DataFrame())
-                _sr_cli_count_by_email   = {}   # email → unique client count
-                _client_to_sr_email      = {}   # client_lower → sr_email
-                if 'Sr. Accountant' in _fd_cli.columns and 'Client' in _fd_cli.columns:
-                    _fd_cli_w = _fd_cli[_fd_cli['Sr. Accountant'].astype(str).str.strip().ne('')].copy()
-                    _fd_cli_w['_sr_email'] = (
-                        _fd_cli_w['Sr. Accountant'].astype(str).str.strip().str.lower()
-                        .map(_name_to_email).fillna('')
-                    )
-                    # client count per email
+                # Clients assigned: unique clients per Sr. email (col AD)
+                _sr_cli_count_by_email = {}
+                if 'Sr. Accountant' in _df_c.columns and 'client_name' in _df_c.columns:
                     _sr_cli_count_by_email = (
-                        _fd_cli_w[_fd_cli_w['_sr_email'].ne('')]
-                        .groupby('_sr_email')['Client'].nunique()
+                        _df_c[_df_c['Sr. Accountant'].astype(str).str.strip().ne('')]
+                        .groupby(_df_c['Sr. Accountant'].astype(str).str.lower().str.strip())
+                        ['client_name'].nunique()
                         .to_dict()
-                    )
-                    # client→email lookup for productive hours join
-                    _client_to_sr_email = (
-                        _fd_cli_w[_fd_cli_w['_sr_email'].ne('')]
-                        .groupby(_fd_cli_w['Client'].astype(str).str.lower().str.strip())['_sr_email']
-                        .first().to_dict()
                     )
 
-                # ── Productive hours from df_resumen_base (Productive Hrs NOT dropped there) ──
-                # df_resumen_base has: POD, Client, Required Role, M{n} - Productive Hours
-                _df_rb_sr   = _cd_sr.get('df_resumen_base', pd.DataFrame())
+                # Productive hours: processing hrs (processor col) + reviewing hrs (reviewer col)
                 _sr_prod_hrs_by_email = {}
-                if (not _df_rb_sr.empty and 'Client' in _df_rb_sr.columns
-                        and _sr_prod_col in _df_rb_sr.columns and _client_to_sr_email):
-                    _rb_w = _df_rb_sr.copy()
-                    _rb_w['_sr_email'] = (
-                        _rb_w['Client'].astype(str).str.lower().str.strip()
-                        .map(_client_to_sr_email).fillna('')
+                _proc_h = 'Capacity Processing Hours'
+                _rev_h  = 'Capacity reviewing hours'
+                if ('processor' in _df_c.columns and _proc_h in _df_c.columns
+                        and 'reviewer' in _df_c.columns and _rev_h in _df_c.columns):
+                    _proc_map = (
+                        _df_c.groupby(_df_c['processor'].astype(str).str.lower().str.strip())[_proc_h]
+                        .sum().to_dict()
                     )
-                    _sr_prod_hrs_by_email = (
-                        _rb_w[_rb_w['_sr_email'].ne('')]
-                        .groupby('_sr_email')[_sr_prod_col].sum()
-                        .to_dict()
+                    _rev_map = (
+                        _df_c.groupby(_df_c['reviewer'].astype(str).str.lower().str.strip())[_rev_h]
+                        .sum().to_dict()
                     )
+                    for _em in set(_proc_map) | set(_rev_map):
+                        _sr_prod_hrs_by_email[_em] = (
+                            float(_proc_map.get(_em, 0.0)) + float(_rev_map.get(_em, 0.0))
+                        )
 
                 # Build table rows — keyed entirely by email
                 _sr_table_rows = []
