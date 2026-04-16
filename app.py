@@ -2817,38 +2817,39 @@ _stc_main_scroll.html("""
                   || doc.querySelector('section.main');
     if (_capTarget) _capObserver.observe(_capTarget, { childList: true, subtree: false });
 
-    // ── Floating "Fix Scroll" button ─────────────────────────────────────
+    // ── Floating "Fix Scroll" hint pill ──────────────────────────────────
     if (!doc.getElementById('cap-fix-scroll-btn')) {
         var _btn = doc.createElement('button');
         _btn.id = 'cap-fix-scroll-btn';
-        _btn.title = 'Fix scroll bar';
-        _btn.textContent = '⇕';
+        _btn.title = 'Click to unlock scroll — or press the ↓ arrow key on your keyboard';
+        _btn.innerHTML = '⇕&nbsp;<span style="font-size:11px;font-weight:600;letter-spacing:0.02em">Scroll stuck? Press ↓ or click</span>';
         _btn.style.cssText = [
             'position:fixed',
             'bottom:18px',
             'right:18px',
             'z-index:99999',
-            'width:36px',
-            'height:36px',
-            'border-radius:50%',
+            'padding:0 14px',
+            'height:34px',
+            'border-radius:17px',
             'border:1.5px solid rgba(255,255,255,0.18)',
-            'background:rgba(30,33,48,0.88)',
+            'background:rgba(30,33,48,0.92)',
             'color:#cdd3f0',
-            'font-size:16px',
+            'font-size:15px',
             'cursor:pointer',
-            'box-shadow:0 2px 10px rgba(0,0,0,0.45)',
+            'box-shadow:0 2px 12px rgba(0,0,0,0.5)',
             'display:flex',
             'align-items:center',
-            'justify-content:center',
+            'gap:4px',
             'transition:background 0.2s',
+            'white-space:nowrap',
             'line-height:1',
         ].join(';');
-        _btn.onmouseover = function(){ _btn.style.background = 'rgba(255,75,75,0.85)'; };
-        _btn.onmouseout  = function(){ _btn.style.background = 'rgba(30,33,48,0.88)'; };
+        _btn.onmouseover = function(){ _btn.style.background = 'rgba(59,130,246,0.85)'; };
+        _btn.onmouseout  = function(){ _btn.style.background = 'rgba(30,33,48,0.92)'; };
         _btn.onclick = function(){
             refreshScroll();
-            _btn.style.background = 'rgba(50,200,120,0.85)';
-            setTimeout(function(){ _btn.style.background = 'rgba(30,33,48,0.88)'; }, 600);
+            _btn.style.background = 'rgba(34,197,94,0.85)';
+            setTimeout(function(){ _btn.style.background = 'rgba(30,33,48,0.92)'; }, 700);
         };
         doc.body.appendChild(_btn);
     }
