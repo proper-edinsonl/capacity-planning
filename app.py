@@ -2848,26 +2848,56 @@ with tab1:
                 df_temp['task_name'] = df_temp['type'].astype(str) + " - " + df_temp['subtype'].astype(str)
                 lista_tareas = ["All"] + sorted(df_temp['task_name'].dropna().unique().tolist())
 
+            # Store a slim lookup table so on_change callbacks can access it
+            _df_lookup = df_temp[
+                [c for c in ['client_name', 'POD', 'Sr. Accountant'] if c in df_temp.columns]
+            ].drop_duplicates()
+            st.session_state['_s0_df_lookup'] = _df_lookup
+
+            # on_change: when POD changes → auto-populate Sr. and Clients
+            def _on_pod_change():
+                _df = st.session_state.get('_s0_df_lookup', pd.DataFrame())
+                _pods = st.session_state.get('_s0_pods_ms', [])
+                if _pods and not _df.empty:
+                    _m = _df['POD'].isin(_pods) if 'POD' in _df.columns else pd.Series(True, index=_df.index)
+                    if 'Sr. Accountant' in _df.columns:
+                        st.session_state['_s0_srs_ms'] = sorted(_df[_m]['Sr. Accountant'].dropna().astype(str).unique().tolist())
+                    if 'client_name' in _df.columns:
+                        st.session_state['_s0_clients_ms'] = sorted(_df[_m]['client_name'].dropna().astype(str).unique().tolist())
+                else:
+                    st.session_state['_s0_srs_ms']     = []
+                    st.session_state['_s0_clients_ms'] = []
+                st.session_state['_filt_pods'] = _pods
+                st.session_state['_filt_srs']  = st.session_state.get('_s0_srs_ms', [])
+
+            # on_change: when Sr. changes → auto-populate Clients
+            def _on_sr_change():
+                _df = st.session_state.get('_s0_df_lookup', pd.DataFrame())
+                _pods = st.session_state.get('_s0_pods_ms', [])
+                _srs  = st.session_state.get('_s0_srs_ms', [])
+                if (_pods or _srs) and not _df.empty:
+                    _m = pd.Series(True, index=_df.index)
+                    if _pods and 'POD' in _df.columns:
+                        _m &= _df['POD'].isin(_pods)
+                    if _srs and 'Sr. Accountant' in _df.columns:
+                        _m &= _df['Sr. Accountant'].isin(_srs)
+                    if 'client_name' in _df.columns:
+                        st.session_state['_s0_clients_ms'] = sorted(_df[_m]['client_name'].dropna().astype(str).unique().tolist())
+                else:
+                    st.session_state['_s0_clients_ms'] = []
+                st.session_state['_filt_srs'] = _srs
+
             col1, col2, col3 = st.columns(3)
             with col1:
-                # No default= here — key already handles persistence across reruns.
-                # Passing both default= and key= can cause React reconciliation loops.
                 selected_pods = st.multiselect(
                     "Filter by POD", options=all_pods,
-                    key="_s0_pods_ms",
+                    key="_s0_pods_ms", on_change=_on_pod_change,
                 )
             with col2:
                 selected_srs = st.multiselect(
                     "Filter by Sr. Accountant", options=all_srs,
-                    key="_s0_srs_ms",
+                    key="_s0_srs_ms", on_change=_on_sr_change,
                 )
-
-            # Sync to _filt_pods/_filt_srs only when value changes (other steps read these)
-            if st.session_state.get('_filt_pods') != selected_pods:
-                st.session_state['_filt_pods'] = selected_pods
-            if st.session_state.get('_filt_srs') != selected_srs:
-                st.session_state['_filt_srs']  = selected_srs
-
             with col3:
                 selected_clients_final = st.multiselect(
                     "Clients to Process", options=all_clients,
@@ -2876,8 +2906,14 @@ with tab1:
                 if not selected_clients_final:
                     st.info("ℹ️ If left empty, the entire database will be processed.")
 
-            if st.session_state.get('_filt_clients') != selected_clients_final:
-                st.session_state['_filt_clients'] = selected_clients_final
+            # Read current values (widgets already set these via on_change or key)
+            selected_pods          = st.session_state.get('_s0_pods_ms', [])
+            selected_srs           = st.session_state.get('_s0_srs_ms', [])
+            selected_clients_final = st.session_state.get('_s0_clients_ms', [])
+            # Keep _filt_* in sync for downstream steps
+            st.session_state['_filt_pods']    = selected_pods
+            st.session_state['_filt_srs']     = selected_srs
+            st.session_state['_filt_clients'] = selected_clients_final
 
             # ── Confirmation of active filter — shown BEFORE onboarding list ─────
             st.divider()
