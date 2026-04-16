@@ -3772,17 +3772,16 @@ if "calc_data" in st.session_state:
                             )
 
         # ── D. Onboarding New Clients ─────────────────────────────────────
-        _onboarding_lcs = {'onboarding', 'customer', 'new client'}
+        # Any HubSpot client not in baseline — regardless of lifecycle — should be
+        # available for AI projection (e.g. lifecycle="Client" but never in master DB)
         _df_onboard = _df_hs_view[
-            _df_hs_view['_lifecycle'].str.lower().isin(_onboarding_lcs) &
             ~_df_hs_view['client_name'].str.lower().str.strip().isin(_baseline_clients)
         ].copy()
 
         if not _df_onboard.empty:
-            with st.expander(f"🆕 New Onboarding Clients ({len(_df_onboard)}) — Not in Baseline", expanded=True):
+            with st.expander(f"🆕 New Clients — Not in Baseline ({len(_df_onboard)})", expanded=True):
                 st.info(
-                    f"**{len(_df_onboard)} client(s)** found in HubSpot with Onboarding/Customer lifecycle "
-                    "but not present in the current baseline. "
+                    f"**{len(_df_onboard)} client(s)** found in HubSpot but not present in the current baseline. "
                     "You can run the AI Prediction for them in Step 4."
                 )
                 _ob_disp = _df_onboard[[
