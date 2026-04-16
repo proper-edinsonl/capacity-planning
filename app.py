@@ -2463,6 +2463,54 @@ _stc_main_scroll.html("""
             ev.stopPropagation();
         }
     }, { passive: false, capture: true });
+
+    // ── MutationObserver: auto-refresh scroll whenever content changes ────
+    function refreshScroll(){
+        win.dispatchEvent(new Event('resize'));
+        var p = pageScroller();
+        if (p) { var t = p.scrollTop; p.scrollTop = t + 1; p.scrollTop = t; }
+    }
+    var _capObserver = new MutationObserver(function(){ refreshScroll(); });
+    var _capTarget = doc.querySelector('[data-testid="stAppViewBlockContainer"]')
+                  || doc.querySelector('.main .block-container')
+                  || doc.querySelector('section.main');
+    if (_capTarget) _capObserver.observe(_capTarget, { childList: true, subtree: false });
+
+    // ── Floating "Fix Scroll" button ─────────────────────────────────────
+    if (!doc.getElementById('cap-fix-scroll-btn')) {
+        var _btn = doc.createElement('button');
+        _btn.id = 'cap-fix-scroll-btn';
+        _btn.title = 'Fix scroll bar';
+        _btn.textContent = '⇕';
+        _btn.style.cssText = [
+            'position:fixed',
+            'bottom:18px',
+            'right:18px',
+            'z-index:99999',
+            'width:36px',
+            'height:36px',
+            'border-radius:50%',
+            'border:1.5px solid rgba(255,255,255,0.18)',
+            'background:rgba(30,33,48,0.88)',
+            'color:#cdd3f0',
+            'font-size:16px',
+            'cursor:pointer',
+            'box-shadow:0 2px 10px rgba(0,0,0,0.45)',
+            'display:flex',
+            'align-items:center',
+            'justify-content:center',
+            'transition:background 0.2s',
+            'line-height:1',
+        ].join(';');
+        _btn.onmouseover = function(){ _btn.style.background = 'rgba(255,75,75,0.85)'; };
+        _btn.onmouseout  = function(){ _btn.style.background = 'rgba(30,33,48,0.88)'; };
+        _btn.onclick = function(){
+            refreshScroll();
+            _btn.style.background = 'rgba(50,200,120,0.85)';
+            setTimeout(function(){ _btn.style.background = 'rgba(30,33,48,0.88)'; }, 600);
+        };
+        doc.body.appendChild(_btn);
+    }
 })();
 </script>
 """, height=0)
@@ -9249,16 +9297,66 @@ if (
     # ── end of _s4v2_inputs_frag ────────────────────────────────────────────────
 
     # ── Step 4 progress indicator ────────────────────────────────────────────────
-    # The Step 4 display fragment can take a moment to build the scenario table
-    # (precomputes 6 months × many rows). Show a transient progress bar while
-    # Streamlit renders the fragment so the user knows loading is in progress.
+    # Full-screen modal overlay that blocks interaction while Step 4 builds.
+    # Injected into the parent document via components.html; auto-dismisses when done.
     if not st.session_state.get('_s4_ready', False):
-        _s4_prog = st.progress(0, text="⏳ Loading Step 4 Capacity Scenario Planner…")
-        for _s4_pct in range(10, 101, 10):
-            import time as _time_s4
-            _time_s4.sleep(0.04)
-            _s4_prog.progress(_s4_pct, text=f"⏳ Initialising Step 4… {_s4_pct}%")
-        _s4_prog.empty()
+        import time as _time_s4
+        import streamlit.components.v1 as _stc_s4prog
+        _stc_s4prog.html("""
+<script>
+(function(){
+    var doc = window.parent.document;
+    if (doc.getElementById('cap-s4-overlay')) return;
+
+    // ── Full-screen blocking overlay ──────────────────────────────────────
+    var ov = doc.createElement('div');
+    ov.id = 'cap-s4-overlay';
+    ov.style.cssText = [
+        'position:fixed','top:0','left:0','width:100%','height:100%',
+        'background:rgba(10,12,20,0.82)',
+        'z-index:2147483647',
+        'display:flex','align-items:center','justify-content:center',
+        'backdrop-filter:blur(3px)',
+        '-webkit-backdrop-filter:blur(3px)',
+    ].join(';');
+
+    ov.innerHTML = [
+        '<div style="background:#1a1e2e;border-radius:18px;padding:48px 64px;',
+        'text-align:center;box-shadow:0 16px 48px rgba(0,0,0,0.7);min-width:340px;max-width:90vw;">',
+        '<div style="font-size:2.6rem;margin-bottom:14px;">⚙️</div>',
+        '<div style="color:#e8ecff;font-size:1.15rem;font-weight:700;margin-bottom:6px;">',
+        'Loading Step 4 Scenario Planner</div>',
+        '<div style="color:#7a85aa;font-size:0.85rem;margin-bottom:24px;">',
+        'Please wait while the scenario is being prepared…</div>',
+        '<div style="background:#252a3d;border-radius:100px;height:10px;overflow:hidden;margin-bottom:10px;">',
+        '<div id="cap-s4-bar" style="background:linear-gradient(90deg,#ff4b4b,#ff7b5e);',
+        'height:100%;width:0%;border-radius:100px;transition:width 80ms linear;"></div>',
+        '</div>',
+        '<div id="cap-s4-pct" style="color:#9ea8c7;font-size:0.82rem;font-variant-numeric:tabular-nums;">0%</div>',
+        '</div>',
+    ].join('');
+    doc.body.appendChild(ov);
+
+    // ── Animate: 0 → 100% over ~3 s, then fade out ───────────────────────
+    var pct = 0;
+    var bar = doc.getElementById('cap-s4-bar');
+    var lbl = doc.getElementById('cap-s4-pct');
+    var iv  = setInterval(function(){
+        pct = Math.min(pct + 1.4, 100);
+        bar.style.width = pct + '%';
+        lbl.textContent = Math.round(pct) + '%';
+        if (pct >= 100){
+            clearInterval(iv);
+            setTimeout(function(){
+                ov.style.transition = 'opacity 0.5s ease';
+                ov.style.opacity = '0';
+                setTimeout(function(){ if (ov.parentNode) ov.remove(); }, 520);
+            }, 400);
+        }
+    }, 42);   // 42 ms × ~72 steps ≈ 3 s total
+})();
+</script>
+""", height=0)
         st.session_state['_s4_ready'] = True
 
     _s4v2_fragment()          # display: scope, params, computation, table, comparison
