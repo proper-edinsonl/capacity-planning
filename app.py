@@ -4432,7 +4432,7 @@ if "calc_data" in st.session_state:
             with _mv_tab_pod:
                 _pod_grp = (
                     _cmap_view.groupby('pod')['client_name']
-                    .apply(lambda x: ', '.join(sorted(x.tolist())))
+                    .apply(lambda x: ', '.join(sorted(str(v) for v in x if pd.notna(v) and str(v).strip())))
                     .reset_index()
                     .rename(columns={'pod': 'POD', 'client_name': 'Clients'})
                     .sort_values('POD')
