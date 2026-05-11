@@ -1866,8 +1866,9 @@ def _process_hc_report(file_bytes: bytes):
     )
     employees = [
         {
-            'email':            str(row.get('Work Email', '')).strip().lower(),
-            'name':             str(row.get('Full name',  '')).strip(),
+            'email':            str(row.get('Work Email',    '')).strip().lower(),
+            'manager_email':    str(row.get('Manager email', '')).strip().lower(),
+            'name':             str(row.get('Full name',     '')).strip(),
             'role':             row['Capacity Role'],
             'pod':              row['POD'],
             'start_date':       row['_sd'],
@@ -6962,25 +6963,39 @@ if "calc_data" in st.session_state:
                                         _r = _proles[_proles['Required Role'] == role_name]
                                         return float(_r[c_fte_col].sum()) if c_fte_col in _r.columns else 0
 
-                                    # Total HC only counts the 4 productive roles
-                                    # (Accountant I/II, General Acc., Sr. Acc.) — managers
-                                    # live in 'Other' and are surfaced in their own row.
-                                    hc_p_tot  = sum(
-                                        v for k, v in _pod_hc.items() if k != 'Other'
-                                    ) or None
-                                    hc_p_acc1 = _pod_hc.get('Accountant I')
-                                    hc_p_acc2 = _pod_hc.get('Accountant II')
-                                    hc_p_gen  = _pod_hc.get('General Accountant')
-                                    hc_p_sr   = _pod_hc.get('Sr. Accountant')
-                                    # Manager count for this POD (normalized lookup)
-                                    _p_mgr_by_pod = _hc.get('mgr_by_pod', {}) if _hc else {}
-                                    _p_mgr_norm   = {
-                                        str(k).lower().replace(' ', '').strip(): int(v)
-                                        for k, v in _p_mgr_by_pod.items()
-                                    }
-                                    hc_p_mgr  = _p_mgr_norm.get(
-                                        str(_pod_name).lower().replace(' ', '').strip(), 0
-                                    )
+                                    # Dynamic HC: compute FTE for this POD for this month's boundaries
+                                    _pd_mes_date = today + relativedelta(months=_month_offsets[i])
+                                    _pd_m_start  = pd.Timestamp(_pd_mes_date.replace(day=1).date())
+                                    _pd_m_end    = pd.Timestamp((_pd_m_start + relativedelta(months=1) - relativedelta(days=1)).date())
+                                    _dyn_pod_emp = [
+                                        e for e in (_hc.get('employees') or [])
+                                        if str(e['pod']).lower().replace(' ', '').strip() == _pod_nm_norm
+                                    ] if _hc else []
+                                    if _dyn_pod_emp:
+                                        _dyn_p_hc = _compute_dynamic_hc(_dyn_pod_emp, _pd_m_start, _pd_m_end)
+                                        hc_p_acc1 = _dyn_p_hc.get('Accountant I',       0.0) or None
+                                        hc_p_acc2 = _dyn_p_hc.get('Accountant II',      0.0) or None
+                                        hc_p_gen  = _dyn_p_hc.get('General Accountant', 0.0) or None
+                                        hc_p_sr   = _dyn_p_hc.get('Sr. Accountant',     0.0) or None
+                                        hc_p_mgr  = (_dyn_p_hc.get('Acct. Manager', 0.0) + _dyn_p_hc.get('Asst. Manager', 0.0))
+                                        hc_p_tot  = (hc_p_acc1 or 0) + (hc_p_acc2 or 0) + (hc_p_gen or 0) + (hc_p_sr or 0) or None
+                                    else:
+                                        # Fallback to static _pod_hc
+                                        hc_p_acc1 = _pod_hc.get('Accountant I')
+                                        hc_p_acc2 = _pod_hc.get('Accountant II')
+                                        hc_p_gen  = _pod_hc.get('General Accountant')
+                                        hc_p_sr   = _pod_hc.get('Sr. Accountant')
+                                        hc_p_tot  = sum(
+                                            v for k, v in _pod_hc.items() if k != 'Other'
+                                        ) or None
+                                        _p_mgr_by_pod = _hc.get('mgr_by_pod', {}) if _hc else {}
+                                        _p_mgr_norm   = {
+                                            str(k).lower().replace(' ', '').strip(): int(v)
+                                            for k, v in _p_mgr_by_pod.items()
+                                        }
+                                        hc_p_mgr  = _p_mgr_norm.get(
+                                            str(_pod_name).lower().replace(' ', '').strip(), 0
+                                        )
                                     d_pod     = round(hc_p_tot - p_fte, 2) if hc_p_tot is not None else None
                                     d_p_acc1  = round(hc_p_acc1 - _prole_fte('Accountant I'),       2) if hc_p_acc1 is not None else None
                                     d_p_acc2  = round(hc_p_acc2 - _prole_fte('Accountant II'),      2) if hc_p_acc2 is not None else None
@@ -7394,6 +7409,26 @@ if "calc_data" in st.session_state:
                                     _churn_rows = _sr_sel_df[_sr_sel_df['Client'].astype(str).str.strip().str.lower().isin(_churn_cli_names)]
                                     _sr_churn_hrs = 0.0  # reassigned below from c_base_col
                                     _sr_churn_mrr = float(_duc.loc[_mask_churn, 'MRR'].sum())
+
+                                # Dynamic HC for this Sr. this month
+                                _sr_mes_d   = today + relativedelta(months=_month_offsets[i])
+                                _sr_m_start = pd.Timestamp(_sr_mes_d.replace(day=1).date())
+                                _sr_m_end   = pd.Timestamp((_sr_m_start + relativedelta(months=1) - relativedelta(days=1)).date())
+                                _sr_email   = str(_sr_hc_data.get('email', '')).strip().lower()
+                                _dyn_sr_emp = [
+                                    e for e in (_hc.get('employees') or [])
+                                    if (e.get('manager_email', '') == _sr_email
+                                        or e.get('email', '') == _sr_email)
+                                ] if (_hc and _sr_email) else []
+                                if _dyn_sr_emp:
+                                    _dyn_sr_hc = _compute_dynamic_hc(_dyn_sr_emp, _sr_m_start, _sr_m_end)
+                                    hc_sr_acc1 = _dyn_sr_hc.get('Accountant I',       0.0) or None
+                                    hc_sr_acc2 = _dyn_sr_hc.get('Accountant II',      0.0) or None
+                                    hc_sr_gen  = _dyn_sr_hc.get('General Accountant', 0.0) or None
+                                    hc_sr_sr   = _dyn_sr_hc.get('Sr. Accountant',     0.0) or None
+                                    hc_sr_mgr  = int(_dyn_sr_hc.get('Acct. Manager', 0.0) + _dyn_sr_hc.get('Asst. Manager', 0.0))
+                                    hc_sr_tot  = (hc_sr_acc1 or 0) + (hc_sr_acc2 or 0) + (hc_sr_gen or 0) + (hc_sr_sr or 0) or None
+                                # (else: static hc_sr_tot / hc_sr_acc1 / etc. from before loop remain in effect)
 
                                 d_sr_tot  = round(hc_sr_tot  - _srv(c_fte_col),          2) if hc_sr_tot  is not None else None
                                 d_sr_acc1 = round(hc_sr_acc1 - _srole_fte('Accountant I'),       2) if hc_sr_acc1 is not None else None
