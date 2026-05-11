@@ -6475,20 +6475,19 @@ if "calc_data" in st.session_state:
                             sum(v for v in _fcast_hc.values() if v is not None)
                             if any(v is not None for v in _fcast_hc.values()) else None
                         )
-                        # New HC Required = Required FTEs + forecasted additional HC
-                        _new_hc_req = (
-                            float(fte_total or 0) + _fcast_hc_sum
-                            if _fcast_hc_sum is not None else None
-                        )
-                        # Forecasted HC = Actual HC + forecasted additional HC
+                        # New HC Required = ONLY the incremental new hires for growth
+                        # (NOT fte_total — that would inflate the number with existing requirements)
+                        _new_hc_req = _fcast_hc_sum   # e.g. 13.7, not 373
+                        # Forecasted HC = Actual HC + new hires
                         _fcast_total_hc = (
                             float(hc_total or 0) + _fcast_hc_sum
                             if (hc_total is not None and _fcast_hc_sum is not None) else None
                         )
-                        # Forecast Over/Under = New HC Required - Forecasted HC
+                        # Forecast Over/Under = Forecasted HC − (existing required + new required)
+                        # Answers: "after hiring for growth, are we over or under total demand?"
                         _fcast_over_under = (
-                            _new_hc_req - _fcast_total_hc
-                            if (_new_hc_req is not None and _fcast_total_hc is not None) else None
+                            _fcast_total_hc - (float(fte_total or 0) + _fcast_hc_sum)
+                            if (_fcast_total_hc is not None and _fcast_hc_sum is not None) else None
                         )
                         # Write forecast rows
                         rows.setdefault("━ MRR Forecast",                     {})[col] = _fmt(_fcast_mrr_growth,  '$')
