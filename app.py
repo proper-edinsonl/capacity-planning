@@ -1842,6 +1842,40 @@ def _process_hc_report(file_bytes: bytes):
     pod_mask = active['Department unit'].astype(str).str.strip().str.lower().str.startswith('pod')
     active_pods = active[pod_mask].copy()
 
+    # ── Per-employee roster for dynamic HC (Ramp Up / Ramp Down) ─────────────
+    # Includes ALL pod employees regardless of Worker Status so that employees
+    # starting or leaving mid-month are counted proportionally (via Start Date
+    # + 14-day ramp and Last Working Day). Static totals above stay unchanged.
+    _cap_roles_dyn = {'Accountant I', 'Accountant II', 'General Accountant',
+                      'Sr. Accountant', 'Acct. Manager', 'Asst. Manager'}
+    _all_pod_mask = df['Department unit'].astype(str).str.strip().str.lower().str.startswith('pod')
+    _all_pod_df   = df[_all_pod_mask].copy()
+    _all_pod_df['Capacity Role'] = (
+        _all_pod_df['Job title'].astype(str).str.lower().str.strip()
+        .map(_HC_ROLE_MAP).fillna('Other')
+    )
+    _all_pod_df['POD'] = _all_pod_df['Department unit'].astype(str).str.strip().str.title()
+    _all_pod_df = _all_pod_df[_all_pod_df['Capacity Role'].isin(_cap_roles_dyn)]
+    _all_pod_df['_sd']  = pd.to_datetime(
+        _all_pod_df['Start Date']       if 'Start Date'       in _all_pod_df.columns else pd.NaT,
+        errors='coerce'
+    )
+    _all_pod_df['_lwd'] = pd.to_datetime(
+        _all_pod_df['Last Working Day'] if 'Last Working Day' in _all_pod_df.columns else pd.NaT,
+        errors='coerce'
+    )
+    employees = [
+        {
+            'email':            str(row.get('Work Email', '')).strip().lower(),
+            'name':             str(row.get('Full name',  '')).strip(),
+            'role':             row['Capacity Role'],
+            'pod':              row['POD'],
+            'start_date':       row['_sd'],
+            'last_working_day': row['_lwd'],
+        }
+        for _, row in _all_pod_df.iterrows()
+    ]
+
     active_pods['Capacity Role'] = (
         active_pods['Job title'].astype(str).str.lower().str.strip()
         .map(_HC_ROLE_MAP).fillna('Other')
@@ -1977,6 +2011,7 @@ def _process_hc_report(file_bytes: bytes):
         'mix_pct':        mix_pct,
         'detail':         active_pods[['Full name', 'Work Email', 'Job title', 'Capacity Role', 'POD']],
         'attrited_detail': attrited_detail,
+        'employees':       employees,   # [{email,name,role,pod,start_date,last_working_day}] — all pods, all statuses
     }
 
 
@@ -2400,6 +2435,55 @@ today = _base_date + relativedelta(months=1)
 _month_offsets   = list(range(-1, 5))   # -1=base month, 0=month after base, 1..4=forward
 meses_proyeccion = [(today + relativedelta(months=off)).strftime("%B %Y") for off in _month_offsets]
 roles_permitidos = ["Accountant I", "Accountant II", "General Accountant", "Sr. Accountant"]
+
+def _compute_dynamic_hc(emp_list, m_start, m_end):
+    """
+    Compute fractional FTE per Capacity Role for month [m_start, m_end].
+
+    Rules:
+    - Productive start = Start Date + 14 days (Ramp Up grace period).
+      If Start Date is NaT the employee is assumed fully productive.
+    - End = Last Working Day (Ramp Down). If NaT the employee is still active.
+    - FTE per employee = busday_count(eff_start, eff_end+1)
+                         / busday_count(m_start,  m_end+1)
+      clamped to [0.0, 1.0].
+
+    Returns dict {role: total_fte} — only roles with FTE > 0.
+    """
+    from collections import defaultdict
+    role_fte = defaultdict(float)
+    try:
+        total_bdays = int(np.busday_count(
+            m_start.date(), (m_end + pd.Timedelta(days=1)).date()
+        ))
+    except Exception:
+        total_bdays = 21   # safe fallback
+    if total_bdays <= 0:
+        return {}
+    for emp in emp_list:
+        sd  = emp.get('start_date')
+        lwd = emp.get('last_working_day')
+        # Ramp Up: productive from Start Date + 14 days
+        if pd.notna(sd):
+            ramp_start = sd + pd.Timedelta(days=14)
+        else:
+            ramp_start = m_start   # no date → assume fully active
+        eff_start = max(m_start, ramp_start)
+        # Ramp Down: last day active = last_working_day (NaT → still active)
+        eff_end = min(m_end, lwd) if pd.notna(lwd) else m_end
+        if eff_start > eff_end:
+            continue   # not active at all this month
+        try:
+            work_bdays = int(np.busday_count(
+                eff_start.date(), (eff_end + pd.Timedelta(days=1)).date()
+            ))
+        except Exception:
+            continue
+        fte = max(0.0, min(1.0, work_bdays / total_bdays))
+        if fte > 0:
+            role_fte[emp['role']] += fte
+    return dict(role_fte)
+
 
 def _build_proj_export_df(pdata):
     """Tabular MRR Forecast summary (M3-M6) from _projection_data dict.
@@ -6310,13 +6394,43 @@ if "calc_data" in st.session_state:
 
                         cap_prod = (prod_hrs_b / current_hrs * 100) if current_hrs > 0 else 0
 
-                        hc_total = _hc_wf['total']              if _hc_wf else None
-                        hc_acc1  = _hc_wf['by_role'].get('Accountant I', 0)      if _hc_wf else None
-                        hc_acc2  = _hc_wf['by_role'].get('Accountant II', 0)     if _hc_wf else None
-                        hc_gen   = _hc_wf['by_role'].get('General Accountant', 0) if _hc_wf else None
-                        hc_sr    = _hc_wf['by_role'].get('Sr. Accountant', 0)    if _hc_wf else None
-                        hc_other = _hc_wf['by_role'].get('Other', 0)             if _hc_wf else None
-                        hc_mgr   = _hc_wf.get('mgr_total', 0)                    if _hc_wf else None
+                        # ── Dynamic HC: fractional FTEs per role for this month ──────────
+                        # Uses Start Date + 14-day ramp and Last Working Day so employees
+                        # joining or leaving mid-month are counted proportionally.
+                        _dyn_hc = {}
+                        if _hc_wf:
+                            _dyn_emp = list(_hc_wf.get('employees') or [])
+                            # Filter to selected PODs when a POD scope is active
+                            if _dyn_emp and _dash_sel_pods:
+                                _dyn_pod_n = {
+                                    str(p).lower().replace(' ', '').strip()
+                                    for p in _dash_sel_pods
+                                }
+                                _dyn_emp = [
+                                    e for e in _dyn_emp
+                                    if str(e['pod']).lower().replace(' ', '').strip() in _dyn_pod_n
+                                ]
+                            if _dyn_emp:
+                                _dyn_hc = _compute_dynamic_hc(_dyn_emp, _aht_start_m, _aht_end_m)
+                                hc_acc1  = _dyn_hc.get('Accountant I',       0.0)
+                                hc_acc2  = _dyn_hc.get('Accountant II',      0.0)
+                                hc_gen   = _dyn_hc.get('General Accountant', 0.0)
+                                hc_sr    = _dyn_hc.get('Sr. Accountant',     0.0)
+                                hc_other = 0.0   # 'Other' excluded from capacity roles
+                                hc_mgr   = (_dyn_hc.get('Acct. Manager', 0.0)
+                                            + _dyn_hc.get('Asst. Manager', 0.0))
+                                hc_total = hc_acc1 + hc_acc2 + hc_gen + hc_sr
+                            else:
+                                # Fallback: employees list not yet present (older HC file)
+                                hc_total = float(_hc_wf.get('total') or 0)
+                                hc_acc1  = float(_hc_wf['by_role'].get('Accountant I',       0))
+                                hc_acc2  = float(_hc_wf['by_role'].get('Accountant II',      0))
+                                hc_gen   = float(_hc_wf['by_role'].get('General Accountant', 0))
+                                hc_sr    = float(_hc_wf['by_role'].get('Sr. Accountant',     0))
+                                hc_other = float(_hc_wf['by_role'].get('Other', 0))
+                                hc_mgr   = float(_hc_wf.get('mgr_total') or 0)
+                        else:
+                            hc_total = hc_acc1 = hc_acc2 = hc_gen = hc_sr = hc_other = hc_mgr = None
 
                         act_hc_prod = (
                             (float(hc_acc1 or 0) * util_acc1 +
@@ -6456,7 +6570,17 @@ if "calc_data" in st.session_state:
                             if _fcast_mrr_growth is not None else None
                         )
                         # Mix % for each productive role (from HC report)
-                        _hc_mix_wf = _hc_wf.get('mix_pct', {}) if _hc_wf else {}
+                        # Mix % from dynamic HC of this month (productive + managers denominator)
+                        # so the HC forecast reflects actual role ratios for this specific month.
+                        _dyn_total_wm = float(hc_total or 0) + float(hc_mgr or 0)
+                        if _dyn_hc and _dyn_total_wm > 0:
+                            _hc_mix_wf = {
+                                r: round(_dyn_hc.get(r, 0.0) / _dyn_total_wm, 6)
+                                for r in ['Accountant I', 'Accountant II',
+                                          'General Accountant', 'Sr. Accountant']
+                            }
+                        else:
+                            _hc_mix_wf = _hc_wf.get('mix_pct', {}) if _hc_wf else {}
                         # Forecasted HC per role = (mix% × budget) / role_cost
                         _roles_cost = {
                             'Accountant I':       cost_acc1,
