@@ -1872,6 +1872,15 @@ def _process_hc_report(file_bytes: bytes):
                    .count().reset_index().rename(columns={'Full name': 'HC'}))
     total       = int(active_pods['Capacity Role'].isin(_productive_roles).sum())  # productive roles only (no managers)
 
+    # ── HC Mix % (denominator = productive roles + managers = full accounting HC) ──
+    _hc_total_with_mgr = total + n_mgr_total
+    mix_pct = {}
+    if _hc_total_with_mgr > 0:
+        for _rn in ['Accountant I', 'Accountant II', 'General Accountant', 'Sr. Accountant']:
+            mix_pct[_rn] = round(by_role.get(_rn, 0) / _hc_total_with_mgr, 6)
+        mix_pct['Asst. Manager'] = round(n_asst_mgr / _hc_total_with_mgr, 6)
+        mix_pct['Acct. Manager'] = round(n_acct_mgr / _hc_total_with_mgr, 6)
+
     # ── Sr. Accountant → direct reports mapping (via Manager email — encoding-safe) ──
     _sr_jt_lower  = active_pods['Job title'].astype(str).str.lower().str.strip()
     _sr_staff     = active_pods[_sr_jt_lower.isin({'sr. accountant', 'sr accountant'})]
@@ -1965,6 +1974,7 @@ def _process_hc_report(file_bytes: bytes):
         'asst_managers':  n_asst_mgr,
         'mgr_total':      n_mgr_total,
         'mgr_by_pod':     mgr_by_pod,
+        'mix_pct':        mix_pct,
         'detail':         active_pods[['Full name', 'Work Email', 'Job title', 'Capacity Role', 'POD']],
         'attrited_detail': attrited_detail,
     }
@@ -2510,6 +2520,14 @@ if "rev_hc_hc_df" not in st.session_state:
         {"Role": roles_permitidos, **{c: [0.0] * len(roles_permitidos) for c in _rev_hc_fte_cols}}
     )
 
+# ── MRR Growth Manual Adjustment (Step 2 tab) ─────────────────────────────
+if "s2_mrr_growth_df" not in st.session_state:
+    # M1 & M2 read-only (past/baseline); M3-M6 editable, pre-seeded with default 5%
+    st.session_state.s2_mrr_growth_df = pd.DataFrame([{
+        "M1 (%)": 0.0, "M2 (%)": 0.0,
+        "M3 (%)": 5.0, "M4 (%)": 5.0, "M5 (%)": 5.0, "M6 (%)": 5.0
+    }])
+
 # ── Step 4 v2 scenario adjuster session state ─────────────────────────────
 _s4v2_mc = [f"M{i+1}" for i in range(6)]
 if "s4v2_hc_adj_df" not in st.session_state:
@@ -2542,6 +2560,8 @@ if "s4v2_ai_hrs" not in st.session_state:
     st.session_state.s4v2_ai_hrs = {_rl: [0.0]*6 for _rl in roles_permitidos}
 
 # ── Defaults so variables are always defined (overwritten by widgets in tab1 ⚙️ expander) ──
+mrr_growth_pct    = 0.05   # 5%  — overwritten by gp_mrr_growth widget
+growth_budget_pct = 0.40   # 40% — overwritten by gp_growth_budget widget
 cost_acc1 = 1140.0; cost_acc2 = 1369.0; cost_gen = 1900.0; cost_sr = 2536.0
 cost_map  = {'Accountant I': cost_acc1, 'Accountant II': cost_acc2,
              'General Accountant': cost_gen, 'Sr. Accountant': cost_sr}
@@ -2952,6 +2972,27 @@ with tab1:
                 'Sr. Accountant':     util_sr,
             }
 
+            st.subheader("📈 Growth Forecast")
+            mrr_growth_pct    = st.number_input(
+                "MRR Projected Growth (%)",
+                min_value=0.0, max_value=200.0, value=5.0, step=0.5,
+                help="Default monthly MRR growth % applied to M3–M6 in the MRR Growth tab.",
+                key="gp_mrr_growth"
+            ) / 100
+            growth_budget_pct = st.number_input(
+                "Growth Budget (%)",
+                min_value=0.0, max_value=100.0, value=40.0, step=1.0,
+                help="% of Forecasted MRR Growth allocated to new-hire budget.",
+                key="gp_growth_budget"
+            ) / 100
+            # Sync M3-M6 of the MRR growth table whenever the global % changes
+            _mgdf = st.session_state.s2_mrr_growth_df.copy()
+            _gp_pct = round(mrr_growth_pct * 100, 4)
+            for _mc in ["M3 (%)", "M4 (%)", "M5 (%)", "M6 (%)"]:
+                if _mc in _mgdf.columns:
+                    _mgdf.at[0, _mc] = _gp_pct
+            st.session_state.s2_mrr_growth_df = _mgdf
+
             st.subheader("📅 Calendar & Working Days")
             calc_mode = st.radio(
                 "Calculation method:",
@@ -3002,8 +3043,10 @@ with tab1:
                             'gp_util_acc1':  _pc_vals.get('util_acc1_pct', 85.0),
                             'gp_util_gen':   _pc_vals.get('util_gen_pct',  80.0),
                             'gp_util_sr':    _pc_vals.get('util_sr_pct',   50.0),
-                            'gp_calc_mode':  _pc_vals.get('calc_mode', "Actual network days of the month"),
-                            'gp_fixed_days': _pc_vals.get('fixed_days', 22),
+                            'gp_calc_mode':     _pc_vals.get('calc_mode', "Actual network days of the month"),
+                            'gp_fixed_days':    _pc_vals.get('fixed_days', 22),
+                            'gp_mrr_growth':    _pc_vals.get('mrr_growth_pct', 5.0),
+                            'gp_growth_budget': _pc_vals.get('growth_budget_pct', 40.0),
                             **{f'hol_{i}': _pc_vals.get(f'hol_{i}', 0) for i in range(len(meses_proyeccion))},
                         }
                         st.session_state['_pending_params_load'] = _pending
@@ -3031,8 +3074,10 @@ with tab1:
                         'util_acc1_pct':    round(util_acc1   * 100, 4),
                         'util_gen_pct':     round(util_gen    * 100, 4),
                         'util_sr_pct':      round(util_sr     * 100, 4),
-                        'calc_mode':        calc_mode,
-                        'fixed_days':       fixed_days,
+                        'calc_mode':           calc_mode,
+                        'fixed_days':          fixed_days,
+                        'mrr_growth_pct':      round(mrr_growth_pct    * 100, 4),
+                        'growth_budget_pct':   round(growth_budget_pct * 100, 4),
                         **{f'hol_{i}': holidays_per_month.get(mes, 0)
                            for i, mes in enumerate(meses_proyeccion)},
                     }
@@ -3120,6 +3165,8 @@ with tab1:
                     st.session_state['_hc_version'] = st.session_state.get('_hc_version', 0) + 1
                     _hc_loaded = st.session_state.hc_data
                     _n_mgrs = _hc_loaded.get('acct_managers', 0) + _hc_loaded.get('asst_managers', 0)
+                    _hc_mix = _hc_loaded.get('mix_pct', {})
+                    def _mpct(k): return f"{_hc_mix.get(k, 0)*100:.1f}%"
                     st.success(
                         f"HC Loaded: **{_n_mgrs} Managers** (Accounting Managers & Assistant Managers)"
                         f" + **{_hc_loaded['total']}** Active accounting staff  \n"
@@ -3128,7 +3175,13 @@ with tab1:
                         f"GenAcc: {_hc_loaded['by_role'].get('General Accountant',0)} · "
                         f"Sr.: {_hc_loaded['by_role'].get('Sr. Accountant',0)} · "
                         f"Asm: {_hc_loaded.get('asst_managers',0)} · "
-                        f"AM: {_hc_loaded.get('acct_managers',0)}"
+                        f"AM: {_hc_loaded.get('acct_managers',0)}  \n"
+                        f"**HC Mix %** — AccI: {_mpct('Accountant I')} · "
+                        f"AccII: {_mpct('Accountant II')} · "
+                        f"GenAcc: {_mpct('General Accountant')} · "
+                        f"Sr.: {_mpct('Sr. Accountant')} · "
+                        f"Asm: {_mpct('Asst. Manager')} · "
+                        f"AM: {_mpct('Acct. Manager')}"
                     )
                     # ── Temporary Sr. / Direct-Reports checker ────────────────────
                     with st.expander("🔍 [DEBUG] Sr. Accountant HC Checker", expanded=False):
@@ -4800,8 +4853,9 @@ if "calc_data" in st.session_state:
             )
 
         if st.session_state.s2_efficiency_choice == "yes":
-            t_auto, t_hist, t_red, t_door = st.tabs([
-                "⚙️ Automations", "➕ Add Hours", "➖ Reduce Hours", "🚪 Door Count Variation"
+            t_auto, t_hist, t_red, t_door, t_mrr_growth = st.tabs([
+                "⚙️ Automations", "➕ Add Hours", "➖ Reduce Hours",
+                "🚪 Door Count Variation", "📈 MRR Growth Manual Adjustment"
             ])
 
             with t_auto:
@@ -4815,6 +4869,47 @@ if "calc_data" in st.session_state:
 
             with t_door:
                 _doorcount_tab_fragment()
+
+            with t_mrr_growth:
+                @st.fragment
+                def _mrr_growth_fragment():
+                    st.markdown(
+                        "**Monthly MRR Growth % per projected month.**  \n"
+                        "M1 and M2 are locked (baseline / current period). "
+                        "M3–M6 are pre-seeded from **MRR Projected Growth %** in Global Parameters "
+                        "and can be overridden manually here for custom scenarios."
+                    )
+                    _mgdf = st.session_state.s2_mrr_growth_df.copy()
+                    _edited_mg = st.data_editor(
+                        _mgdf,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "M1 (%)": st.column_config.NumberColumn(
+                                "M1 (%) — locked", format="%.2f%%", disabled=True),
+                            "M2 (%)": st.column_config.NumberColumn(
+                                "M2 (%) — locked", format="%.2f%%", disabled=True),
+                            "M3 (%)": st.column_config.NumberColumn(
+                                "M3 (%)", min_value=0.0, format="%.2f%%"),
+                            "M4 (%)": st.column_config.NumberColumn(
+                                "M4 (%)", min_value=0.0, format="%.2f%%"),
+                            "M5 (%)": st.column_config.NumberColumn(
+                                "M5 (%)", min_value=0.0, format="%.2f%%"),
+                            "M6 (%)": st.column_config.NumberColumn(
+                                "M6 (%)", min_value=0.0, format="%.2f%%"),
+                        },
+                        key="mrr_growth_editor"
+                    )
+                    # Lock M1/M2 to 0 regardless of edits
+                    _edited_mg.at[0, "M1 (%)"] = 0.0
+                    _edited_mg.at[0, "M2 (%)"] = 0.0
+                    st.session_state.s2_mrr_growth_df = _edited_mg
+                    st.caption(
+                        "💡 These percentages drive **Forecasted MRR Growth** in the Step 3 waterfall "
+                        "and pre-populate the **⊕ New MRR** row in the Step 4 Scenario Planner."
+                    )
+
+                _mrr_growth_fragment()
 
             # ── Proceed gate: hide Step 3 & 4 while the user is actively
             # configuring Step 2. A "Proceed" button opens the gate; having
@@ -5816,14 +5911,20 @@ if "calc_data" in st.session_state:
             _sr_auto_mi_idx  = _sr_auto_opts.index(_sr_auto_mi) if _sr_auto_mi in _sr_auto_opts else 0
             _sr_auto_net_days = _sr_auto_wday.get(_sr_auto_mi_idx, 20)
             _df_ca = st.session_state.get('df_clean', pd.DataFrame())
-            # Clients per Sr.
+            # Clients per Sr. — active (non-churned) clients only: FSD is null or >= today
+            # Normalize Sr. Accountant column: if it's a name (no @), map to email via HC data
             _sr_auto_cli_cnt = {}
             if 'Sr. Accountant' in _df_ca.columns and 'client_name' in _df_ca.columns:
-                _sr_auto_cli_cnt = (
-                    _df_ca[_df_ca['Sr. Accountant'].astype(str).str.strip().ne('')]
-                    .groupby(_df_ca['Sr. Accountant'].astype(str).str.lower().str.strip())
-                    ['client_name'].nunique().to_dict()
-                )
+                _n2e_a = {str(_n).lower().strip(): str(_d.get('email', '')).lower().strip()
+                          for _n, _d in (_sr_auto_hc.get('by_sr', {}) or {}).items()
+                          if str(_d.get('email', '')).strip()}
+                _today_sr  = pd.Timestamp.today().normalize()
+                _fsd_ca    = pd.to_datetime(_df_ca.get('Final Service Date', pd.Series(dtype='datetime64[ns]')), errors='coerce')
+                _active_ca = _df_ca[_fsd_ca.isna() | (_fsd_ca >= _today_sr)]
+                _active_ca = _active_ca[_active_ca['Sr. Accountant'].astype(str).str.strip().ne('')]
+                _sr_col_a  = _active_ca['Sr. Accountant'].astype(str).str.lower().str.strip()
+                _norm_a    = _sr_col_a.apply(lambda v: _n2e_a.get(v, v) if '@' not in v else v)
+                _sr_auto_cli_cnt = _active_ca.groupby(_norm_a)['client_name'].nunique().to_dict()
             # Productive hrs per Sr.
             _sr_auto_prod_hrs = {}
             if ('processor' in _df_ca.columns and 'Capacity Processing Hours' in _df_ca.columns
@@ -6149,6 +6250,8 @@ if "calc_data" in st.session_state:
                     rows   = {}
                     months = []
                     _wdays = st.session_state.get('calc_data', {}).get('dict_workable_days', {})
+                    _prev_mrr = 0.0          # tracks previous month MRR for % movement
+                    _proj_store = {}         # {month_idx: {forecasted_mrr_growth, hc_by_role}}
 
                     for i, mes_str in enumerate(meses_proyeccion):
                         if i >= len(_exec): break
@@ -6266,6 +6369,116 @@ if "calc_data" in st.session_state:
                         rows.setdefault("  Expected Cost ($)",            {})[col] = _fmt(exp_cost, '$')
                         rows.setdefault("  Expected Margin ($)",          {})[col] = _fmt(exp_margin, '$')
                         rows.setdefault("  Expected Margin (%)",          {})[col] = _fmt(exp_margin_pct, '%')
+
+                        # ── Pre-compute client count for this month (needed by forecast below) ──
+                        # _aht_start_m / _aht_end_m are also used again later in the AHT section;
+                        # computing here first so the forecast block has access to _m_cli_count.
+                        _aht_start_m = pd.Timestamp((today + relativedelta(months=_month_offsets[i])).replace(day=1).date())
+                        _aht_end_m   = pd.Timestamp((_aht_start_m + relativedelta(months=1) - relativedelta(days=1)).date())
+                        _m_cli_count = 0
+                        if not _duc.empty and 'client_name' in _duc.columns:
+                            _duc_gl_o_pre  = pd.to_datetime(_duc.get('Go Live',            pd.Series(dtype='datetime64[ns]')), errors='coerce')
+                            _duc_fsd_o_pre = pd.to_datetime(_duc.get('Final Service Date', pd.Series(dtype='datetime64[ns]')), errors='coerce')
+                            _m_cli_mask_pre = (
+                                (_duc_gl_o_pre.isna()  | (_duc_gl_o_pre  <= _aht_end_m)) &
+                                (_duc_fsd_o_pre.isna() | (_duc_fsd_o_pre >= _aht_start_m))
+                            )
+                            _m_cli_count = int(_m_cli_mask_pre.sum())
+
+                        # ── MRR Forecast Projection (Step 3) ────────────────────────────
+                        # Real MRR % Movement: (MRR this month - MRR previous month) / previous
+                        _real_mrr_mov = (
+                            (float(mrr or 0) - _prev_mrr) / _prev_mrr * 100
+                            if _prev_mrr > 0 else None
+                        )
+                        # Manual growth % from Step 2 MRR Growth tab (M1/M2 locked at 0)
+                        _mgdf_v      = st.session_state.s2_mrr_growth_df
+                        _mg_col      = f"M{i+1} (%)"
+                        _mg_val_pct  = float(_mgdf_v.at[0, _mg_col]) / 100 if _mg_col in _mgdf_v.columns else 0.0
+                        # Forecasted MRR Growth: only for M3-M6 (indices 2-5)
+                        if i >= 2 and float(mrr or 0) > 0:
+                            _fcast_mrr_growth = float(mrr or 0) * _mg_val_pct
+                        else:
+                            _fcast_mrr_growth = None
+                        _total_fcast_mrr = (
+                            float(mrr or 0) + _fcast_mrr_growth
+                            if _fcast_mrr_growth is not None else None
+                        )
+                        # Average MRR per client
+                        _m_cli_cnt_fcast = _m_cli_count if _m_cli_count and _m_cli_count > 0 else None
+                        _avg_mrr_cli = (
+                            float(mrr or 0) / _m_cli_cnt_fcast
+                            if _m_cli_cnt_fcast else None
+                        )
+                        # # of Projected New Clients
+                        _n_proj_cli = (
+                            _fcast_mrr_growth / _avg_mrr_cli
+                            if (_fcast_mrr_growth and _avg_mrr_cli and _avg_mrr_cli > 0)
+                            else None
+                        )
+                        # Forecasted Additional Budget: Growth Budget % × Forecasted MRR Growth
+                        _fcast_budget = (
+                            growth_budget_pct * _fcast_mrr_growth
+                            if _fcast_mrr_growth is not None else None
+                        )
+                        # Mix % for each productive role (from HC report)
+                        _hc_mix_wf = _hc_wf.get('mix_pct', {}) if _hc_wf else {}
+                        # Forecasted HC per role = (mix% × budget) / role_cost
+                        _roles_cost = {
+                            'Accountant I':       cost_acc1,
+                            'Accountant II':      cost_acc2,
+                            'General Accountant': cost_gen,
+                            'Sr. Accountant':     cost_sr,
+                        }
+                        _fcast_hc = {}
+                        for _rn, _rc in _roles_cost.items():
+                            _rmix = _hc_mix_wf.get(_rn, 0.0)
+                            _fcast_hc[_rn] = (
+                                (_rmix * _fcast_budget) / _rc
+                                if (_fcast_budget and _rc > 0) else None
+                            )
+                        _fcast_hc_sum = (
+                            sum(v for v in _fcast_hc.values() if v is not None)
+                            if any(v is not None for v in _fcast_hc.values()) else None
+                        )
+                        # New HC Required = Required FTEs + forecasted additional HC
+                        _new_hc_req = (
+                            float(fte_total or 0) + _fcast_hc_sum
+                            if _fcast_hc_sum is not None else None
+                        )
+                        # Forecasted HC = Actual HC + forecasted additional HC
+                        _fcast_total_hc = (
+                            float(hc_total or 0) + _fcast_hc_sum
+                            if (hc_total is not None and _fcast_hc_sum is not None) else None
+                        )
+                        # Forecast Over/Under = New HC Required - Forecasted HC
+                        _fcast_over_under = (
+                            _new_hc_req - _fcast_total_hc
+                            if (_new_hc_req is not None and _fcast_total_hc is not None) else None
+                        )
+                        # Write forecast rows
+                        rows.setdefault("━ MRR Forecast",                     {})[col] = _fmt(_fcast_mrr_growth,  '$')
+                        rows.setdefault("  Real MRR % Movement",               {})[col] = _fmt(_real_mrr_mov,       '%')
+                        rows.setdefault("  Forecasted MRR Growth ($)",          {})[col] = _fmt(_fcast_mrr_growth,  '$')
+                        rows.setdefault("  Total Forecasted MRR ($)",           {})[col] = _fmt(_total_fcast_mrr,   '$')
+                        rows.setdefault("  Avg MRR per Client ($)",             {})[col] = _fmt(_avg_mrr_cli,        '$')
+                        rows.setdefault("  # Projected New Clients",            {})[col] = _fmt(_n_proj_cli,         'dec')
+                        rows.setdefault("  Forecasted Budget ($)",              {})[col] = _fmt(_fcast_budget,       '$')
+                        rows.setdefault("  Fcast HC — Accountant I",            {})[col] = _fmt(_fcast_hc.get('Accountant I'),       'dec')
+                        rows.setdefault("  Fcast HC — Accountant II",           {})[col] = _fmt(_fcast_hc.get('Accountant II'),      'dec')
+                        rows.setdefault("  Fcast HC — General Accountant",      {})[col] = _fmt(_fcast_hc.get('General Accountant'), 'dec')
+                        rows.setdefault("  Fcast HC — Sr. Accountant",          {})[col] = _fmt(_fcast_hc.get('Sr. Accountant'),     'dec')
+                        rows.setdefault("  New HC Required",                    {})[col] = _fmt(_new_hc_req,         'dec')
+                        rows.setdefault("  Forecasted HC (Actual + New)",       {})[col] = _fmt(_fcast_total_hc,     'dec')
+                        rows.setdefault("  Forecast Over/Under",                {})[col] = _fmt(_fcast_over_under,   'dec')
+                        # Store for Step 4 pre-population (only M3-M6 where forecast is active)
+                        if i >= 2:
+                            _proj_store[i] = {
+                                'forecasted_mrr_growth': _fcast_mrr_growth,
+                                'hc_by_role':            {k: v for k, v in _fcast_hc.items()},
+                            }
+                        _prev_mrr = float(mrr or 0)
+
                         # Per-month learning-curve-aware AHT and split ticket counts
                         # Filter to clients active in this specific month:
                         #   Go Live <= month end  AND  (FSD >= month start OR FSD missing)
@@ -6346,6 +6559,8 @@ if "calc_data" in st.session_state:
 
                     df_wf = pd.DataFrame(rows, index=months).T
                     df_wf.index.name = ""
+                    # Store projection data for Step 4 pre-population
+                    st.session_state['_projection_data'] = _proj_store
                     return df_wf
 
                 # ── Overall view — rebuild only when cascade or HC data changes ────────
@@ -6384,6 +6599,13 @@ if "calc_data" in st.session_state:
                     "━ MRR ($)":                  ["  (+) New MRR ($)", "  (-) Churn MRR ($)", "  Revenue / HC ($)"],
                     "━ Cost & Margin":            ["  Capacity Cost ($)", "  Capacity Margin ($)", "  Capacity Margin (%)",
                                                    "  Expected Cost ($)", "  Expected Margin ($)", "  Expected Margin (%)"],
+                    "━ MRR Forecast":             ["  Real MRR % Movement", "  Forecasted MRR Growth ($)",
+                                                   "  Total Forecasted MRR ($)", "  Avg MRR per Client ($)",
+                                                   "  # Projected New Clients", "  Forecasted Budget ($)",
+                                                   "  Fcast HC — Accountant I", "  Fcast HC — Accountant II",
+                                                   "  Fcast HC — General Accountant", "  Fcast HC — Sr. Accountant",
+                                                   "  New HC Required", "  Forecasted HC (Actual + New)",
+                                                   "  Forecast Over/Under"],
                     "━ Property Count":           ["  Res Properties", "  Comm Properties", "  Client Count", "  Res Doors", "  Comm Doors", "  SQFT (Comm)"],
                     "━ Working Days":             ["  Holidays"],
                 }
@@ -6392,6 +6614,13 @@ if "calc_data" in st.session_state:
                     "━ Required HC (FTEs)":       ["  · Accountant I", "  · Accountant II", "  · General Accountant", "  · Sr. Accountant"],
                     "━ MRR ($)":                  ["  (+) New MRR ($)", "  (-) Churn MRR ($)"],
                     "━ Cost & Margin":            ["  Capacity Cost ($)", "  Capacity Margin ($)", "  Capacity Margin (%)"],
+                    "━ MRR Forecast":             ["  Real MRR % Movement", "  Forecasted MRR Growth ($)",
+                                                   "  Total Forecasted MRR ($)", "  Avg MRR per Client ($)",
+                                                   "  # Projected New Clients", "  Forecasted Budget ($)",
+                                                   "  Fcast HC — Accountant I", "  Fcast HC — Accountant II",
+                                                   "  Fcast HC — General Accountant", "  Fcast HC — Sr. Accountant",
+                                                   "  New HC Required", "  Forecasted HC (Actual + New)",
+                                                   "  Forecast Over/Under"],
                     "━ Property Count":           ["  Res Properties", "  Comm Properties", "  Client Count", "  Res Doors", "  Comm Doors", "  SQFT (Comm)"],
                     "━ Working Days":             ["  Holidays"],
                 }
@@ -7932,11 +8161,38 @@ if "calc_data" in st.session_state:
 
         from io import BytesIO
         output = BytesIO()
+        # ── Helper: build MRR Forecast DataFrame from _projection_data ─────────────
+        def _build_proj_export_df(pdata):
+            """Tabular MRR Forecast summary (M3-M6) from _projection_data dict."""
+            if not pdata:
+                return pd.DataFrame()
+            _rows = []
+            for _pmi in sorted(pdata.keys()):   # 2..5 → M3..M6
+                _pd = pdata[_pmi]
+                _hbr = _pd.get('hc_by_role') or {}
+                _rows.append({
+                    'Month':                          f'M{_pmi + 1}',
+                    'Forecasted MRR Growth ($)':      _pd.get('forecasted_mrr_growth'),
+                    'HC — Accountant I':              _hbr.get('Accountant I'),
+                    'HC — Accountant II':             _hbr.get('Accountant II'),
+                    'HC — General Accountant':        _hbr.get('General Accountant'),
+                    'HC — Sr. Accountant':            _hbr.get('Sr. Accountant'),
+                })
+            return pd.DataFrame(_rows)
+
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             # Tab 1: Capacity Overview — Waterfall (transposed: metrics as rows, months as columns)
             _wf_exp = st.session_state.get('_wf_overall_export', pd.DataFrame())
             if not _wf_exp.empty:
                 _wf_exp.to_excel(writer, sheet_name='Capacity_Overview_Waterfall')
+            # Tab 1a: MRR Forecast — dedicated clean projection summary (M3-M6)
+            _proj_exp_df = _build_proj_export_df(st.session_state.get('_projection_data', {}))
+            if not _proj_exp_df.empty:
+                _proj_exp_df.to_excel(writer, sheet_name='MRR_Forecast', index=False)
+            # Tab 1aa: MRR Growth settings from Step 2
+            _mrr_grow_exp = st.session_state.get('s2_mrr_growth_df', pd.DataFrame())
+            if not _mrr_grow_exp.empty:
+                _mrr_grow_exp.to_excel(writer, sheet_name='MRR_Growth_Settings', index=False)
             # Tab 1b: By POD waterfalls — one sheet per POD
             _wf_pods_exp = st.session_state.get('_wf_pod_all_export', {})
             for _pn_exp, _df_pw_exp in sorted(_wf_pods_exp.items()):
@@ -8161,10 +8417,17 @@ if "calc_data" in st.session_state:
                 _sr_ndays_x  = _sr_wday_exp.get(_sr_mi_idx_x, 20)
                 _df_cx = st.session_state.get('df_clean', pd.DataFrame())
                 _sr_cli_x = {}
-                if 'Sr. Accountant' in _df_cx.columns and 'client_name' in _df_cx.columns:
-                    _sr_cli_x = (_df_cx[_df_cx['Sr. Accountant'].astype(str).str.strip().ne('')]
-                                 .groupby(_df_cx['Sr. Accountant'].astype(str).str.lower().str.strip())
-                                 ['client_name'].nunique().to_dict())
+                if not _df_cx.empty and 'Sr. Accountant' in _df_cx.columns and 'client_name' in _df_cx.columns:
+                    _n2e_x    = {str(_n).lower().strip(): str(_d.get('email', '')).lower().strip()
+                                 for _n, _d in (_sr_hc_exp.get('by_sr', {}) or {}).items()
+                                 if str(_d.get('email', '')).strip()}
+                    _fsd_cx    = pd.to_datetime(_df_cx.get('Final Service Date', pd.Series(dtype='datetime64[ns]')), errors='coerce')
+                    _today_cx  = pd.Timestamp.today().normalize()
+                    _active_cx = _df_cx[_fsd_cx.isna() | (_fsd_cx >= _today_cx)]
+                    _active_cx = _active_cx[_active_cx['Sr. Accountant'].astype(str).str.strip().ne('')]
+                    _sr_col_x  = _active_cx['Sr. Accountant'].astype(str).str.lower().str.strip()
+                    _norm_x    = _sr_col_x.apply(lambda v: _n2e_x.get(v, v) if '@' not in v else v)
+                    _sr_cli_x  = _active_cx.groupby(_norm_x)['client_name'].nunique().to_dict()
                 _sr_prh_x = {}
                 if ('processor' in _df_cx.columns and 'Capacity Processing Hours' in _df_cx.columns
                         and 'reviewer' in _df_cx.columns and 'Capacity reviewing hours' in _df_cx.columns):
@@ -8433,15 +8696,21 @@ if "calc_data" in st.session_state:
                 # Sr. Accountant (col AD) = Sr. email → unique client count
                 _df_c = st.session_state.get('df_clean', pd.DataFrame())
 
-                # Clients assigned: unique clients per Sr. email (col AD)
+                # Clients assigned: non-churned clients from df_clean (FSD null or >= today)
+                # Normalize Sr. Accountant: map name → email via HC data so the dict is
+                # always keyed by email (matching the HC loop key _sr_em)
                 _sr_cli_count_by_email = {}
-                if 'Sr. Accountant' in _df_c.columns and 'client_name' in _df_c.columns:
-                    _sr_cli_count_by_email = (
-                        _df_c[_df_c['Sr. Accountant'].astype(str).str.strip().ne('')]
-                        .groupby(_df_c['Sr. Accountant'].astype(str).str.lower().str.strip())
-                        ['client_name'].nunique()
-                        .to_dict()
-                    )
+                if not _df_c.empty and 'Sr. Accountant' in _df_c.columns and 'client_name' in _df_c.columns:
+                    _n2e_c    = {str(_n).lower().strip(): str(_d.get('email', '')).lower().strip()
+                                 for _n, _d in (_hc_sr.get('by_sr', {}) or {}).items()
+                                 if str(_d.get('email', '')).strip()}
+                    _fsd_ct    = pd.to_datetime(_df_c.get('Final Service Date', pd.Series(dtype='datetime64[ns]')), errors='coerce')
+                    _today_ct  = pd.Timestamp.today().normalize()
+                    _active_ct = _df_c[_fsd_ct.isna() | (_fsd_ct >= _today_ct)]
+                    _active_ct = _active_ct[_active_ct['Sr. Accountant'].astype(str).str.strip().ne('')]
+                    _sr_col_c  = _active_ct['Sr. Accountant'].astype(str).str.lower().str.strip()
+                    _norm_c    = _sr_col_c.apply(lambda v: _n2e_c.get(v, v) if '@' not in v else v)
+                    _sr_cli_count_by_email = _active_ct.groupby(_norm_c)['client_name'].nunique().to_dict()
 
                 # Productive hours: processing hrs (processor col) + reviewing hrs (reviewer col)
                 _sr_prod_hrs_by_email = {}
@@ -10262,6 +10531,14 @@ if (
                             _cfte_s4.insert(_cfte_s4.columns.get_loc('Client') + 1, 'MRR ($)', _cfte_s4['Client'].astype(str).str.lower().str.strip().map(_mrr_s4).fillna(0.0))
                         _cfte_s4.rename(columns={c: c.replace('- Final FTEs', 'FTEs').replace('- Final Hours', 'Hrs') for c in _fte_mc_s4 + _fte_hc_s4}, inplace=True)
                         _cfte_s4.to_excel(_xw, sheet_name='Client_FTEs_by_Month', index=False)
+                # MRR Forecast projection (Step 3) — dedicated clean sheet
+                _proj_scen_df = _build_proj_export_df(st.session_state.get('_projection_data', {}))
+                if not _proj_scen_df.empty:
+                    _proj_scen_df.to_excel(_xw, sheet_name='MRR_Forecast', index=False)
+                # MRR Growth % settings (Step 2)
+                _mrr_grow_scen = st.session_state.get('s2_mrr_growth_df', pd.DataFrame())
+                if not _mrr_grow_scen.empty:
+                    _mrr_grow_scen.to_excel(_xw, sheet_name='MRR_Growth_Settings', index=False)
                 # Scenario inputs
                 st.session_state.s4v2_hc_adj_df.to_excel(_xw, sheet_name='HC_Adjustments', index=False)
                 st.session_state.s4v2_mrr_adj_df.to_excel(_xw, sheet_name='MRR_Adjustments', index=False)
@@ -10337,6 +10614,10 @@ if (
                             _cfte_all.insert(_cfte_all.columns.get_loc('Client') + 1, 'MRR ($)', _cfte_all['Client'].astype(str).str.lower().str.strip().map(_mrr_all).fillna(0.0))
                         _cfte_all.rename(columns={c: c.replace('- Final FTEs', 'FTEs').replace('- Final Hours', 'Hrs') for c in _fte_mc_all + _fte_hc_all}, inplace=True)
                         _cfte_all.to_excel(_xw_all, sheet_name='3_Client_FTEs_by_Month', index=False)
+                # Tab: MRR Forecast projection — dedicated clean sheet
+                _proj_all_df = _build_proj_export_df(st.session_state.get('_projection_data', {}))
+                if not _proj_all_df.empty:
+                    _proj_all_df.to_excel(_xw_all, sheet_name='3_MRR_Forecast', index=False)
                 # ── Step 2 inputs ─────────────────────────────────────────────
                 if not st.session_state.automations_df.empty:
                     st.session_state.automations_df.to_excel(_xw_all, sheet_name='2_Automations', index=False)
@@ -10347,6 +10628,10 @@ if (
                 _dc_exp = st.session_state.get('doorcount_df', pd.DataFrame())
                 if not _dc_exp.empty:
                     _dc_exp.to_excel(_xw_all, sheet_name='2_DoorCount_Variation', index=False)
+                # MRR Growth % settings (Step 2)
+                _mrr_grow_all = st.session_state.get('s2_mrr_growth_df', pd.DataFrame())
+                if not _mrr_grow_all.empty:
+                    _mrr_grow_all.to_excel(_xw_all, sheet_name='2_MRR_Growth_Settings', index=False)
                 # ── Step 4 scenario ───────────────────────────────────────────
                 _df_scen.to_excel(_xw_all, sheet_name='4_Scenario')
                 st.session_state.s4v2_params_df.to_excel(_xw_all, sheet_name='4_Global_Params', index=False)
@@ -10495,6 +10780,43 @@ if (
 </script>
 """, height=0)
         st.session_state['_s4_ready'] = True
+
+    # ── Pre-populate Step 4 tables from Step 3 projection data ─────────────────
+    # Runs on full-page reruns (outside fragments). Uses a hash to detect when
+    # _projection_data changed so we don't overwrite intentional user edits.
+    _pdata = st.session_state.get('_projection_data', {})
+    _pdata_hash = hash(str(_pdata)) if _pdata else None
+    _prev_pdata_hash = st.session_state.get('_s4_pdata_hash')
+    if _pdata and _pdata_hash != _prev_pdata_hash:
+        # --- ⊕ New MRR row in s4v2_mrr_adj_df ---
+        if 's4v2_mrr_adj_df' in st.session_state:
+            _mrr_pp = st.session_state.s4v2_mrr_adj_df.copy()
+            _new_mrr_mask = _mrr_pp["Adjustment"] == "⊕ New MRR"
+            if _new_mrr_mask.any():
+                for _pmi, _pd in _pdata.items():   # _pmi = 2..5 → M3..M6
+                    _pcol = f"M{_pmi + 1}"
+                    if _pcol in _mrr_pp.columns:
+                        _fmg = _pd.get('forecasted_mrr_growth')
+                        _mrr_pp.loc[_new_mrr_mask, _pcol] = float(_fmg) if _fmg is not None else 0.0
+                _mrr_pp.loc[_new_mrr_mask, "Confirmed"] = True
+            st.session_state.s4v2_mrr_adj_df = _mrr_pp
+        # --- ↑ Ramp Up rows per role in s4v2_hc_adj_df ---
+        if 's4v2_hc_adj_df' in st.session_state:
+            _hc_pp = st.session_state.s4v2_hc_adj_df.copy()
+            _ramp_mask = _hc_pp["Direction"] == "↑ Ramp Up"
+            for _prl in roles_permitidos:
+                _role_mask = _ramp_mask & (_hc_pp["Role"] == _prl)
+                if not _role_mask.any():
+                    continue
+                for _pmi, _pd in _pdata.items():
+                    _pcol = f"M{_pmi + 1}"
+                    if _pcol in _hc_pp.columns:
+                        _rv = (_pd.get('hc_by_role') or {}).get(_prl)
+                        _hc_pp.loc[_role_mask, _pcol] = float(_rv) if _rv is not None else 0.0
+            _hc_pp.loc[_ramp_mask, "Confirmed"] = True
+            st.session_state.s4v2_hc_adj_df = _hc_pp
+        # Mark as processed so we don't overwrite user edits on the next rerun
+        st.session_state['_s4_pdata_hash'] = _pdata_hash
 
     _s4v2_fragment()          # display: scope, params, computation, table, comparison
     _s4v2_inputs_frag()       # inputs:  editors + downloads (isolated, fast reruns)
@@ -11050,6 +11372,43 @@ with tab_recon:
                             _vc_typ = [c for c in _val_cols_hrs if c in _t1.columns or c in _t2.columns]
                             _levels['By_Type_Subtype'] = _merge_delta(_t1, _t2, _tk, _vc_typ)
 
+                    # — MRR Forecast (optional sheet — present only in new-format exports) —
+                    try:
+                        _mf1 = pd.read_excel(_rv1, sheet_name='MRR_Forecast')
+                        _mf2 = pd.read_excel(_rv2, sheet_name='MRR_Forecast')
+                        _mf1.columns = _mf1.columns.str.strip()
+                        _mf2.columns = _mf2.columns.str.strip()
+                        if 'Month' in _mf1.columns and 'Month' in _mf2.columns:
+                            _mf_val = [c for c in _mf1.columns if c != 'Month']
+                            # ensure all val cols exist in both
+                            for _mvc in _mf_val:
+                                if _mvc not in _mf2.columns:
+                                    _mf2[_mvc] = None
+                            _mf_val2 = [c for c in _mf2.columns if c != 'Month' and c not in _mf_val]
+                            _mf_all_val = _mf_val + _mf_val2
+                            _levels['MRR_Forecast'] = _merge_delta(_mf1, _mf2, ['Month'], _mf_all_val)
+                    except Exception:
+                        pass  # sheet absent in one or both files — skip silently
+
+                    # — MRR Growth Settings (optional sheet) —
+                    try:
+                        _mgs1 = pd.read_excel(_rv1, sheet_name='MRR_Growth_Settings')
+                        _mgs2 = pd.read_excel(_rv2, sheet_name='MRR_Growth_Settings')
+                        _mgs1.columns = _mgs1.columns.str.strip()
+                        _mgs2.columns = _mgs2.columns.str.strip()
+                        _mgs_cols = [c for c in _mgs1.columns if c in _mgs2.columns]
+                        _mgs_r1 = _mgs1.iloc[0] if not _mgs1.empty else pd.Series(dtype=float)
+                        _mgs_r2 = _mgs2.iloc[0] if not _mgs2.empty else pd.Series(dtype=float)
+                        _mgs_rows = []
+                        for _mgc in _mgs_cols:
+                            _mgv1 = pd.to_numeric(_mgs_r1.get(_mgc, 0), errors='coerce') or 0.0
+                            _mgv2 = pd.to_numeric(_mgs_r2.get(_mgc, 0), errors='coerce') or 0.0
+                            _mgs_rows.append({'Month': _mgc, 'V1 (%)': _mgv1, 'V2 (%)': _mgv2, 'Δ (%)': round(_mgv2 - _mgv1, 4)})
+                        if _mgs_rows:
+                            _levels['MRR_Growth_Settings'] = pd.DataFrame(_mgs_rows)
+                    except Exception:
+                        pass
+
                 else:
                     # ── VOLUME INPUT mode ─────────────────────────────────────
                     _vi1 = pd.read_excel(_rv1, sheet_name=0)
@@ -11187,7 +11546,8 @@ with tab_recon:
                     _yellow_fill = PatternFill(start_color='FFEB9C', end_color='FFEB9C', fill_type='solid')
                     _hdr_font    = Font(bold=True)
 
-                    _sheet_order = ['Overall', 'By_POD', 'By_Sr_Accountant', 'By_Client', 'By_Type_Subtype']
+                    _sheet_order = ['Overall', 'By_POD', 'By_Sr_Accountant', 'By_Client', 'By_Type_Subtype',
+                                    'MRR_Forecast', 'MRR_Growth_Settings']
                     for _sname in _sheet_order:
                         if _sname not in _levels:
                             continue
@@ -11259,6 +11619,17 @@ with tab_recon:
                         st.markdown('🟢 ' + '  |  '.join(_pos_parts))
                     if _neg_parts:
                         st.markdown('🔴 ' + '  |  '.join(_neg_parts))
+
+                # MRR Forecast comparison (on-page)
+                if 'MRR_Forecast' in _levels and not _levels['MRR_Forecast'].empty:
+                    st.subheader("📈 MRR Forecast Comparison")
+                    st.caption("Forecasted MRR Growth and HC projections (M3–M6) — V1 vs V2")
+                    st.dataframe(_levels['MRR_Forecast'], use_container_width=True)
+
+                if 'MRR_Growth_Settings' in _levels and not _levels['MRR_Growth_Settings'].empty:
+                    st.subheader("🔢 MRR Growth Settings Comparison")
+                    st.caption("Monthly growth % used in each version")
+                    st.dataframe(_levels['MRR_Growth_Settings'], use_container_width=True)
 
                 # Download button
                 st.download_button(
