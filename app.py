@@ -6485,9 +6485,11 @@ if "calc_data" in st.session_state:
                         )
                         # Forecast Over/Under = Forecasted HC − (existing required + new required)
                         # Answers: "after hiring for growth, are we over or under total demand?"
+                        # Option B: "Without hiring anyone, how short am I if growth materializes?"
+                        # = current actual HC − (existing required + new hires needed)
                         _fcast_over_under = (
-                            _fcast_total_hc - (float(fte_total or 0) + _fcast_hc_sum)
-                            if (_fcast_total_hc is not None and _fcast_hc_sum is not None) else None
+                            float(hc_total or 0) - (float(fte_total or 0) + _fcast_hc_sum)
+                            if (_fcast_hc_sum is not None and hc_total is not None) else None
                         )
                         # Write forecast rows
                         rows.setdefault("━ MRR Forecast",                     {})[col] = _fmt(_fcast_mrr_growth,  '$')
