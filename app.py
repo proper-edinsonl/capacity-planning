@@ -2401,6 +2401,27 @@ _month_offsets   = list(range(-1, 5))   # -1=base month, 0=month after base, 1..
 meses_proyeccion = [(today + relativedelta(months=off)).strftime("%B %Y") for off in _month_offsets]
 roles_permitidos = ["Accountant I", "Accountant II", "General Accountant", "Sr. Accountant"]
 
+def _build_proj_export_df(pdata):
+    """Tabular MRR Forecast summary (M3-M6) from _projection_data dict.
+    Defined at module level so it's available from @st.fragment callbacks
+    without depending on a prior full-page run of the Step 3 export block.
+    """
+    if not pdata:
+        return pd.DataFrame()
+    _rows = []
+    for _pmi in sorted(pdata.keys()):   # 2..5 → M3..M6
+        _pd_i = pdata[_pmi]
+        _hbr  = _pd_i.get('hc_by_role') or {}
+        _rows.append({
+            'Month':                          f'M{_pmi + 1}',
+            'Forecasted MRR Growth ($)':      _pd_i.get('forecasted_mrr_growth'),
+            'HC — Accountant I':              _hbr.get('Accountant I'),
+            'HC — Accountant II':             _hbr.get('Accountant II'),
+            'HC — General Accountant':        _hbr.get('General Accountant'),
+            'HC — Sr. Accountant':            _hbr.get('Sr. Accountant'),
+        })
+    return pd.DataFrame(_rows)
+
 AFFECTS_OPTIONS = [
     "Vol Proc",
     "Vol Rev",
@@ -3336,7 +3357,7 @@ with tab1:
             # Shown AFTER the filter confirmation so the user knows which scope
             # is active before deciding to add / replace these clients.
             _today_ts   = pd.Timestamp.today().normalize()
-            _ci_m       = {c.strip().lower(): c for c in df_temp.columns}
+            _ci_m       = {str(c).strip().lower(): c for c in df_temp.columns if pd.notna(c)}
             # Resolve client_name column case-insensitively (may be 'client_name', 'Client Name', etc.)
             _cn_col_r   = (_ci_m.get('client_name')
                            or next((v for k, v in _ci_m.items() if k.replace(' ', '_') == 'client_name'), None))
@@ -6231,6 +6252,15 @@ if "calc_data" in st.session_state:
                         _hc_wf['by_role']   = _sc_by_role
                         _hc_wf['total']     = _sc_total
                         _hc_wf['mgr_total'] = _sc_mgr_tot
+                        # Recompute mix_pct for this POD subset so HC forecasts
+                        # use the selected-POD role ratios, not firm-wide ratios.
+                        _sc_total_with_mgr = _sc_total + _sc_mgr_tot
+                        if _sc_total_with_mgr > 0:
+                            _hc_wf['mix_pct'] = {
+                                _rn: round(_sc_by_role.get(_rn, 0) / _sc_total_with_mgr, 6)
+                                for _rn in ['Accountant I', 'Accountant II',
+                                            'General Accountant', 'Sr. Accountant']
+                            }
 
                 # ── Helper to format by metric type ─────────────────────────────────
                 def _fmt(val, kind):
@@ -6405,6 +6435,10 @@ if "calc_data" in st.session_state:
                             if _fcast_mrr_growth is not None else None
                         )
                         # Average MRR per client
+                        # NOTE: _m_cli_count here comes from the pre-computation block
+                        # ~30 lines above (uses _duc_gl_o_pre / _duc_fsd_o_pre).
+                        # A second _m_cli_count assignment exists further below in the
+                        # AHT section (~line 6552) — that one is for row display only.
                         _m_cli_cnt_fcast = _m_cli_count if _m_cli_count and _m_cli_count > 0 else None
                         _avg_mrr_cli = (
                             float(mrr or 0) / _m_cli_cnt_fcast
@@ -8161,25 +8195,6 @@ if "calc_data" in st.session_state:
 
         from io import BytesIO
         output = BytesIO()
-        # ── Helper: build MRR Forecast DataFrame from _projection_data ─────────────
-        def _build_proj_export_df(pdata):
-            """Tabular MRR Forecast summary (M3-M6) from _projection_data dict."""
-            if not pdata:
-                return pd.DataFrame()
-            _rows = []
-            for _pmi in sorted(pdata.keys()):   # 2..5 → M3..M6
-                _pd = pdata[_pmi]
-                _hbr = _pd.get('hc_by_role') or {}
-                _rows.append({
-                    'Month':                          f'M{_pmi + 1}',
-                    'Forecasted MRR Growth ($)':      _pd.get('forecasted_mrr_growth'),
-                    'HC — Accountant I':              _hbr.get('Accountant I'),
-                    'HC — Accountant II':             _hbr.get('Accountant II'),
-                    'HC — General Accountant':        _hbr.get('General Accountant'),
-                    'HC — Sr. Accountant':            _hbr.get('Sr. Accountant'),
-                })
-            return pd.DataFrame(_rows)
-
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             # Tab 1: Capacity Overview — Waterfall (transposed: metrics as rows, months as columns)
             _wf_exp = st.session_state.get('_wf_overall_export', pd.DataFrame())
