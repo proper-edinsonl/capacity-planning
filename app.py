@@ -6395,6 +6395,14 @@ if "calc_data" in st.session_state:
 
                         cap_prod = (prod_hrs_b / current_hrs * 100) if current_hrs > 0 else 0
 
+                        # ── Month boundaries (needed by dynamic HC and AHT sections) ────
+                        _aht_start_m = pd.Timestamp(
+                            (today + relativedelta(months=_month_offsets[i])).replace(day=1).date()
+                        )
+                        _aht_end_m = pd.Timestamp(
+                            (_aht_start_m + relativedelta(months=1) - relativedelta(days=1)).date()
+                        )
+
                         # ── Dynamic HC: fractional FTEs per role for this month ──────────
                         # Uses Start Date + 14-day ramp and Last Working Day so employees
                         # joining or leaving mid-month are counted proportionally.
@@ -6516,10 +6524,7 @@ if "calc_data" in st.session_state:
                         rows.setdefault("  Expected Margin (%)",          {})[col] = _fmt(exp_margin_pct, '%')
 
                         # ── Pre-compute client count for this month (needed by forecast below) ──
-                        # _aht_start_m / _aht_end_m are also used again later in the AHT section;
-                        # computing here first so the forecast block has access to _m_cli_count.
-                        _aht_start_m = pd.Timestamp((today + relativedelta(months=_month_offsets[i])).replace(day=1).date())
-                        _aht_end_m   = pd.Timestamp((_aht_start_m + relativedelta(months=1) - relativedelta(days=1)).date())
+                        # _aht_start_m / _aht_end_m already set at loop top; reuse them here.
                         _m_cli_count = 0
                         if not _duc.empty and 'client_name' in _duc.columns:
                             _duc_gl_o_pre  = pd.to_datetime(_duc.get('Go Live',            pd.Series(dtype='datetime64[ns]')), errors='coerce')
