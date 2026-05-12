@@ -981,14 +981,42 @@ def _detect_file_type(uploaded_file):
 
 
 def _clean_record_id(series):
+    """
+    Normalize a Record ID column to clean digit strings.
+    Handles: int64, float64 (e.g. 18937637995.0), scientific notation strings,
+    and IDs >15 digits without float64 precision loss.
+    """
+    import re as _re
+    _SCI = _re.compile(r'^-?\d+(\.\d+)?[eE][+\-]?\d+$')
     def _rid_str(v):
+        if v is None:
+            return ''
+        s = str(v).strip()
+        if s.lower() in ('nan', 'none', '', 'nat'):
+            return ''
+        # Already a clean integer string (most common path)
+        if s.isdigit():
+            return s
+        # Float with .0 suffix — strip without float conversion to preserve precision
+        if _re.fullmatch(r'\d+\.0+', s):
+            return s.split('.')[0]
+        # Scientific notation — convert via int(float()) which is exact for <2^53
+        if _SCI.match(s):
+            try:
+                return str(int(float(s)))
+            except (ValueError, OverflowError):
+                return s
+        # Pandas int64/float64 native value passed as Python int or float
         try:
-            f = float(v)
-            if pd.isna(f): return ''
-            return str(int(f))
-        except (ValueError, TypeError):
-            s = str(v).strip()
-            return '' if s.lower() in ('nan', 'none', '') else s
+            if isinstance(v, float):
+                if v != v:  # NaN check without pd.isna import
+                    return ''
+                return str(int(v))
+            if isinstance(v, int):
+                return str(v)
+        except (ValueError, OverflowError):
+            pass
+        return s if s else ''
     return series.apply(_rid_str)
 
 
@@ -1428,8 +1456,9 @@ def _build_client_master_map():
 
     # ── LAYER 3: HubSpot POD enrichment (_pod column) ─────────────────────────
     if _hs is not None and not _hs.empty:
+        # 'client_name' is the canonical name after _parse_hubspot_file renames the column
         _hs_cn_col = next((c for c in _hs.columns
-                           if c.lower() in ('company name', 'company', 'name')), None)
+                           if c.lower() in ('company name', 'company', 'name', 'client_name')), None)
         if _hs_cn_col and '_pod' in _hs.columns:
             _hs2 = _hs.copy()
             _hs2['_key'] = _hs2[_hs_cn_col].astype(str).str.lower().str.strip()
@@ -1473,7 +1502,17 @@ def _build_client_master_map():
             _existing_keys = set(_cmap['client_key'])
             for _, _hr in _hs2.iterrows():
                 _hk = _hr['_key']
+                _hr_rid = str(_hr.get('record_id', '') or '').strip()
                 _m  = _cmap['client_key'] == _hk
+                # Fallback: if name didn't match, try record_id (client was renamed in HubSpot)
+                if not _m.any() and _hr_rid and 'record_id' in _cmap.columns:
+                    _m_rid = _cmap['record_id'] == _hr_rid
+                    if _m_rid.any():
+                        # Client renamed — adopt HubSpot's name as the canonical name
+                        _cmap.loc[_m_rid, 'client_name'] = _hr[_hs_cn_col]
+                        _cmap.loc[_m_rid, 'client_key']  = _hk
+                        _cmap.loc[_m_rid, 'source']      = 'hubspot'
+                        _m = _m_rid   # use rid-based mask for field updates below
                 if _m.any():
                     if _hs_mrr_col:
                         _hmrr = pd.to_numeric(_hr.get(_hs_mrr_col, None), errors='coerce')
@@ -1557,9 +1596,18 @@ def _parse_hubspot_file(uploaded_file):
     # ── Capture Record ID (Column A / explicit column) ─────────────────────
     _rid_col_hs = next(
         (c for c in df.columns if str(c).lower().strip() in ('record id', 'record_id', 'hubspot record id', 'id')),
-        df.columns[0]  # fallback: first column (HubSpot puts Record ID in col A)
+        None
     )
-    df['record_id'] = _clean_record_id(df[_rid_col_hs])
+    # Fallback: first column only if it looks numeric (HubSpot puts Record ID in col A)
+    if _rid_col_hs is None:
+        _col0 = df.columns[0]
+        _sample = df[_col0].dropna().head(10)
+        _looks_numeric = pd.to_numeric(_sample, errors='coerce').notna().sum() >= len(_sample) * 0.8
+        _rid_col_hs = _col0 if _looks_numeric else None
+    if _rid_col_hs is not None:
+        df['record_id'] = _clean_record_id(df[_rid_col_hs])
+    else:
+        df['record_id'] = ''
 
     # Normalize company name column
     _name_candidates = [c for c in df.columns if c.lower() in ['company name', 'company', 'client name', 'client_name']]
