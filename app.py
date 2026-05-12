@@ -1584,6 +1584,26 @@ def _build_client_master_map():
         if str(row.get('record_id', '')).strip()
     }
 
+    # ── Write HubSpot canonical names back to df_clean and df_clients_unique ──
+    # Any client matched by record_id uses HubSpot's client_name as ground truth.
+    # This runs on every map rebuild so names stay in sync across all reruns.
+    _rid_to_canonical = {
+        row['record_id']: row['client_name']
+        for _, row in _cmap.iterrows()
+        if str(row.get('record_id', '')).strip() and str(row.get('client_name', '')).strip()
+    }
+    if _rid_to_canonical:
+        for _ss_key in ('df_clean', 'df_clients_unique'):
+            _ss_df = st.session_state.get(_ss_key, pd.DataFrame())
+            if _ss_df.empty or 'record_id' not in _ss_df.columns:
+                continue
+            _rid_s   = _clean_record_id(_ss_df['record_id'])
+            _has_rid = _rid_s.ne('') & _rid_s.isin(_rid_to_canonical)
+            if _has_rid.any():
+                _ss_df = _ss_df.copy()
+                _ss_df.loc[_has_rid, 'client_name'] = _rid_s[_has_rid].map(_rid_to_canonical)
+                st.session_state[_ss_key] = _ss_df
+
 
 def _parse_hubspot_file(uploaded_file):
     """Parse a HubSpot export and return a cleaned DataFrame with derived columns."""
@@ -4933,60 +4953,31 @@ if "calc_data" in st.session_state:
 
         # ── Helper: detect client name mismatches against the cascade ──────────
         def _find_name_mismatches(df, avail_clients):
-            """
-            For each non-empty Client value in df that is not in avail_clients,
-            return list of (index, file_name, best_suggestion_or_None).
-            Suggestion is scored by word overlap + substring containment.
-            """
+            """Return list of unrecognized non-empty Client values not in avail_clients."""
             if df.empty or 'Client' not in df.columns or not avail_clients:
                 return []
             _avail_set   = set(avail_clients)
             _avail_lower = {c.lower().strip(): c for c in avail_clients}
-            _result = []
-            for _idx, _row in df.iterrows():
+            _bad = []
+            for _, _row in df.iterrows():
                 _name = str(_row.get('Client', '') or '').strip()
-                if not _name or _name in _avail_set:
+                if not _name or _name in _avail_set or _name.lower() in _avail_lower:
                     continue
-                if _name.lower() in _avail_lower:
-                    continue  # case difference — already normalized elsewhere
-                # Score canonical names by word overlap + containment
-                _nw = set(_name.lower().split())
-                _best, _best_score = None, 0
-                for _c in avail_clients:
-                    _cw    = set(_c.lower().split())
-                    _score = len(_nw & _cw)
-                    if _name.lower() in _c.lower() or _c.lower() in _name.lower():
-                        _score += 3
-                    if _score > _best_score:
-                        _best_score, _best = _score, _c
-                _result.append((_idx, _name, _best if _best_score > 0 else None))
-            return _result
+                _bad.append(_name)
+            return list(dict.fromkeys(_bad))   # unique, order preserved
 
-        def _show_name_mismatch_ui(mismatches, df_key, btn_key, avail_clients):
-            """Render a warning + auto-fix button for client name mismatches."""
-            if not mismatches:
+        def _show_name_mismatch_ui(bad_names, label=""):
+            """Warn about client names not in the cascade."""
+            if not bad_names:
                 return
-            _lines = []
-            for _, _old, _sug in mismatches:
-                if _sug:
-                    _lines.append(f"- `{_old}` → **sugerido:** {_sug}")
-                else:
-                    _lines.append(f"- `{_old}` — sin coincidencia en la cascada")
             st.warning(
-                f"⚠️ **{len(mismatches)} nombre(s) no encontrado(s)** en la cascada. "
-                "Estas filas serán **ignoradas** al aplicar el cascade. "
-                "Corrígelos en la tabla o usa el botón de abajo.\n\n"
-                + "\n".join(_lines)
+                f"⚠️ **{len(bad_names)} nombre(s) no encontrado(s)** en la cascada "
+                f"— estas filas serán ignoradas: "
+                + ", ".join(f"`{n}`" for n in bad_names[:8])
+                + (" ..." if len(bad_names) > 8 else "")
+                + "\n\n💡 Si el nombre cambió en HubSpot, vuelve a subir el archivo HubSpot "
+                "y re-corre la cascada — los nombres se unifican automáticamente por Record ID."
             )
-            _has_suggestions = any(s for _, _, s in mismatches)
-            if _has_suggestions:
-                if st.button("🔧 Auto-corregir nombres sugeridos", key=btn_key):
-                    _df_fix = st.session_state[df_key].copy()
-                    for _fix_idx, _old_n, _sug_n in mismatches:
-                        if _sug_n and _fix_idx in _df_fix.index:
-                            _df_fix.at[_fix_idx, 'Client'] = _sug_n
-                    st.session_state[df_key] = _df_fix
-                    st.rerun(scope="fragment")
 
         @st.fragment
         def _hist_tab_fragment():
@@ -5047,9 +5038,9 @@ if "calc_data" in st.session_state:
                 st.session_state.historical_df.insert(0, "Confirmed", False)
             if "POD" not in st.session_state.historical_df.columns:
                 st.session_state.historical_df.insert(1, "POD", "")
-            # Validate client names in current table (catches both uploaded and typed names)
+            # Validate client names in current table
             _hist_mm = _find_name_mismatches(st.session_state.historical_df, _avail_cli_h)
-            _show_name_mismatch_ui(_hist_mm, 'historical_df', 'hist_autofix_btn', _avail_cli_h)
+            _show_name_mismatch_ui(_hist_mm)
             st.caption("☑️ **Confirmed** rows are included in the cascade. All uploaded rows are confirmed by default.")
             st.session_state.historical_df = st.data_editor(
                 st.session_state.historical_df,
@@ -5139,7 +5130,7 @@ if "calc_data" in st.session_state:
             # Validate client names in current table
             _red_avail = st.session_state.calc_data.get('clientes_validos', [])
             _red_mm = _find_name_mismatches(st.session_state.reductions_df, _red_avail)
-            _show_name_mismatch_ui(_red_mm, 'reductions_df', 'red_autofix_btn', _red_avail)
+            _show_name_mismatch_ui(_red_mm)
             st.caption("☑️ Check **Confirmed** on each row to include it in the cascade. Unconfirmed rows are ignored.")
             st.session_state.reductions_df = st.data_editor(
                 st.session_state.reductions_df,
