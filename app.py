@@ -1077,8 +1077,71 @@ def _load_volume_aht(uploaded_file, log):
                 if _c_status:
                     _srs = _srs[_srs[_c_status].astype(str).str.strip().str.lower() != 'attrition']
 
-                # Build lookup: record_id → sr_email  AND  client_name_lower → sr_email
-                # Deduplicate: one Sr per client (keep first occurrence)
+                # ── Detect Client Status column (for churn exclusion) ──────────────────
+                _c_cli_status = next(
+                    (v for k, v in _srs_col.items() if 'client' in k and 'status' in k), None
+                )
+
+                # ── Build Sr. Ratios data from FULL (non-deduped) srs ────────────────
+                # Rule 1: exclude clients whose Client Status contains 'churn' (case-insensitive)
+                # Rule 2: shared clients (n Srs) → weight = 1/n so hours are never double-counted
+                _srs_for_ratios = _srs.copy()
+                if _c_cli_status:
+                    _churn_mask = (
+                        _srs_for_ratios[_c_cli_status]
+                        .astype(str).str.lower().str.contains('churn', na=False)
+                    )
+                    _churn_excluded = int(_churn_mask.sum())
+                    _srs_for_ratios = _srs_for_ratios[~_churn_mask]
+                else:
+                    _churn_excluded = 0
+
+                # Build client_key → [sr_email, ...] (deduped per client)
+                _cli_srs_map  = {}   # {client_key → [sr_email, ...]}
+                _cli_key_type = {}   # {client_key → 'rid' | 'name'}
+                for _, _rr in _srs_for_ratios.iterrows():
+                    _em_r = str(_rr.get(_c_email, '') or '').strip().lower()
+                    if not _em_r or _em_r in ('nan', 'none', ''):
+                        continue
+                    _rid_r = ''
+                    if _c_rid:
+                        _rid_r = _clean_record_id(pd.Series([_rr.get(_c_rid, '')])).iloc[0]
+                    _cn_r  = str(_rr.get(_c_client, '') or '').strip().lower()
+                    _ckey  = _rid_r if _rid_r else _cn_r
+                    if not _ckey:
+                        continue
+                    _cli_srs_map.setdefault(_ckey, [])
+                    if _em_r not in _cli_srs_map[_ckey]:
+                        _cli_srs_map[_ckey].append(_em_r)
+                    _cli_key_type[_ckey] = 'rid' if _rid_r else 'name'
+
+                # Share weights: 1 / max(n_srs, 1) — zero-div safe
+                _sw_rid_map  = {}   # {record_id       → weight}
+                _sw_name_map = {}   # {client_name_low → weight}
+                for _ck, _emlist in _cli_srs_map.items():
+                    _w = 1.0 / max(len(_emlist), 1)
+                    if _cli_key_type.get(_ck) == 'rid':
+                        _sw_rid_map[_ck]  = _w
+                    else:
+                        _sw_name_map[_ck] = _w
+
+                # Client count per Sr. directly from srs sheet (post churn filter)
+                _srs_cli_cnt = {}
+                for _ck, _emlist in _cli_srs_map.items():
+                    for _em_c in _emlist:
+                        _srs_cli_cnt[_em_c] = _srs_cli_cnt.get(_em_c, 0) + 1
+
+                _n_shared = sum(1 for v in _cli_srs_map.values() if len(v) > 1)
+                st.session_state['_srs_ratios_data'] = {
+                    'cli_cnt_by_email':  _srs_cli_cnt,
+                    'share_weight_rid':  _sw_rid_map,
+                    'share_weight_name': _sw_name_map,
+                }
+                log(f"  srs ratios: {len(_srs_cli_cnt)} Srs · "
+                    f"{len(_cli_srs_map)} active clients "
+                    f"({_churn_excluded} churn excluded, {_n_shared} shared)")
+
+                # ── Deduped lookup for df['Sr. Accountant'] update (unchanged) ────────
                 _srs_dedup = _srs.drop_duplicates(subset=[_c_client], keep='first')
                 _srs_rid_map  = {}
                 _srs_name_map = {}
@@ -6377,39 +6440,62 @@ if "calc_data" in st.session_state:
             _sr_auto_opts    = [f"M{i+1} — {m}" for i, m in enumerate(meses_proyeccion)]
             _sr_auto_mi_idx  = _sr_auto_opts.index(_sr_auto_mi) if _sr_auto_mi in _sr_auto_opts else 0
             _sr_auto_net_days = _sr_auto_wday.get(_sr_auto_mi_idx, 20)
-            _df_ca = st.session_state.get('df_clean', pd.DataFrame())
-            # Clients per Sr. — active (non-churned) clients only: FSD is null or >= today
-            # Normalize Sr. Accountant column: if it's a name (no @), map to email via HC data
-            _sr_auto_cli_cnt = {}
-            if 'Sr. Accountant' in _df_ca.columns and 'client_name' in _df_ca.columns:
-                _n2e_a = {str(_n).lower().strip(): str(_d.get('email', '')).lower().strip()
-                          for _n, _d in (_sr_auto_hc.get('by_sr', {}) or {}).items()
-                          if str(_d.get('email', '')).strip()}
-                _today_sr  = pd.Timestamp.today().normalize()
-                _fsd_ca    = pd.to_datetime(_df_ca.get('Final Service Date', pd.Series(dtype='datetime64[ns]')), errors='coerce')
-                _active_ca = _df_ca[_fsd_ca.isna() | (_fsd_ca >= _today_sr)]
-                _active_ca = _active_ca[_active_ca['Sr. Accountant'].astype(str).str.strip().ne('')]
-                _sr_col_a  = _active_ca['Sr. Accountant'].astype(str).str.lower().str.strip()
-                _norm_a    = _sr_col_a.apply(lambda v: _n2e_a.get(v, v) if '@' not in v else v)
-                _sr_auto_cli_cnt = _active_ca.groupby(_norm_a)['client_name'].nunique().to_dict()
-            # Productive hrs per Sr.
+            _df_ca    = st.session_state.get('df_clean', pd.DataFrame())
+            _srs_rd_a = st.session_state.get('_srs_ratios_data', {})
+            # ── Client count: srs sheet (authoritative) or df_clean FSD fallback ──
+            if _srs_rd_a.get('cli_cnt_by_email'):
+                _sr_auto_cli_cnt = dict(_srs_rd_a['cli_cnt_by_email'])
+            else:
+                _sr_auto_cli_cnt = {}
+                if 'Sr. Accountant' in _df_ca.columns and 'client_name' in _df_ca.columns:
+                    _n2e_a = {str(_n).lower().strip(): str(_d.get('email', '')).lower().strip()
+                              for _n, _d in (_sr_auto_hc.get('by_sr', {}) or {}).items()
+                              if str(_d.get('email', '')).strip()}
+                    _today_sr  = pd.Timestamp.today().normalize()
+                    _fsd_ca    = pd.to_datetime(_df_ca.get('Final Service Date', pd.Series(dtype='datetime64[ns]')), errors='coerce')
+                    _active_ca = _df_ca[_fsd_ca.isna() | (_fsd_ca >= _today_sr)]
+                    _active_ca = _active_ca[_active_ca['Sr. Accountant'].astype(str).str.strip().ne('')]
+                    _sr_col_a  = _active_ca['Sr. Accountant'].astype(str).str.lower().str.strip()
+                    _norm_a    = _sr_col_a.apply(lambda v: _n2e_a.get(v, v) if '@' not in v else v)
+                    _sr_auto_cli_cnt = _active_ca.groupby(_norm_a)['client_name'].nunique().to_dict()
+            # ── Apply share weights to hours (shared-client math, zero-div safe) ──
+            _sw_rid_a  = _srs_rd_a.get('share_weight_rid',  {})
+            _sw_name_a = _srs_rd_a.get('share_weight_name', {})
+            _df_ca_w = _df_ca.copy()
+            if (_sw_rid_a or _sw_name_a) and not _df_ca_w.empty:
+                _rid_s_a  = (_df_ca_w['record_id'].astype(str).str.strip()
+                             if 'record_id' in _df_ca_w.columns
+                             else pd.Series('', index=_df_ca_w.index))
+                _name_s_a = (_df_ca_w['client_name'].astype(str).str.lower().str.strip()
+                             if 'client_name' in _df_ca_w.columns
+                             else pd.Series('', index=_df_ca_w.index))
+                _w_vals_a = [_sw_rid_a.get(r) or _sw_name_a.get(n) or 1.0
+                             for r, n in zip(_rid_s_a, _name_s_a)]
+                _df_ca_w['_w'] = _w_vals_a
+                for _hcol_a in ['Capacity Processing Hours', 'Capacity reviewing hours']:
+                    if _hcol_a in _df_ca_w.columns:
+                        _df_ca_w[_hcol_a] = (
+                            pd.to_numeric(_df_ca_w[_hcol_a], errors='coerce').fillna(0.0)
+                            * _df_ca_w['_w']
+                        )
+            # Productive hrs per Sr. (weighted)
             _sr_auto_prod_hrs = {}
-            if ('processor' in _df_ca.columns and 'Capacity Processing Hours' in _df_ca.columns
-                    and 'reviewer' in _df_ca.columns and 'Capacity reviewing hours' in _df_ca.columns):
-                _pm = _df_ca.groupby(_df_ca['processor'].astype(str).str.lower().str.strip())['Capacity Processing Hours'].sum().to_dict()
-                _rm = _df_ca.groupby(_df_ca['reviewer'].astype(str).str.lower().str.strip())['Capacity reviewing hours'].sum().to_dict()
+            if ('processor' in _df_ca_w.columns and 'Capacity Processing Hours' in _df_ca_w.columns
+                    and 'reviewer' in _df_ca_w.columns and 'Capacity reviewing hours' in _df_ca_w.columns):
+                _pm = _df_ca_w.groupby(_df_ca_w['processor'].astype(str).str.lower().str.strip())['Capacity Processing Hours'].sum().to_dict()
+                _rm = _df_ca_w.groupby(_df_ca_w['reviewer'].astype(str).str.lower().str.strip())['Capacity reviewing hours'].sum().to_dict()
                 for _ema in set(_pm) | set(_rm):
                     _sr_auto_prod_hrs[_ema] = float(_pm.get(_ema, 0.0)) + float(_rm.get(_ema, 0.0))
-            # MEC & Other hrs per Sr.
+            # MEC & Other hrs per Sr. (weighted)
             _sr_auto_mec, _sr_auto_other = {}, {}
             _need_a = ['Ideal Proc', 'Ideal Rev', 'Capacity Processing Hours', 'Capacity reviewing hours', 'type', 'Sr. Accountant']
-            if not _df_ca.empty and all(c in _df_ca.columns for c in _need_a):
-                _sk   = _df_ca['Sr. Accountant'].astype(str).str.lower().str.strip()
-                _ipa  = _df_ca['Ideal Proc'].astype(str).str.strip()
-                _ira  = _df_ca['Ideal Rev'].astype(str).str.strip()
-                _tya  = _df_ca['type'].astype(str).str.strip().str.upper()
-                _pha  = pd.to_numeric(_df_ca['Capacity Processing Hours'], errors='coerce').fillna(0.0)
-                _rha  = pd.to_numeric(_df_ca['Capacity reviewing hours'],  errors='coerce').fillna(0.0)
+            if not _df_ca_w.empty and all(c in _df_ca_w.columns for c in _need_a):
+                _sk   = _df_ca_w['Sr. Accountant'].astype(str).str.lower().str.strip()
+                _ipa  = _df_ca_w['Ideal Proc'].astype(str).str.strip()
+                _ira  = _df_ca_w['Ideal Rev'].astype(str).str.strip()
+                _tya  = _df_ca_w['type'].astype(str).str.strip().str.upper()
+                _pha  = pd.to_numeric(_df_ca_w['Capacity Processing Hours'], errors='coerce').fillna(0.0)
+                _rha  = pd.to_numeric(_df_ca_w['Capacity reviewing hours'],  errors='coerce').fillna(0.0)
                 _cpa  = pd.concat([
                     pd.DataFrame({'_sr': _sk[_ipa == 'Sr. Accountant'], '_ty': _tya[_ipa == 'Sr. Accountant'], '_h': _pha[_ipa == 'Sr. Accountant']}),
                     pd.DataFrame({'_sr': _sk[_ira == 'Sr. Accountant'], '_ty': _tya[_ira == 'Sr. Accountant'], '_h': _rha[_ira == 'Sr. Accountant']}),
@@ -8956,35 +9042,60 @@ if "calc_data" in st.session_state:
                 _sr_opts_x   = [f"M{i+1} — {m}" for i, m in enumerate(meses_proyeccion)]
                 _sr_mi_idx_x = _sr_opts_x.index(_sr_mi_x) if _sr_mi_x in _sr_opts_x else 0
                 _sr_ndays_x  = _sr_wday_exp.get(_sr_mi_idx_x, 20)
-                _df_cx = st.session_state.get('df_clean', pd.DataFrame())
-                _sr_cli_x = {}
-                if not _df_cx.empty and 'Sr. Accountant' in _df_cx.columns and 'client_name' in _df_cx.columns:
-                    _n2e_x    = {str(_n).lower().strip(): str(_d.get('email', '')).lower().strip()
-                                 for _n, _d in (_sr_hc_exp.get('by_sr', {}) or {}).items()
-                                 if str(_d.get('email', '')).strip()}
-                    _fsd_cx    = pd.to_datetime(_df_cx.get('Final Service Date', pd.Series(dtype='datetime64[ns]')), errors='coerce')
-                    _today_cx  = pd.Timestamp.today().normalize()
-                    _active_cx = _df_cx[_fsd_cx.isna() | (_fsd_cx >= _today_cx)]
-                    _active_cx = _active_cx[_active_cx['Sr. Accountant'].astype(str).str.strip().ne('')]
-                    _sr_col_x  = _active_cx['Sr. Accountant'].astype(str).str.lower().str.strip()
-                    _norm_x    = _sr_col_x.apply(lambda v: _n2e_x.get(v, v) if '@' not in v else v)
-                    _sr_cli_x  = _active_cx.groupby(_norm_x)['client_name'].nunique().to_dict()
+                _df_cx    = st.session_state.get('df_clean', pd.DataFrame())
+                _srs_rd_x = st.session_state.get('_srs_ratios_data', {})
+                # ── Client count: srs sheet (authoritative) or df_clean FSD fallback ──
+                if _srs_rd_x.get('cli_cnt_by_email'):
+                    _sr_cli_x = dict(_srs_rd_x['cli_cnt_by_email'])
+                else:
+                    _sr_cli_x = {}
+                    if not _df_cx.empty and 'Sr. Accountant' in _df_cx.columns and 'client_name' in _df_cx.columns:
+                        _n2e_x    = {str(_n).lower().strip(): str(_d.get('email', '')).lower().strip()
+                                     for _n, _d in (_sr_hc_exp.get('by_sr', {}) or {}).items()
+                                     if str(_d.get('email', '')).strip()}
+                        _fsd_cx    = pd.to_datetime(_df_cx.get('Final Service Date', pd.Series(dtype='datetime64[ns]')), errors='coerce')
+                        _today_cx  = pd.Timestamp.today().normalize()
+                        _active_cx = _df_cx[_fsd_cx.isna() | (_fsd_cx >= _today_cx)]
+                        _active_cx = _active_cx[_active_cx['Sr. Accountant'].astype(str).str.strip().ne('')]
+                        _sr_col_x  = _active_cx['Sr. Accountant'].astype(str).str.lower().str.strip()
+                        _norm_x    = _sr_col_x.apply(lambda v: _n2e_x.get(v, v) if '@' not in v else v)
+                        _sr_cli_x  = _active_cx.groupby(_norm_x)['client_name'].nunique().to_dict()
+                # ── Apply share weights to hours (shared-client math, zero-div safe) ──
+                _sw_rid_x  = _srs_rd_x.get('share_weight_rid',  {})
+                _sw_name_x = _srs_rd_x.get('share_weight_name', {})
+                _df_cxw = _df_cx.copy()
+                if (_sw_rid_x or _sw_name_x) and not _df_cxw.empty:
+                    _rid_s_x  = (_df_cxw['record_id'].astype(str).str.strip()
+                                 if 'record_id' in _df_cxw.columns
+                                 else pd.Series('', index=_df_cxw.index))
+                    _name_s_x = (_df_cxw['client_name'].astype(str).str.lower().str.strip()
+                                 if 'client_name' in _df_cxw.columns
+                                 else pd.Series('', index=_df_cxw.index))
+                    _w_vals_x = [_sw_rid_x.get(r) or _sw_name_x.get(n) or 1.0
+                                 for r, n in zip(_rid_s_x, _name_s_x)]
+                    _df_cxw['_w'] = _w_vals_x
+                    for _hcol_x in ['Capacity Processing Hours', 'Capacity reviewing hours']:
+                        if _hcol_x in _df_cxw.columns:
+                            _df_cxw[_hcol_x] = (
+                                pd.to_numeric(_df_cxw[_hcol_x], errors='coerce').fillna(0.0)
+                                * _df_cxw['_w']
+                            )
                 _sr_prh_x = {}
-                if ('processor' in _df_cx.columns and 'Capacity Processing Hours' in _df_cx.columns
-                        and 'reviewer' in _df_cx.columns and 'Capacity reviewing hours' in _df_cx.columns):
-                    _pm_x = _df_cx.groupby(_df_cx['processor'].astype(str).str.lower().str.strip())['Capacity Processing Hours'].sum().to_dict()
-                    _rm_x = _df_cx.groupby(_df_cx['reviewer'].astype(str).str.lower().str.strip())['Capacity reviewing hours'].sum().to_dict()
+                if ('processor' in _df_cxw.columns and 'Capacity Processing Hours' in _df_cxw.columns
+                        and 'reviewer' in _df_cxw.columns and 'Capacity reviewing hours' in _df_cxw.columns):
+                    _pm_x = _df_cxw.groupby(_df_cxw['processor'].astype(str).str.lower().str.strip())['Capacity Processing Hours'].sum().to_dict()
+                    _rm_x = _df_cxw.groupby(_df_cxw['reviewer'].astype(str).str.lower().str.strip())['Capacity reviewing hours'].sum().to_dict()
                     for _ex in set(_pm_x) | set(_rm_x):
                         _sr_prh_x[_ex] = float(_pm_x.get(_ex, 0.0)) + float(_rm_x.get(_ex, 0.0))
                 _sr_mec_x, _sr_oth_x = {}, {}
                 _need_x = ['Ideal Proc', 'Ideal Rev', 'Capacity Processing Hours', 'Capacity reviewing hours', 'type', 'Sr. Accountant']
-                if not _df_cx.empty and all(c in _df_cx.columns for c in _need_x):
-                    _sk_x  = _df_cx['Sr. Accountant'].astype(str).str.lower().str.strip()
-                    _ip_x  = _df_cx['Ideal Proc'].astype(str).str.strip()
-                    _ir_x  = _df_cx['Ideal Rev'].astype(str).str.strip()
-                    _ty_x  = _df_cx['type'].astype(str).str.strip().str.upper()
-                    _ph_x  = pd.to_numeric(_df_cx['Capacity Processing Hours'], errors='coerce').fillna(0.0)
-                    _rh_x  = pd.to_numeric(_df_cx['Capacity reviewing hours'],  errors='coerce').fillna(0.0)
+                if not _df_cxw.empty and all(c in _df_cxw.columns for c in _need_x):
+                    _sk_x  = _df_cxw['Sr. Accountant'].astype(str).str.lower().str.strip()
+                    _ip_x  = _df_cxw['Ideal Proc'].astype(str).str.strip()
+                    _ir_x  = _df_cxw['Ideal Rev'].astype(str).str.strip()
+                    _ty_x  = _df_cxw['type'].astype(str).str.strip().str.upper()
+                    _ph_x  = pd.to_numeric(_df_cxw['Capacity Processing Hours'], errors='coerce').fillna(0.0)
+                    _rh_x  = pd.to_numeric(_df_cxw['Capacity reviewing hours'],  errors='coerce').fillna(0.0)
                     _cp_x  = pd.concat([
                         pd.DataFrame({'_sr': _sk_x[_ip_x=='Sr. Accountant'], '_ty': _ty_x[_ip_x=='Sr. Accountant'], '_h': _ph_x[_ip_x=='Sr. Accountant']}),
                         pd.DataFrame({'_sr': _sk_x[_ir_x=='Sr. Accountant'], '_ty': _ty_x[_ir_x=='Sr. Accountant'], '_h': _rh_x[_ir_x=='Sr. Accountant']}),
@@ -9237,34 +9348,57 @@ if "calc_data" in st.session_state:
                 # Sr. Accountant (col AD) = Sr. email → unique client count
                 _df_c = st.session_state.get('df_clean', pd.DataFrame())
 
-                # Clients assigned: non-churned clients from df_clean (FSD null or >= today)
-                # Normalize Sr. Accountant: map name → email via HC data so the dict is
-                # always keyed by email (matching the HC loop key _sr_em)
-                _sr_cli_count_by_email = {}
-                if not _df_c.empty and 'Sr. Accountant' in _df_c.columns and 'client_name' in _df_c.columns:
-                    _n2e_c    = {str(_n).lower().strip(): str(_d.get('email', '')).lower().strip()
-                                 for _n, _d in (_hc_sr.get('by_sr', {}) or {}).items()
-                                 if str(_d.get('email', '')).strip()}
-                    _fsd_ct    = pd.to_datetime(_df_c.get('Final Service Date', pd.Series(dtype='datetime64[ns]')), errors='coerce')
-                    _today_ct  = pd.Timestamp.today().normalize()
-                    _active_ct = _df_c[_fsd_ct.isna() | (_fsd_ct >= _today_ct)]
-                    _active_ct = _active_ct[_active_ct['Sr. Accountant'].astype(str).str.strip().ne('')]
-                    _sr_col_c  = _active_ct['Sr. Accountant'].astype(str).str.lower().str.strip()
-                    _norm_c    = _sr_col_c.apply(lambda v: _n2e_c.get(v, v) if '@' not in v else v)
-                    _sr_cli_count_by_email = _active_ct.groupby(_norm_c)['client_name'].nunique().to_dict()
+                # ── Client count: srs sheet (authoritative) or df_clean FSD fallback ──
+                _srs_rd_c = st.session_state.get('_srs_ratios_data', {})
+                if _srs_rd_c.get('cli_cnt_by_email'):
+                    _sr_cli_count_by_email = dict(_srs_rd_c['cli_cnt_by_email'])
+                else:
+                    _sr_cli_count_by_email = {}
+                    if not _df_c.empty and 'Sr. Accountant' in _df_c.columns and 'client_name' in _df_c.columns:
+                        _n2e_c    = {str(_n).lower().strip(): str(_d.get('email', '')).lower().strip()
+                                     for _n, _d in (_hc_sr.get('by_sr', {}) or {}).items()
+                                     if str(_d.get('email', '')).strip()}
+                        _fsd_ct    = pd.to_datetime(_df_c.get('Final Service Date', pd.Series(dtype='datetime64[ns]')), errors='coerce')
+                        _today_ct  = pd.Timestamp.today().normalize()
+                        _active_ct = _df_c[_fsd_ct.isna() | (_fsd_ct >= _today_ct)]
+                        _active_ct = _active_ct[_active_ct['Sr. Accountant'].astype(str).str.strip().ne('')]
+                        _sr_col_c  = _active_ct['Sr. Accountant'].astype(str).str.lower().str.strip()
+                        _norm_c    = _sr_col_c.apply(lambda v: _n2e_c.get(v, v) if '@' not in v else v)
+                        _sr_cli_count_by_email = _active_ct.groupby(_norm_c)['client_name'].nunique().to_dict()
 
-                # Productive hours: processing hrs (processor col) + reviewing hrs (reviewer col)
+                # ── Apply share weights to hours (shared-client math, zero-div safe) ──
+                _sw_rid_c  = _srs_rd_c.get('share_weight_rid',  {})
+                _sw_name_c = _srs_rd_c.get('share_weight_name', {})
+                _df_cw = _df_c.copy()
+                if (_sw_rid_c or _sw_name_c) and not _df_cw.empty:
+                    _rid_s_c  = (_df_cw['record_id'].astype(str).str.strip()
+                                 if 'record_id' in _df_cw.columns
+                                 else pd.Series('', index=_df_cw.index))
+                    _name_s_c = (_df_cw['client_name'].astype(str).str.lower().str.strip()
+                                 if 'client_name' in _df_cw.columns
+                                 else pd.Series('', index=_df_cw.index))
+                    _w_vals_c = [_sw_rid_c.get(r) or _sw_name_c.get(n) or 1.0
+                                 for r, n in zip(_rid_s_c, _name_s_c)]
+                    _df_cw['_w'] = _w_vals_c
+                    for _hcol_c in ['Capacity Processing Hours', 'Capacity reviewing hours']:
+                        if _hcol_c in _df_cw.columns:
+                            _df_cw[_hcol_c] = (
+                                pd.to_numeric(_df_cw[_hcol_c], errors='coerce').fillna(0.0)
+                                * _df_cw['_w']
+                            )
+
+                # Productive hours per Sr. (weighted)
                 _sr_prod_hrs_by_email = {}
                 _proc_h = 'Capacity Processing Hours'
                 _rev_h  = 'Capacity reviewing hours'
-                if ('processor' in _df_c.columns and _proc_h in _df_c.columns
-                        and 'reviewer' in _df_c.columns and _rev_h in _df_c.columns):
+                if ('processor' in _df_cw.columns and _proc_h in _df_cw.columns
+                        and 'reviewer' in _df_cw.columns and _rev_h in _df_cw.columns):
                     _proc_map = (
-                        _df_c.groupby(_df_c['processor'].astype(str).str.lower().str.strip())[_proc_h]
+                        _df_cw.groupby(_df_cw['processor'].astype(str).str.lower().str.strip())[_proc_h]
                         .sum().to_dict()
                     )
                     _rev_map = (
-                        _df_c.groupby(_df_c['reviewer'].astype(str).str.lower().str.strip())[_rev_h]
+                        _df_cw.groupby(_df_cw['reviewer'].astype(str).str.lower().str.strip())[_rev_h]
                         .sum().to_dict()
                     )
                     for _em in set(_proc_map) | set(_rev_map):
@@ -9275,41 +9409,32 @@ if "calc_data" in st.session_state:
                 # Role mode (follows Step 3 selection)
                 _s3_real = st.session_state.get('s3_role_mode_radio', '').startswith("👥")
 
-                # ── Pre-compute MEC & Other hrs from df_clean ────────────────
-                # For clients where Sr. Accountant (col AD) = sr_email:
-                #   · If Ideal Proc == 'Sr. Accountant' → add Capacity Processing Hours (col L)
-                #   · If Ideal Rev  == 'Sr. Accountant' → add Capacity reviewing hours  (col M)
-                # Split by type (col B): 'MEC' vs 'Other'
+                # ── MEC & Other hrs from df_clean (weighted) ────────────────────────
                 _mec_rev_by_email   = {}
                 _other_rev_by_email = {}
                 _need_cols = ['Ideal Proc', 'Ideal Rev',
                               'Capacity Processing Hours', 'Capacity reviewing hours',
                               'type', 'Sr. Accountant']
-                if not _df_c.empty and all(c in _df_c.columns for c in _need_cols):
-                    _sr_key  = _df_c['Sr. Accountant'].astype(str).str.lower().str.strip()
-                    _ip      = _df_c['Ideal Proc'].astype(str).str.strip()
-                    _ir      = _df_c['Ideal Rev'].astype(str).str.strip()
-                    _typ     = _df_c['type'].astype(str).str.strip().str.upper()
-                    _proc_h  = pd.to_numeric(_df_c['Capacity Processing Hours'], errors='coerce').fillna(0.0)
-                    _rev_h   = pd.to_numeric(_df_c['Capacity reviewing hours'],  errors='coerce').fillna(0.0)
+                if not _df_cw.empty and all(c in _df_cw.columns for c in _need_cols):
+                    _sr_key  = _df_cw['Sr. Accountant'].astype(str).str.lower().str.strip()
+                    _ip      = _df_cw['Ideal Proc'].astype(str).str.strip()
+                    _ir      = _df_cw['Ideal Rev'].astype(str).str.strip()
+                    _typ     = _df_cw['type'].astype(str).str.strip().str.upper()
+                    _proc_h  = pd.to_numeric(_df_cw['Capacity Processing Hours'], errors='coerce').fillna(0.0)
+                    _rev_h   = pd.to_numeric(_df_cw['Capacity reviewing hours'],  errors='coerce').fillna(0.0)
 
-                    # Proc contribution: Ideal Proc = 'Sr. Accountant' → processing hours
                     _p_mask = _ip == 'Sr. Accountant'
                     _proc_contrib = pd.DataFrame({
                         '_sr': _sr_key[_p_mask],
                         '_ty': _typ[_p_mask],
                         '_h':  _proc_h[_p_mask],
                     })
-
-                    # Rev contribution: Ideal Rev = 'Sr. Accountant' → reviewing hours
                     _r_mask = _ir == 'Sr. Accountant'
                     _rev_contrib = pd.DataFrame({
                         '_sr': _sr_key[_r_mask],
                         '_ty': _typ[_r_mask],
                         '_h':  _rev_h[_r_mask],
                     })
-
-                    # Combine, group by Sr. email × type, pivot
                     _combined = pd.concat([_proc_contrib, _rev_contrib], ignore_index=True)
                     if not _combined.empty:
                         _pivoted = (
