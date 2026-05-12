@@ -980,6 +980,18 @@ def _detect_file_type(uploaded_file):
     return 'unknown'
 
 
+def _clean_record_id(series):
+    def _rid_str(v):
+        try:
+            f = float(v)
+            if pd.isna(f): return ''
+            return str(int(f))
+        except (ValueError, TypeError):
+            s = str(v).strip()
+            return '' if s.lower() in ('nan', 'none', '') else s
+    return series.apply(_rid_str)
+
+
 def _load_volume_aht(uploaded_file, log):
     """Load the Volume & AHT source file."""
     uploaded_file.seek(0)
@@ -1001,6 +1013,11 @@ def _load_volume_aht(uploaded_file, log):
             seen[c] = 0
             new_cols.append(c)
     df.columns = new_cols
+
+    # ── Capture Record ID (PK) from volume file ────────────────────────────
+    _rid_candidates = [c for c in df.columns
+                       if 'record' in str(c).lower() and 'id' in str(c).lower()]
+    df['record_id'] = _clean_record_id(df[_rid_candidates[0]]) if _rid_candidates else ''
 
     if 'Proc Role' not in df.columns:
         if 'Rev Role' in df.columns:
@@ -1148,13 +1165,67 @@ def _apply_hubspot(df_vol, uploaded_file, log, is_update=False):
     df_hs['_hs_res_doors'] = pd.to_numeric(df_hs.get('Recent - Residential Doors',  pd.Series(dtype=float)), errors='coerce')
     df_hs['_hs_sqft']      = pd.to_numeric(df_hs.get('Recent - Commercial SQFT',    pd.Series(dtype=float)), errors='coerce')
 
-    hs_merge = df_hs[['client_name', 'MRR', 'Go Live', 'Final Service Date',
-                       'PMS', '_hs_pod', '_hs_res_doors', '_hs_sqft']].drop_duplicates(subset=['client_name'])
+    # ── Build HubSpot merge tables ────────────────────────────────────────
+    _hs_fields = ['MRR', 'Go Live', 'Final Service Date', 'PMS', '_hs_pod', '_hs_res_doors', '_hs_sqft']
+    _hs_export_cols = ['client_name', 'record_id'] + _hs_fields
+    _hs_export_cols = [c for c in _hs_export_cols if c in df_hs.columns]
+    hs_all = df_hs[_hs_export_cols].copy()
 
-    # Drop stale cols from vol — POD is intentionally excluded so master DB assignments are preserved
+    # Drop stale cols from vol
     drop_these = ['MRR', 'Go Live', 'Final Service Date', 'PMS']
     df_vol = df_vol.drop(columns=[c for c in drop_these if c in df_vol.columns], errors='ignore')
-    df_vol = df_vol.merge(hs_merge, on='client_name', how='left')
+
+    # Ensure vol has record_id column
+    if 'record_id' not in df_vol.columns:
+        df_vol['record_id'] = ''
+
+    # ── Primary merge: on record_id (where both sides have non-empty record_id) ──
+    _has_rid_vol = df_vol['record_id'].ne('')
+    _has_rid_hs  = hs_all['record_id'].ne('') if 'record_id' in hs_all.columns else pd.Series(False, index=hs_all.index)
+    hs_by_rid = hs_all[_has_rid_hs].drop_duplicates(subset=['record_id'])
+
+    # Secondary merge table: by client_name (for rows without record_id)
+    hs_by_name = hs_all.drop_duplicates(subset=['client_name'])
+
+    # Split vol into "has record_id" and "doesn't have record_id"
+    _vol_with_rid  = df_vol[_has_rid_vol].copy()
+    _vol_no_rid    = df_vol[~_has_rid_vol].copy()
+
+    # Merge "has rid" side on record_id — HubSpot client_name overrides vol's on match
+    if not _vol_with_rid.empty:
+        # Preserve original client_name for rows that get no HubSpot match
+        _orig_names = _vol_with_rid['client_name'].values.copy()
+        _vol_with_rid = _vol_with_rid.drop(columns=['client_name'], errors='ignore')
+        if not hs_by_rid.empty:
+            _vol_with_rid = _vol_with_rid.merge(
+                hs_by_rid[['record_id', 'client_name'] + [c for c in _hs_fields if c in hs_by_rid.columns]],
+                on='record_id', how='left'
+            )
+        # Restore client_name for unmatched rows (NaN after left-join or merge skipped)
+        if 'client_name' not in _vol_with_rid.columns:
+            _vol_with_rid['client_name'] = _orig_names
+        else:
+            _no_match = _vol_with_rid['client_name'].isna()
+            _vol_with_rid.loc[_no_match, 'client_name'] = _orig_names[_no_match.values]
+        # For rows still missing HubSpot fields, fall back to name-based lookup
+        _hs_name_only_f = hs_by_name[[c for c in ['client_name'] + _hs_fields if c in hs_by_name.columns]]
+        _missing_mrr = _vol_with_rid['MRR'].isna() if 'MRR' in _vol_with_rid.columns else pd.Series(True, index=_vol_with_rid.index)
+        if _missing_mrr.any():
+            _fb = _vol_with_rid[_missing_mrr].drop(columns=[c for c in _hs_fields if c in _vol_with_rid.columns], errors='ignore')
+            _fb = _fb.merge(_hs_name_only_f, on='client_name', how='left')
+            _vol_with_rid = pd.concat([_vol_with_rid[~_missing_mrr], _fb], ignore_index=True)
+
+    # Merge "no rid" side on client_name
+    if not _vol_no_rid.empty:
+        _hs_name_only = hs_by_name[[c for c in ['client_name'] + _hs_fields if c in hs_by_name.columns]]
+        _vol_no_rid = _vol_no_rid.merge(_hs_name_only, on='client_name', how='left')
+
+    df_vol = pd.concat([_vol_with_rid, _vol_no_rid], ignore_index=True)
+    log(f"  HubSpot enrichment applied (record_id merge): {len(hs_by_rid)} by ID, {len(hs_by_name)} by name")
+
+    # Ensure client_name exists after merge restructuring
+    if 'client_name' not in df_vol.columns:
+        df_vol['client_name'] = ''
 
     # POD: keep master DB value; only fall back to HubSpot POD when master DB has nothing
     if 'POD' not in df_vol.columns:
@@ -1170,8 +1241,6 @@ def _apply_hubspot(df_vol, uploaded_file, log, is_update=False):
     df_vol['Res doors']      = df_vol['Res doors'].fillna(df_vol['_hs_res_doors'])
     df_vol['SQFT Commercial'] = df_vol['SQFT Commercial'].fillna(df_vol['_hs_sqft'])
     df_vol = df_vol.drop(columns=['_hs_res_doors', '_hs_sqft'], errors='ignore')
-
-    log(f"  HubSpot enrichment applied: MRR, Go Live, FSD, PMS, POD for {len(hs_merge)} clients")
 
     # --- NEW CLIENTS (not in vol) ---
     existing_clients = set(df_vol['client_name'].str.lower().str.strip())
@@ -1239,7 +1308,7 @@ def _run_pipeline(files_by_type, log):
         log("── Step 4/4: No HubSpot file — MRR/dates not enriched")
 
     # Ensure canonical column order matching the rest of the app
-    must_have = ['client_name', 'type', 'subtype', 'processor', 'Proc Role',
+    must_have = ['record_id', 'client_name', 'type', 'subtype', 'processor', 'Proc Role',
                  'reviewer', 'Rev Role',
                  'Closed tickets with Proc time', 'Closed tickets with rev time',
                  '>>> FINAL Capacity Proc AHT', '>>> FINAL Capacity Rev AHT',
@@ -1291,7 +1360,7 @@ def _build_client_master_map():
     _hs  = st.session_state.get('hs_parsed')
     _ov  = st.session_state.get('hs_client_overrides', {})
 
-    _COLS = ['client_name', 'client_key', 'pod', 'sr_accountant',
+    _COLS = ['record_id', 'client_name', 'client_key', 'pod', 'sr_accountant',
              'mrr', 'go_live', 'fsd', 'source']
 
     if _df.empty:
@@ -1304,16 +1373,22 @@ def _build_client_master_map():
     # ── LAYER 1: Master DB (df_clean) ─────────────────────────────────────────
     _df2 = _df.copy()
     _df2['_key'] = _df2['client_name'].astype(str).str.lower().str.strip()
+    if 'record_id' in _df2.columns:
+        _df2['_rid'] = _clean_record_id(_df2['record_id'])
+    else:
+        _df2['_rid'] = ''
 
     _rows = []
     for _k, _g in _df2.groupby('_key', sort=False):
         _cn  = _g['client_name'].iloc[0]
+        _rid_val = _g['_rid'].replace('', pd.NA).dropna()
+        _rid_val = _rid_val.iloc[0] if not _rid_val.empty else ''
         _pod = _norm_pod(_first_valid(_g['POD']) if 'POD' in _g.columns else None)
         _sr  = _norm_str(_first_valid(_g['Sr. Accountant']) if 'Sr. Accountant' in _g.columns else None)
         _mrr = float(_first_valid(_g['MRR']) or 0)              if 'MRR'                  in _g.columns else 0.0
         _gl  = _first_valid(_g['Go Live'])                       if 'Go Live'              in _g.columns else pd.NaT
         _fsd = _first_valid(_g['Final Service Date'])            if 'Final Service Date'   in _g.columns else pd.NaT
-        _rows.append({'client_name': _cn, 'client_key': _k,
+        _rows.append({'record_id': _rid_val, 'client_name': _cn, 'client_key': _k,
                       'pod': _pod, 'sr_accountant': _sr,
                       'mrr': _mrr, 'go_live': _gl, 'fsd': _fsd,
                       'source': 'master_db'})
@@ -1329,12 +1404,20 @@ def _build_client_master_map():
                 _lkp = dict(zip(_duc2['_key'], _duc2[_col]))
                 _hit = _cmap['client_key'].isin(_lkp)
                 _cmap.loc[_hit, _tgt] = _cmap.loc[_hit, 'client_key'].map(_lkp)
+        # Sync record_id from df_clients_unique
+        if 'record_id' in _duc2.columns:
+            _rid_lkp = dict(zip(_duc2['_key'], _clean_record_id(_duc2['record_id'])))
+            _hit_rid = _cmap['client_key'].isin(_rid_lkp)
+            _cmap.loc[_hit_rid & (_cmap['record_id'] == ''), 'record_id'] = (
+                _cmap.loc[_hit_rid & (_cmap['record_id'] == ''), 'client_key'].map(_rid_lkp)
+            )
         # Add clients that are ONLY in df_clients_unique (edge case)
         _dup_keys = set(_cmap['client_key'])
         for _, _dr in _duc2.iterrows():
             if _dr['_key'] in _dup_keys:
                 continue
             _cmap = pd.concat([_cmap, pd.DataFrame([{
+                'record_id': str(_dr.get('record_id', '') or '').strip(),
                 'client_name': _dr['client_name'], 'client_key': _dr['_key'],
                 'pod': 'No POD', 'sr_accountant': '',
                 'mrr':   float(_dr.get('MRR', 0) or 0),
@@ -1361,6 +1444,22 @@ def _build_client_master_map():
             _cmap.loc[_hit, 'pod']    = _cmap.loc[_hit, 'client_key'].map(_hs_pod_lkp)
             _cmap.loc[_hit, 'source'] = _cmap.loc[_hit, 'source'].apply(
                 lambda s: 'hubspot' if s == 'master_db' else s)
+
+            # Also build record_id → pod lookup from HubSpot
+            _hs_rid_pod_lkp = {}
+            if 'record_id' in _hs2.columns:
+                for _, _hr in _hs2.iterrows():
+                    _hr_rid = str(_hr.get('record_id', '')).strip()
+                    _hp = _norm_pod(_hr.get('_pod', ''))
+                    if _hr_rid and _hp != 'No POD':
+                        _hs_rid_pod_lkp[_hr_rid] = _hp
+
+            # Update POD by record_id (overrides name-based for renamed clients)
+            for _cidx, _crow in _cmap.iterrows():
+                _crow_rid = str(_crow.get('record_id', '')).strip()
+                if _crow_rid in _hs_rid_pod_lkp:
+                    _cmap.at[_cidx, 'pod']    = _hs_rid_pod_lkp[_crow_rid]
+                    _cmap.at[_cidx, 'source'] = 'hubspot'
 
             # Also pull MRR / Go Live from HubSpot for existing & new clients
             _hs_mrr_col = next((c for c in _hs.columns
@@ -1395,6 +1494,7 @@ def _build_client_master_map():
                     _hfsd = pd.to_datetime(_hr.get(_hs_fsd_col, None), errors='coerce') if _hs_fsd_col else pd.NaT
                     _hp   = _hs_pod_lkp.get(_hk, 'No POD')
                     _cmap = pd.concat([_cmap, pd.DataFrame([{
+                        'record_id': str(_hr.get('record_id', '') or '').strip(),
                         'client_name': _hr[_hs_cn_col], 'client_key': _hk,
                         'pod': _hp, 'sr_accountant': '',
                         'mrr': _hmrr, 'go_live': _hgl, 'fsd': _hfsd,
@@ -1439,6 +1539,11 @@ def _build_client_master_map():
         }
         for _, row in _cmap.iterrows()
     }
+    st.session_state._rid_map = {
+        row['record_id']: row['client_key']
+        for _, row in _cmap.iterrows()
+        if str(row.get('record_id', '')).strip()
+    }
 
 
 def _parse_hubspot_file(uploaded_file):
@@ -1448,6 +1553,13 @@ def _parse_hubspot_file(uploaded_file):
     uploaded_file.seek(0)
     df = xl.parse(xl.sheet_names[0])
     df.columns = df.columns.str.strip()
+
+    # ── Capture Record ID (Column A / explicit column) ─────────────────────
+    _rid_col_hs = next(
+        (c for c in df.columns if str(c).lower().strip() in ('record id', 'record_id', 'hubspot record id', 'id')),
+        df.columns[0]  # fallback: first column (HubSpot puts Record ID in col A)
+    )
+    df['record_id'] = _clean_record_id(df[_rid_col_hs])
 
     # Normalize company name column
     _name_candidates = [c for c in df.columns if c.lower() in ['company name', 'company', 'client name', 'client_name']]
@@ -1655,9 +1767,29 @@ def _apply_hubspot_update(df_vol_base, df_new_base, uploaded_file, log):
     df_vol = df_vol_base.copy()
     updates = {'MRR': 0, 'Go Live': 0, 'Final Service Date': 0, 'New Clients': 0}
 
+    # Parse record_id from HubSpot update file
+    _rid_col_upd = next(
+        (c for c in df_hs.columns if str(c).lower().strip() in ('record id', 'record_id', 'hubspot record id', 'id')),
+        None
+    )
+    if _rid_col_upd:
+        df_hs['record_id'] = _clean_record_id(df_hs[_rid_col_upd])
+    else:
+        df_hs['record_id'] = ''
+
+    if 'record_id' not in df_vol.columns:
+        df_vol['record_id'] = ''
+
     for _, hs_row in df_hs.iterrows():
         cname = hs_row['client_name']
-        mask  = df_vol['client_name'].str.strip().str.lower() == cname.lower()
+        rid   = str(hs_row.get('record_id', '')).strip()
+        # Primary: match by record_id; fallback: by client_name
+        if rid:
+            mask = df_vol['record_id'] == rid
+            if not mask.any():
+                mask = df_vol['client_name'].str.strip().str.lower() == cname.lower()
+        else:
+            mask = df_vol['client_name'].str.strip().str.lower() == cname.lower()
         if mask.any():
             if pd.notna(hs_row['_mrr']):
                 df_vol.loc[mask, 'MRR'] = hs_row['_mrr']; updates['MRR'] += 1
@@ -1665,6 +1797,9 @@ def _apply_hubspot_update(df_vol_base, df_new_base, uploaded_file, log):
                 df_vol.loc[mask, 'Go Live'] = hs_row['_gl']; updates['Go Live'] += 1
             if pd.notna(hs_row['_fsd']):
                 df_vol.loc[mask, 'Final Service Date'] = hs_row['_fsd']; updates['Final Service Date'] += 1
+            # Sync client_name to HubSpot's authoritative name when matched by record_id
+            if rid and mask.any():
+                df_vol.loc[mask, 'client_name'] = cname
 
     log(f"  Updated existing clients — MRR: {updates['MRR']}, Go Live: {updates['Go Live']}, FSD: {updates['Final Service Date']}")
 
@@ -2484,6 +2619,19 @@ def _compute_dynamic_hc(emp_list, m_start, m_end):
         if fte > 0:
             role_fte[emp['role']] += fte
     return dict(role_fte)
+
+
+def _insert_rid_after_client(df):
+    """Move or insert Record ID column immediately after Client column."""
+    if 'record_id' not in df.columns and 'Record ID' not in df.columns:
+        return df
+    rid_col = 'Record ID' if 'Record ID' in df.columns else 'record_id'
+    if 'Client' not in df.columns:
+        return df
+    cols = [c for c in df.columns if c != rid_col]
+    idx  = cols.index('Client') + 1
+    cols.insert(idx, rid_col)
+    return df[cols]
 
 
 def _build_proj_export_df(pdata):
@@ -3713,11 +3861,14 @@ with tab1:
 
                     # MRR BASE VALIDATION
                     _loading_overlay(_s1_ov, "Step 1 · Building Baseline", "⚙️", 3, 5, "Computing client metrics…")
-                    df_clients_unique = df.groupby('client_name', as_index=False).agg({
+                    _duc_agg = {
                         'MRR':                'max',
                         'Go Live':            lambda x: x.dropna().iloc[0] if not x.dropna().empty else pd.NaT,
                         'Final Service Date': lambda x: x.dropna().iloc[0] if not x.dropna().empty else pd.NaT,
-                    })
+                    }
+                    if 'record_id' in df.columns:
+                        _duc_agg['record_id'] = lambda x: next((v for v in x if str(v).strip()), '')
+                    df_clients_unique = df.groupby('client_name', as_index=False).agg(_duc_agg)
 
                     st.session_state.df_clean         = df.copy()
                     st.session_state.df_clients_unique = df_clients_unique.copy()
@@ -4163,8 +4314,19 @@ if "calc_data" in st.session_state:
                 _fsd_diff = bool(_new_fsd) and _new_fsd != _cur_fsd_str  # only diff if FSD actually changed
                 _has_diff = (_status != 'In Both') or _mrr_diff or _gl_diff or _fsd_diff or _pod_diff
 
+                # Name-changed detection: IDs match but names differ
+                _in_vol_by_rid = False
+                _rid_now = str(_hr.get('record_id', '') or '').strip()
+                if _rid_now:
+                    _rid_map_now = st.session_state.get('_rid_map', {})
+                    _in_vol_by_rid = _rid_now in _rid_map_now
+                if _in_vol_by_rid and not _in_vol:
+                    _status = 'Name Changed'
+
                 _recon_rows.append({
                     'Apply':              _has_diff,
+                    'Record ID':          _rid_now,
+                    'HS Name':            _hr['client_name'],
                     'Client':             _hr['client_name'],
                     'Current POD':        _cur_pod or '—',
                     'New POD':            _hs_pod or _cur_pod or '',
@@ -4215,7 +4377,7 @@ if "calc_data" in st.session_state:
                     "Rows marked **Not in HubSpot** may indicate churned clients."
                 )
                 # Rebuild recon table if columns changed
-                if 'Current POD' not in _recon_df_now.columns or 'New POD' not in _recon_df_now.columns:
+                if 'Current POD' not in _recon_df_now.columns or 'New POD' not in _recon_df_now.columns or 'Record ID' not in _recon_df_now.columns:
                     st.session_state['hs_recon_df'] = None
                     st.rerun(scope="fragment")
                 _recon_pod_opts = [''] + sorted(set(lista_pods) | set(
@@ -4226,10 +4388,12 @@ if "calc_data" in st.session_state:
                     st.session_state.hs_recon_df,
                     use_container_width=True,
                     hide_index=True,
-                    disabled=['Client', 'Current POD', 'Status', 'Lifecycle', 'Terminating',
+                    disabled=['Record ID', 'HS Name', 'Client', 'Current POD', 'Status', 'Lifecycle', 'Terminating',
                                'Current MRR ($)', 'Current Start Date'],
                     column_config={
                         'Apply':           st.column_config.CheckboxColumn('Apply', default=False),
+                        'Record ID':       st.column_config.TextColumn('Record ID'),
+                        'HS Name':         st.column_config.TextColumn('HS Name (HubSpot)'),
                         'Client':          st.column_config.TextColumn('Client'),
                         'Current POD':     st.column_config.TextColumn('Current POD'),
                         'New POD':         st.column_config.SelectboxColumn('New POD', options=_recon_pod_opts, default=''),
@@ -8573,12 +8737,12 @@ if "calc_data" in st.session_state:
                     except: _tot_exp[_nc] = ''
                 _cli_exp_frames.append(pd.DataFrame([_tot_exp]))
             _cli_detail_exp = pd.concat(_cli_exp_frames, ignore_index=True) if _cli_exp_frames else _cli_raw_exp
-            _cli_detail_exp.to_excel(writer, index=False, sheet_name='Client_Role_Detail')
+            _insert_rid_after_client(_cli_detail_exp).to_excel(writer, index=False, sheet_name='Client_Role_Detail')
             # Tab 6: Baseline Audit — most detailed level (drop internal email cols)
             if not st.session_state.final_dashboards.get('baseline', pd.DataFrame()).empty:
                 _bl_exp = st.session_state.final_dashboards['baseline'].copy()
                 _bl_exp = _bl_exp[[c for c in _bl_exp.columns if c not in {'Processor Email', 'Reviewer Email'}]]
-                _bl_exp.to_excel(writer, index=False, sheet_name='Baseline_Audit')
+                _insert_rid_after_client(_bl_exp).to_excel(writer, index=False, sheet_name='Baseline_Audit')
             # Tab 7: Employee Level
             _el_df_exp = st.session_state.get('_s3_emp_level_df', pd.DataFrame())
             if not _el_df_exp.empty:
@@ -10683,9 +10847,9 @@ if (
                     _wf_s4.to_excel(_xw, sheet_name='Capacity_Overview')
                 # Detailed level — Step 3 underlying data
                 if not _fd_s4.get('cliente', pd.DataFrame()).empty:
-                    _fd_s4['cliente'].to_excel(_xw, sheet_name='Client_Role_Detail', index=False)
+                    _insert_rid_after_client(_fd_s4['cliente']).to_excel(_xw, sheet_name='Client_Role_Detail', index=False)
                 if not _fd_s4.get('baseline', pd.DataFrame()).empty:
-                    _fd_s4['baseline'].to_excel(_xw, sheet_name='Baseline_Audit', index=False)
+                    _insert_rid_after_client(_fd_s4['baseline']).to_excel(_xw, sheet_name='Baseline_Audit', index=False)
                 _df_resbase_s4 = st.session_state.get('calc_data', {}).get('df_resumen_base', pd.DataFrame())
                 if not _df_resbase_s4.empty:
                     _df_resbase_s4.to_excel(_xw, sheet_name='Base_Hours_by_Role', index=False)
@@ -10762,12 +10926,12 @@ if (
                     _pod_sr_all.to_excel(_xw_all, sheet_name='3_POD_x_SrAccountant', index=False)
                 # Tab: Client & Role Summary — full detail
                 if not _fd_all.get('cliente', pd.DataFrame()).empty:
-                    _fd_all['cliente'].to_excel(_xw_all, sheet_name='3_Client_Role_Detail', index=False)
+                    _insert_rid_after_client(_fd_all['cliente']).to_excel(_xw_all, sheet_name='3_Client_Role_Detail', index=False)
                 # Tab: Baseline Audit — most detailed level (drop internal email cols)
                 if not _fd_all.get('baseline', pd.DataFrame()).empty:
                     _bl_all = _fd_all['baseline'].copy()
                     _bl_all = _bl_all[[c for c in _bl_all.columns if c not in {'Processor Email', 'Reviewer Email'}]]
-                    _bl_all.to_excel(_xw_all, sheet_name='3_Baseline_Audit', index=False)
+                    _insert_rid_after_client(_bl_all).to_excel(_xw_all, sheet_name='3_Baseline_Audit', index=False)
                 # Tab: Employee Level
                 _el_df_all = st.session_state.get('_s3_emp_level_df', pd.DataFrame())
                 if not _el_df_all.empty:
@@ -10817,9 +10981,9 @@ if (
                 st.session_state.s4v2_params_df.to_excel(_xw_all, sheet_name='4_Global_Params', index=False)
                 # Detailed level for scenario
                 if not _fd_all.get('cliente', pd.DataFrame()).empty:
-                    _fd_all['cliente'].to_excel(_xw_all, sheet_name='4_Client_Role_Detail', index=False)
+                    _insert_rid_after_client(_fd_all['cliente']).to_excel(_xw_all, sheet_name='4_Client_Role_Detail', index=False)
                 if not _fd_all.get('baseline', pd.DataFrame()).empty:
-                    _fd_all['baseline'].to_excel(_xw_all, sheet_name='4_Baseline_Audit', index=False)
+                    _insert_rid_after_client(_fd_all['baseline']).to_excel(_xw_all, sheet_name='4_Baseline_Audit', index=False)
                 _df_resbase_all = st.session_state.get('calc_data', {}).get('df_resumen_base', pd.DataFrame())
                 if not _df_resbase_all.empty:
                     _df_resbase_all.to_excel(_xw_all, sheet_name='4_Base_Hours_by_Role', index=False)
@@ -11532,7 +11696,8 @@ with tab_recon:
                             _levels['By_Sr_Accountant'] = _sr_m
 
                     # — By Client —
-                    _cli_key_fd = _safe_cols(_fd1, ['POD', 'Sr. Accountant', 'Client'])
+                    _cli_key_fd = [c for c in ['POD', 'Sr. Accountant', 'Record ID', 'Client']
+                                   if c in _fd1.columns and c in _fd2.columns]
                     if _cli_key_fd:
                         _c1 = _agg_fd(_fd1, _cli_key_fd)
                         _c2 = _agg_fd(_fd2, _cli_key_fd)
@@ -11695,7 +11860,8 @@ with tab_recon:
                             _levels['By_Sr_Accountant'] = _sr_vm
 
                     # — By Client —
-                    _vi_cli_key = [c for c in ['POD', 'Sr. Accountant', 'Client'] if c in _vi1.columns]
+                    _vi_cli_key = [c for c in ['POD', 'Sr. Accountant', 'Record ID', 'Client']
+                                   if c in _vi1.columns and c in _vi2.columns]
                     if _vi_cli_key:
                         _c1 = _agg_vi(_vi1, _vi_cli_key)
                         _c2 = _agg_vi(_vi2, _vi_cli_key)
