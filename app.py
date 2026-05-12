@@ -4931,6 +4931,63 @@ if "calc_data" in st.session_state:
                         st.session_state.automations_df[_existing] = _num_after
                         st.rerun(scope="fragment")
 
+        # ── Helper: detect client name mismatches against the cascade ──────────
+        def _find_name_mismatches(df, avail_clients):
+            """
+            For each non-empty Client value in df that is not in avail_clients,
+            return list of (index, file_name, best_suggestion_or_None).
+            Suggestion is scored by word overlap + substring containment.
+            """
+            if df.empty or 'Client' not in df.columns or not avail_clients:
+                return []
+            _avail_set   = set(avail_clients)
+            _avail_lower = {c.lower().strip(): c for c in avail_clients}
+            _result = []
+            for _idx, _row in df.iterrows():
+                _name = str(_row.get('Client', '') or '').strip()
+                if not _name or _name in _avail_set:
+                    continue
+                if _name.lower() in _avail_lower:
+                    continue  # case difference — already normalized elsewhere
+                # Score canonical names by word overlap + containment
+                _nw = set(_name.lower().split())
+                _best, _best_score = None, 0
+                for _c in avail_clients:
+                    _cw    = set(_c.lower().split())
+                    _score = len(_nw & _cw)
+                    if _name.lower() in _c.lower() or _c.lower() in _name.lower():
+                        _score += 3
+                    if _score > _best_score:
+                        _best_score, _best = _score, _c
+                _result.append((_idx, _name, _best if _best_score > 0 else None))
+            return _result
+
+        def _show_name_mismatch_ui(mismatches, df_key, btn_key, avail_clients):
+            """Render a warning + auto-fix button for client name mismatches."""
+            if not mismatches:
+                return
+            _lines = []
+            for _, _old, _sug in mismatches:
+                if _sug:
+                    _lines.append(f"- `{_old}` → **sugerido:** {_sug}")
+                else:
+                    _lines.append(f"- `{_old}` — sin coincidencia en la cascada")
+            st.warning(
+                f"⚠️ **{len(mismatches)} nombre(s) no encontrado(s)** en la cascada. "
+                "Estas filas serán **ignoradas** al aplicar el cascade. "
+                "Corrígelos en la tabla o usa el botón de abajo.\n\n"
+                + "\n".join(_lines)
+            )
+            _has_suggestions = any(s for _, _, s in mismatches)
+            if _has_suggestions:
+                if st.button("🔧 Auto-corregir nombres sugeridos", key=btn_key):
+                    _df_fix = st.session_state[df_key].copy()
+                    for _fix_idx, _old_n, _sug_n in mismatches:
+                        if _sug_n and _fix_idx in _df_fix.index:
+                            _df_fix.at[_fix_idx, 'Client'] = _sug_n
+                    st.session_state[df_key] = _df_fix
+                    st.rerun(scope="fragment")
+
         @st.fragment
         def _hist_tab_fragment():
             st.markdown("**Pure extra hours to add per month (e.g. Historical Accounting). Include the POD for new clients.**")
@@ -4979,13 +5036,20 @@ if "calc_data" in st.session_state:
                             lambda v: _pod_norm_h.get(v.lower(), v) if v else ''
                         )
                         st.session_state.historical_df = _hist_up_df
-                        st.success(f"✅ Loaded {len(_hist_up_df)} row(s) — all marked Confirmed.")
+                        _up_mm = _find_name_mismatches(_hist_up_df, _avail_cli_h)
+                        if _up_mm:
+                            st.success(f"✅ Loaded {len(_hist_up_df)} row(s) — {len(_up_mm)} nombre(s) requieren revisión (ver abajo).")
+                        else:
+                            st.success(f"✅ Loaded {len(_hist_up_df)} row(s) — all marked Confirmed.")
                     except Exception as _he:
                         st.error(f"❌ Could not read file: {_he}")
             if "Confirmed" not in st.session_state.historical_df.columns:
                 st.session_state.historical_df.insert(0, "Confirmed", False)
             if "POD" not in st.session_state.historical_df.columns:
                 st.session_state.historical_df.insert(1, "POD", "")
+            # Validate client names in current table (catches both uploaded and typed names)
+            _hist_mm = _find_name_mismatches(st.session_state.historical_df, _avail_cli_h)
+            _show_name_mismatch_ui(_hist_mm, 'historical_df', 'hist_autofix_btn', _avail_cli_h)
             st.caption("☑️ **Confirmed** rows are included in the cascade. All uploaded rows are confirmed by default.")
             st.session_state.historical_df = st.data_editor(
                 st.session_state.historical_df,
@@ -5058,7 +5122,12 @@ if "calc_data" in st.session_state:
                             lambda v: _cli_norm_map.get(v.lower(), v) if v else ''
                         )
                         st.session_state.reductions_df = _red_up_df
-                        st.success(f"✅ Loaded {len(_red_up_df)} row(s) — all marked Confirmed.")
+                        _avail_cli_r = st.session_state.calc_data.get('clientes_validos', [])
+                        _up_mm_r = _find_name_mismatches(_red_up_df, _avail_cli_r)
+                        if _up_mm_r:
+                            st.success(f"✅ Loaded {len(_red_up_df)} row(s) — {len(_up_mm_r)} nombre(s) requieren revisión (ver abajo).")
+                        else:
+                            st.success(f"✅ Loaded {len(_red_up_df)} row(s) — all marked Confirmed.")
                     except Exception as _re:
                         st.error(f"❌ Could not read file: {_re}")
             if "Confirmed" not in st.session_state.reductions_df.columns:
@@ -5067,6 +5136,10 @@ if "calc_data" in st.session_state:
                 st.session_state.reductions_df.insert(1, "POD", "")
             _red_clients_opts = [""] + st.session_state.calc_data.get('clientes_validos', [])
             _red_pods_opts    = [""] + lista_pods
+            # Validate client names in current table
+            _red_avail = st.session_state.calc_data.get('clientes_validos', [])
+            _red_mm = _find_name_mismatches(st.session_state.reductions_df, _red_avail)
+            _show_name_mismatch_ui(_red_mm, 'reductions_df', 'red_autofix_btn', _red_avail)
             st.caption("☑️ Check **Confirmed** on each row to include it in the cascade. Unconfirmed rows are ignored.")
             st.session_state.reductions_df = st.data_editor(
                 st.session_state.reductions_df,
@@ -5616,6 +5689,24 @@ if "calc_data" in st.session_state:
             for i, mes_str in enumerate(meses_proyeccion):
                 df_resumen[f"M{i+1} ({mes_str}) - Adjustments (+) Hrs"] = 0.0
                 df_resumen[f"M{i+1} ({mes_str}) - Adjustments (-) Hrs"] = 0.0
+
+            # ── Validate Add/Reduce Hours client names before applying ──────────
+            _cas_cli_valid = set(df_resumen['Client'].dropna().unique())
+            def _warn_skipped(adj_df, label):
+                if adj_df.empty or 'Client' not in adj_df.columns:
+                    return
+                _conf = adj_df[adj_df.get('Confirmed', pd.Series(True, index=adj_df.index)) == True] if 'Confirmed' in adj_df.columns else adj_df
+                _bad  = [str(v) for v in _conf['Client'].dropna().unique()
+                         if str(v).strip() and str(v).strip() not in _cas_cli_valid]
+                if _bad:
+                    st.warning(
+                        f"⚠️ **{label}**: {len(_bad)} nombre(s) de cliente no coinciden con la cascada "
+                        f"y serán ignorados: {', '.join(f'`{n}`' for n in _bad[:5])}"
+                        + (" y más..." if len(_bad) > 5 else "") +
+                        " — ve al tab correspondiente y usa **Auto-corregir** para resolverlo."
+                    )
+            _warn_skipped(st.session_state.historical_df, "Add Hours")
+            _warn_skipped(st.session_state.reductions_df, "Reduce Hours")
 
             # 3. APPLY (+) HISTORICAL ADJUSTMENTS
             _hist_raw = st.session_state.historical_df
