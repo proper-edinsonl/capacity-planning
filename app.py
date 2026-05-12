@@ -1054,6 +1054,73 @@ def _load_volume_aht(uploaded_file, log):
             df = df.rename(columns={'Rev Role.1': 'Rev Role'})
 
     log(f"  Loaded {len(df)} rows, {df['client_name'].nunique() if 'client_name' in df.columns else '?'} clients")
+
+    # ── Read 'srs' sheet if present — authoritative client→Sr. mapping ────────
+    # Columns expected: client, Email (sr email), Hubspot ID (= client record_id)
+    # Emp Status: 'Active' | 'Attrition'   — only use Active Srs
+    if 'srs' in xl.sheet_names:
+        try:
+            uploaded_file.seek(0)
+            _srs = pd.read_excel(uploaded_file, sheet_name='srs')
+            _srs.columns = _srs.columns.str.strip()
+            # Normalize to lowercase column names for robust detection
+            _srs_col = {str(c).lower().strip(): c for c in _srs.columns}
+
+            _c_email  = _srs_col.get('email')
+            _c_client = _srs_col.get('client')
+            _c_status = _srs_col.get('emp status')
+            _c_rid    = next((v for k, v in _srs_col.items()
+                              if 'hubspot' in k and 'id' in k), None)
+
+            if _c_email and _c_client:
+                # Filter: only Active Srs (ignore Attrition rows)
+                if _c_status:
+                    _srs = _srs[_srs[_c_status].astype(str).str.strip().str.lower() != 'attrition']
+
+                # Build lookup: record_id → sr_email  AND  client_name_lower → sr_email
+                # Deduplicate: one Sr per client (keep first occurrence)
+                _srs_dedup = _srs.drop_duplicates(subset=[_c_client], keep='first')
+                _srs_rid_map  = {}
+                _srs_name_map = {}
+                for _, _sr_row in _srs_dedup.iterrows():
+                    _sr_email = str(_sr_row.get(_c_email, '') or '').strip().lower()
+                    if not _sr_email or _sr_email in ('nan', 'none', ''):
+                        continue
+                    # record_id key
+                    if _c_rid:
+                        _raw_rid = _sr_row.get(_c_rid, '')
+                        _sr_rid  = _clean_record_id(pd.Series([_raw_rid])).iloc[0]
+                        if _sr_rid:
+                            _srs_rid_map[_sr_rid] = _sr_email
+                    # name key (fallback)
+                    _sr_cli = str(_sr_row.get(_c_client, '') or '').strip().lower()
+                    if _sr_cli:
+                        _srs_name_map[_sr_cli] = _sr_email
+
+                # Apply to df: record_id match first, then client_name
+                _df_rid_s   = df['record_id'] if 'record_id' in df.columns else pd.Series('', index=df.index)
+                _df_name_s  = df['client_name'].astype(str).str.strip().str.lower() if 'client_name' in df.columns else pd.Series('', index=df.index)
+                _resolved   = []
+                for _rid_v, _name_v in zip(_df_rid_s, _df_name_s):
+                    if _rid_v and _rid_v in _srs_rid_map:
+                        _resolved.append(_srs_rid_map[_rid_v])
+                    elif _name_v in _srs_name_map:
+                        _resolved.append(_srs_name_map[_name_v])
+                    else:
+                        _resolved.append(None)
+
+                _new_sr_series = pd.Series(_resolved, index=df.index)
+                _updated = _new_sr_series.notna()
+                if 'Sr. Accountant' not in df.columns:
+                    df['Sr. Accountant'] = ''
+                df.loc[_updated, 'Sr. Accountant'] = _new_sr_series[_updated]
+                log(f"  srs sheet: updated Sr. Accountant for {_updated.sum()} rows "
+                    f"({len(_srs_rid_map)} by record_id, {len(_srs_name_map)} by name)")
+            else:
+                log("  srs sheet: missing 'client' or 'Email' column — skipped")
+        except Exception as _srs_e:
+            log(f"  srs sheet: could not read ({_srs_e}) — skipped")
+
     return df
 
 
