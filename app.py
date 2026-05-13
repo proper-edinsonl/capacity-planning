@@ -11,6 +11,9 @@ from dateutil.relativedelta import relativedelta
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 
+# --- APP VERSION ---
+APP_VERSION = "v3.5.0"
+
 # --- SCENARIOS DIRECTORY ---
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SCENARIOS_DIR = os.path.join(_APP_DIR, "scenarios")
@@ -2481,8 +2484,18 @@ section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📊 Capacity Planning & FTE Projections")
-st.markdown("Operational projection integrating learning curves, automations, financial savings, and cascade adjustments.")
+_h_col, _v_col = st.columns([8, 1])
+with _h_col:
+    st.title("📊 Capacity Planning & FTE Projections")
+    st.markdown("Operational projection integrating learning curves, automations, financial savings, and cascade adjustments.")
+with _v_col:
+    st.markdown(
+        f"<div style='text-align:right; padding-top:18px;'>"
+        f"<span style='background:#1f77b4; color:white; padding:4px 10px; "
+        f"border-radius:12px; font-size:0.78rem; font-weight:600; "
+        f"letter-spacing:0.5px;'>{APP_VERSION}</span></div>",
+        unsafe_allow_html=True,
+    )
 
 # ── GLOSSARY OVERLAY ──────────────────────────────────────────────────────────
 if st.session_state.get('_show_glossary', False):
