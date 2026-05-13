@@ -4756,7 +4756,7 @@ if "calc_data" in st.session_state:
                 )
                 _sel_ob = _ob_disp[_ob_disp['Client'].isin(_sel_clients)]
                 if st.button(
-                    f"🤖 Queue {len(_sel_ob)} Clients for AI Prediction (Step 4)",
+                    f"🤖 Queue {len(_sel_ob)} Clients for AI Prediction",
                     type="primary", key="hs_queue_ai_btn",
                     disabled=len(_sel_ob) == 0
                 ):
@@ -4849,24 +4849,24 @@ if "calc_data" in st.session_state:
                     st.session_state.pop('hs_pre_ai_manual_editor', None)
                     if _added > 0 and _updated == 0:
                         st.success(
-                            f"✅ {_added} client(s) added to the AI Prediction table in Step 4. "
-                            "Scroll down to Step 4 → New Clients AI Prediction to run predictions."
+                            f"✅ {_added} client(s) queued. Opening AI Prediction panel..."
                         )
                     elif _updated > 0 and _added == 0:
                         st.success(
-                            f"✅ {_updated} client(s) updated in the AI Prediction table in Step 4. "
-                            "Scroll down to Step 4 → New Clients AI Prediction to run predictions."
+                            f"✅ {_updated} client(s) updated. Opening AI Prediction panel..."
                         )
                     elif _added > 0 or _updated > 0:
                         st.success(
-                            f"✅ {_added} client(s) added, {_updated} updated in the AI Prediction table in Step 4. "
-                            "Scroll down to Step 4 → New Clients AI Prediction to run predictions."
+                            f"✅ {_added} added, {_updated} updated. Opening AI Prediction panel..."
                         )
                     else:
                         st.warning(
                             "⚠️ No clients were queued — all selected clients are already in the AI Prediction table "
-                            "with the same name and POD. Check Step 4 → New Clients AI Prediction."
+                            "with the same name and POD."
                         )
+                    # Full page rerun so the page-level AI Prediction section
+                    # (rendered before Step 2) becomes visible immediately.
+                    st.rerun()
 
         if st.button("🔄 Re-upload HubSpot file", key="hs_reupload_btn"):
             st.session_state.hs_parsed = None
