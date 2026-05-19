@@ -2161,6 +2161,8 @@ _HC_ROLE_MAP = {
     'general accountant': 'General Accountant',
     'sr. accountant':     'Sr. Accountant',
     'sr accountant':      'Sr. Accountant',
+    'accounting manager': 'Acct. Manager',
+    'assistant manager':  'Asst. Manager',
 }
 
 @st.cache_data(show_spinner=False)
