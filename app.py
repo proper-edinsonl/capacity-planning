@@ -5699,7 +5699,7 @@ if "calc_data" in st.session_state:
                 _tk    = str(row.get('type', '')) + ' - ' + str(row.get('subtype', ''))
                 _pk    = str(row.get('POD', '')).strip()
                 _pmsk  = str(row.get('PMS', '')).strip()
-                _effs  = _auto_cache.get((_ck, _tk, _pk, _pmsk), [(0.0,0.0,0.0,0.0)]*6)
+                _effs  = _auto_cache.get((_ck, _tk, _pk, _pmsk), [(0.0,0.0,0.0,0.0)]*7)
 
                 if _s3_use_real_cas:
                     _ideal_p = str(row.get('Proc Role', '')).strip()
@@ -9881,9 +9881,9 @@ if (
             _s4_auto_sav_total = _s4_precomp['ast']
         else:
             # ── CACHE MISS: run the full precomputation ───────────────────────
-            _s4_base_hrs_role  = {_rl: [0.0]*6 for _rl in roles_permitidos}
-            _s4_auto_sav_role  = {_rl: [0.0]*6 for _rl in roles_permitidos}
-            _s4_auto_sav_total = [0.0]*6
+            _s4_base_hrs_role  = {_rl: [0.0]*7 for _rl in roles_permitidos}
+            _s4_auto_sav_role  = {_rl: [0.0]*7 for _rl in roles_permitidos}
+            _s4_auto_sav_total = [0.0]*7
 
             # 1. Base hours per role from Step 3 Final Hours (post Step-2+3 adj)
             _rb_scope = pd.DataFrame()
@@ -10138,7 +10138,7 @@ if (
                 _cmins = f"M{_i+1} ({_ms}) - Adjustments (-) Hrs"
                 if _scope_is_sr:
                     # Sr. scope: sum Final Hours per role from pre-computed breakdown
-                    _b_curr = sum(_s4_base_hrs_role.get(_rl, [0.0]*6)[_i] for _rl in roles_permitidos)
+                    _b_curr = sum(_s4_base_hrs_role.get(_rl, [0.0]*7)[_i] for _rl in roles_permitidos)
                     _b_base = _rb_sum_cache.get(_cbase, _b_curr)
                     _b_ap   = 0.0
                     _b_am   = 0.0
@@ -10158,11 +10158,11 @@ if (
                 else:
                     # productive_hrs = base_hrs / shrink_factor  (shrink = 2-util+abs+att)
                     _b_prod = sum(
-                        _s4_base_hrs_role.get(_rl, [0.0]*6)[_i] / max(_shrink_cache.get(_rl, 1.0), 0.01)
+                        _s4_base_hrs_role.get(_rl, [0.0]*7)[_i] / max(_shrink_cache.get(_rl, 1.0), 0.01)
                         for _rl in roles_permitidos
                     )
                 # Recalculate _b_base from role breakdown to keep consistent with _b_prod
-                _b_base_from_roles = sum(_s4_base_hrs_role.get(_rl, [0.0]*6)[_i] for _rl in roles_permitidos)
+                _b_base_from_roles = sum(_s4_base_hrs_role.get(_rl, [0.0]*7)[_i] for _rl in roles_permitidos)
                 if _b_base_from_roles > 0:
                     _b_base = _b_base_from_roles
                 _b_new  = _fd.get('pod_new_hrs',   {}).get(_ms, {}).get(_scope, 0.0)
@@ -10179,10 +10179,10 @@ if (
 
             # ── FTEs from pre-auto base + Step-4 automation savings ──────────
             _d_fte_m = float(_dict_hrs_fte.get(_i, 157.5) or 157.5)
-            _req_a1 = max(0.0, (_s4_base_hrs_role.get('Accountant I',       [0.0]*6)[_i] - _s4_auto_sav_role.get('Accountant I',       [0.0]*6)[_i]) / _d_fte_m)
-            _req_a2 = max(0.0, (_s4_base_hrs_role.get('Accountant II',      [0.0]*6)[_i] - _s4_auto_sav_role.get('Accountant II',      [0.0]*6)[_i]) / _d_fte_m)
-            _req_gn = max(0.0, (_s4_base_hrs_role.get('General Accountant', [0.0]*6)[_i] - _s4_auto_sav_role.get('General Accountant', [0.0]*6)[_i]) / _d_fte_m)
-            _req_sr = max(0.0, (_s4_base_hrs_role.get('Sr. Accountant',     [0.0]*6)[_i] - _s4_auto_sav_role.get('Sr. Accountant',     [0.0]*6)[_i]) / _d_fte_m)
+            _req_a1 = max(0.0, (_s4_base_hrs_role.get('Accountant I',       [0.0]*7)[_i] - _s4_auto_sav_role.get('Accountant I',       [0.0]*7)[_i]) / _d_fte_m)
+            _req_a2 = max(0.0, (_s4_base_hrs_role.get('Accountant II',      [0.0]*7)[_i] - _s4_auto_sav_role.get('Accountant II',      [0.0]*7)[_i]) / _d_fte_m)
+            _req_gn = max(0.0, (_s4_base_hrs_role.get('General Accountant', [0.0]*7)[_i] - _s4_auto_sav_role.get('General Accountant', [0.0]*7)[_i]) / _d_fte_m)
+            _req_sr = max(0.0, (_s4_base_hrs_role.get('Sr. Accountant',     [0.0]*7)[_i] - _s4_auto_sav_role.get('Sr. Accountant',     [0.0]*7)[_i]) / _d_fte_m)
 
             # ── Hours adjustments per role ────────────────────────────────────
             _hrs_role_df   = st.session_state.s4v2_hrs_role_df
@@ -10498,10 +10498,10 @@ if (
             # baseline ≡ scenario when no Step-4 changes are applied, eliminating
             # rounding-boundary phantom Δs (e.g. 383.91 vs 383.90).
             if _scope == "Overall":
-                _b3_fte_a1  = max(0.0, float(_s4_base_hrs_role.get('Accountant I',       [0.0]*6)[_i]) / _d_fte_m)
-                _b3_fte_a2  = max(0.0, float(_s4_base_hrs_role.get('Accountant II',      [0.0]*6)[_i]) / _d_fte_m)
-                _b3_fte_gn  = max(0.0, float(_s4_base_hrs_role.get('General Accountant', [0.0]*6)[_i]) / _d_fte_m)
-                _b3_fte_sr  = max(0.0, float(_s4_base_hrs_role.get('Sr. Accountant',     [0.0]*6)[_i]) / _d_fte_m)
+                _b3_fte_a1  = max(0.0, float(_s4_base_hrs_role.get('Accountant I',       [0.0]*7)[_i]) / _d_fte_m)
+                _b3_fte_a2  = max(0.0, float(_s4_base_hrs_role.get('Accountant II',      [0.0]*7)[_i]) / _d_fte_m)
+                _b3_fte_gn  = max(0.0, float(_s4_base_hrs_role.get('General Accountant', [0.0]*7)[_i]) / _d_fte_m)
+                _b3_fte_sr  = max(0.0, float(_s4_base_hrs_role.get('Sr. Accountant',     [0.0]*7)[_i]) / _d_fte_m)
                 _b3_fte_tot = _b3_fte_a1 + _b3_fte_a2 + _b3_fte_gn + _b3_fte_sr
                 _b3_mrr     = float(_r.get("Total MRR ($)", 0) or 0)
                 _base_nums.setdefault("Required Hours (Hrs)",    {})[_col] = float(_r.get("7. Total Required Hours (Final)", 0) or 0)
@@ -10539,14 +10539,14 @@ if (
                 # Baseline FTEs recomputed from _s4_base_hrs_role / _d_fte_m
                 # (same formula as scenario → zero phantom Δ when no changes).
                 _b3_fte_by_role = {
-                    _brl: max(0.0, float(_s4_base_hrs_role.get(_brl, [0.0]*6)[_i]) / _d_fte_m)
+                    _brl: max(0.0, float(_s4_base_hrs_role.get(_brl, [0.0]*7)[_i]) / _d_fte_m)
                     for _brl in roles_permitidos
                 }
                 _b3_fte_tot = sum(_b3_fte_by_role.values())
                 # Required Hours: mirror scenario's _b_curr exactly.
                 # Sr scope → sum of per-role base hours; POD scope → _rb_scope Final Hours sum.
                 if _scope_is_sr:
-                    _b3_req_hrs = sum(float(_s4_base_hrs_role.get(_rl, [0.0]*6)[_i]) for _rl in roles_permitidos)
+                    _b3_req_hrs = sum(float(_s4_base_hrs_role.get(_rl, [0.0]*7)[_i]) for _rl in roles_permitidos)
                 else:
                     _b3_req_hrs = _rb_sum_cache.get(_cfin_b3, 0.0)
                 _base_nums.setdefault("Required Hours (Hrs)",    {})[_col] = _b3_req_hrs
