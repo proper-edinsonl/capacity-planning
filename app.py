@@ -6863,6 +6863,7 @@ if "calc_data" in st.session_state:
                     months = []
                     _wdays = st.session_state.get('calc_data', {}).get('dict_workable_days', {})
                     _prev_mrr = 0.0          # tracks previous month MRR for % movement
+                    _prev_total_fcast_mrr = 0.0  # compounding forecast base (independent of churn)
                     _proj_store = {}         # {month_idx: {forecasted_mrr_growth, hc_by_role}}
 
                     for i, mes_str in enumerate(meses_proyeccion):
@@ -7042,15 +7043,17 @@ if "calc_data" in st.session_state:
                         _mgdf_v      = st.session_state.s2_mrr_growth_df
                         _mg_col      = f"M{i+1} (%)"
                         _mg_val_pct  = float(_mgdf_v.at[0, _mg_col]) / 100 if _mg_col in _mgdf_v.columns else 0.0
-                        # Forecasted MRR Growth: only for M3-M7 (indices 2-6)
-                        if i >= 2 and float(mrr or 0) > 0:
-                            _fcast_mrr_growth = float(mrr or 0) * _mg_val_pct
+                        # Forecasted MRR Growth: compounds on the forecast (not actual MRR)
+                        # so Total Forecasted MRR always grows regardless of real churn.
+                        # M3 seeds from previous actual MRR (last stable month); M4+ compound.
+                        if i >= 2 and (_prev_mrr > 0 or _prev_total_fcast_mrr > 0):
+                            _fcast_base       = _prev_total_fcast_mrr if _prev_total_fcast_mrr > 0 else _prev_mrr
+                            _fcast_mrr_growth = _fcast_base * _mg_val_pct
+                            _total_fcast_mrr  = _fcast_base + _fcast_mrr_growth
+                            _prev_total_fcast_mrr = _total_fcast_mrr
                         else:
                             _fcast_mrr_growth = None
-                        _total_fcast_mrr = (
-                            float(mrr or 0) + _fcast_mrr_growth
-                            if _fcast_mrr_growth is not None else None
-                        )
+                            _total_fcast_mrr  = None
                         # Average MRR per client
                         # NOTE: _m_cli_count here comes from the pre-computation block
                         # ~30 lines above (uses _duc_gl_o_pre / _duc_fsd_o_pre).
