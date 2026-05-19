@@ -205,7 +205,7 @@ def _make_ai_prediction_fragment(pfx, add_to_scenario, add_to_baseline=False):
         with _ai_col1:
             _ai_month = st.selectbox(
                 "Projection month:",
-                options=list(range(6)),
+                options=list(range(7)),
                 format_func=lambda i: meses_proyeccion[i],
                 key=f"{pfx}_ai_month_idx"
             )
@@ -2767,7 +2767,7 @@ with st.sidebar:
     st.markdown(f"Export Ideal: {'✅' if _sb_ideal_ok else '⬜'}")
     st.markdown(f"Export Real:  {'✅' if _sb_real_ok  else '⬜'}")
 
-# --- GENERATE MONTHS: previous month (base) + 5 forward ---
+# --- GENERATE MONTHS: previous month (base) + 6 forward ---
 # Starting from last month means the first column is always the reference/base month
 # (e.g. if today is March, columns are: Feb, Mar, Apr, May, Jun, Jul)
 _actual_today   = datetime.today()
@@ -2781,7 +2781,7 @@ _sel_base_year  = st.session_state.get('base_year_sel',  _prev_month_dt.year)
 _base_date = datetime(_sel_base_year, _sel_base_month, 15)  # mid-month avoids edge cases
 today = _base_date + relativedelta(months=1)
 
-_month_offsets   = list(range(-1, 5))   # -1=base month, 0=month after base, 1..4=forward
+_month_offsets   = list(range(-1, 6))   # -1=base month, 0=month after base, 1..5=forward
 meses_proyeccion = [(today + relativedelta(months=off)).strftime("%B %Y") for off in _month_offsets]
 roles_permitidos = ["Accountant I", "Accountant II", "General Accountant", "Sr. Accountant"]
 
@@ -2848,7 +2848,7 @@ def _insert_rid_after_client(df):
 
 
 def _build_proj_export_df(pdata):
-    """Tabular MRR Forecast summary (M3-M6) from _projection_data dict.
+    """Tabular MRR Forecast summary (M3-M7) from _projection_data dict.
     Defined at module level so it's available from @st.fragment callbacks
     without depending on a prior full-page run of the Step 3 export block.
     """
@@ -2883,13 +2883,13 @@ if "automations_df" not in st.session_state:
     st.session_state.automations_df = pd.DataFrame(columns=[
         "Confirmed", "Initiative Name", "POD", "PMS", "Client", "Task (Type - Subtype)",
         "Affects",
-        "M1 (%)", "M2 (%)", "M3 (%)", "M4 (%)", "M5 (%)", "M6 (%)"
+        "M1 (%)", "M2 (%)", "M3 (%)", "M4 (%)", "M5 (%)", "M6 (%)", "M7 (%)"
     ])
 
-meses_hrs_cols = [f"M{i+1} (Hrs)" for i in range(6)]
-meses_fte_cols = [f"M{i+1} (FTEs)" for i in range(6)]
+meses_hrs_cols = [f"M{i+1} (Hrs)" for i in range(7)]
+meses_fte_cols = [f"M{i+1} (FTEs)" for i in range(7)]
 
-meses_pct_cols = [f"M{i+1} (%)" for i in range(6)]   # for door-count variation
+meses_pct_cols = [f"M{i+1} (%)" for i in range(7)]   # for door-count variation
 
 if "historical_df" not in st.session_state:
     st.session_state.historical_df = pd.DataFrame(columns=["Confirmed", "POD", "Client", "Required Role"] + meses_hrs_cols)
@@ -2952,7 +2952,7 @@ if "ai_manual_clients" not in st.session_state:
 elif "POD" not in st.session_state.ai_manual_clients.columns:
     st.session_state.ai_manual_clients.insert(1, "POD", "")
 
-meses_mrr_cols = [f"M{i+1} ($)" for i in range(6)]
+meses_mrr_cols = [f"M{i+1} ($)" for i in range(7)]
 
 if "ramp_df" not in st.session_state:
     st.session_state.ramp_df = pd.DataFrame(
@@ -2978,10 +2978,10 @@ else:
     if "POD" not in st.session_state.manual_mrr_df.columns:
         st.session_state.manual_mrr_df.insert(1, "POD", "")
 
-_rev_hc_mrr_cols = [f"M{i+1} ($)" for i in range(6)]
-_rev_hc_fte_cols = [f"M{i+1} (FTEs)" for i in range(6)]
+_rev_hc_mrr_cols = [f"M{i+1} ($)" for i in range(7)]
+_rev_hc_fte_cols = [f"M{i+1} (FTEs)" for i in range(7)]
 if "rev_hc_mrr_df" not in st.session_state:
-    st.session_state.rev_hc_mrr_df = pd.DataFrame([[0.0] * 6], columns=_rev_hc_mrr_cols)
+    st.session_state.rev_hc_mrr_df = pd.DataFrame([[0.0] * 7], columns=_rev_hc_mrr_cols)
 if "rev_hc_hc_df" not in st.session_state:
     st.session_state.rev_hc_hc_df = pd.DataFrame(
         {"Role": roles_permitidos, **{c: [0.0] * len(roles_permitidos) for c in _rev_hc_fte_cols}}
@@ -2989,14 +2989,14 @@ if "rev_hc_hc_df" not in st.session_state:
 
 # ── MRR Growth Manual Adjustment (Step 2 tab) ─────────────────────────────
 if "s2_mrr_growth_df" not in st.session_state:
-    # M1 & M2 read-only (past/baseline); M3-M6 editable, pre-seeded with default 5%
+    # M1 & M2 read-only (past/baseline); M3-M7 editable, pre-seeded with default 5%
     st.session_state.s2_mrr_growth_df = pd.DataFrame([{
         "M1 (%)": 0.0, "M2 (%)": 0.0,
-        "M3 (%)": 5.0, "M4 (%)": 5.0, "M5 (%)": 5.0, "M6 (%)": 5.0
+        "M3 (%)": 5.0, "M4 (%)": 5.0, "M5 (%)": 5.0, "M6 (%)": 5.0, "M7 (%)": 5.0
     }])
 
 # ── Step 4 v2 scenario adjuster session state ─────────────────────────────
-_s4v2_mc = [f"M{i+1}" for i in range(6)]
+_s4v2_mc = [f"M{i+1}" for i in range(7)]
 if "s4v2_hc_adj_df" not in st.session_state:
     _hc_init = []
     for _rl in roles_permitidos:
@@ -3018,13 +3018,13 @@ if "s4v2_hrs_role_df" not in st.session_state:
 elif "Confirmed" not in st.session_state.s4v2_hrs_role_df.columns:
     st.session_state.s4v2_hrs_role_df.insert(0, "Confirmed", False)
 _s4v2_auto_cols = ["Confirmed", "Initiative Name", "POD", "PMS", "Client", "Task (Type - Subtype)", "Affects",
-                   "M1 (%)", "M2 (%)", "M3 (%)", "M4 (%)", "M5 (%)", "M6 (%)"]
+                   "M1 (%)", "M2 (%)", "M3 (%)", "M4 (%)", "M5 (%)", "M6 (%)", "M7 (%)"]
 if "s4v2_auto_df" not in st.session_state:
     st.session_state.s4v2_auto_df = pd.DataFrame(columns=_s4v2_auto_cols)
 
 if "s4v2_ai_hrs" not in st.session_state:
     # Stores AI-predicted productive hours per role for each projected month
-    st.session_state.s4v2_ai_hrs = {_rl: [0.0]*6 for _rl in roles_permitidos}
+    st.session_state.s4v2_ai_hrs = {_rl: [0.0]*7 for _rl in roles_permitidos}
 
 # ── Defaults so variables are always defined (overwritten by widgets in tab1 ⚙️ expander) ──
 mrr_growth_pct    = 0.05   # 5%  — overwritten by gp_mrr_growth widget
@@ -3443,7 +3443,7 @@ with tab1:
             mrr_growth_pct    = st.number_input(
                 "MRR Projected Growth (%)",
                 min_value=0.0, max_value=200.0, value=5.0, step=0.5,
-                help="Default monthly MRR growth % applied to M3–M6 in the MRR Growth tab.",
+                help="Default monthly MRR growth % applied to M3–M7 in the MRR Growth tab.",
                 key="gp_mrr_growth"
             ) / 100
             growth_budget_pct = st.number_input(
@@ -3452,10 +3452,10 @@ with tab1:
                 help="% of Forecasted MRR Growth allocated to new-hire budget.",
                 key="gp_growth_budget"
             ) / 100
-            # Sync M3-M6 of the MRR growth table whenever the global % changes
+            # Sync M3-M7 of the MRR growth table whenever the global % changes
             _mgdf = st.session_state.s2_mrr_growth_df.copy()
             _gp_pct = round(mrr_growth_pct * 100, 4)
-            for _mc in ["M3 (%)", "M4 (%)", "M5 (%)", "M6 (%)"]:
+            for _mc in ["M3 (%)", "M4 (%)", "M5 (%)", "M6 (%)", "M7 (%)"]:
                 if _mc in _mgdf.columns:
                     _mgdf.at[0, _mc] = _gp_pct
             st.session_state.s2_mrr_growth_df = _mgdf
@@ -5029,11 +5029,11 @@ if "calc_data" in st.session_state:
                 {"Initiative Name": "AP Automation", "Client": "All",
                  "Task (Type - Subtype)": "AP - Invoice Processing",
                  "Affects": "Vol Proc + Vol Rev",
-                 "M1 (%)": 10, "M2 (%)": 15, "M3 (%)": 20, "M4 (%)": 20, "M5 (%)": 20, "M6 (%)": 20},
+                 "M1 (%)": 10, "M2 (%)": 15, "M3 (%)": 20, "M4 (%)": 20, "M5 (%)": 20, "M6 (%)": 20, "M7 (%)": 20},
                 {"Initiative Name": "AI Coding", "Client": "Acme Corp",
                  "Task (Type - Subtype)": "All",
                  "Affects": "AHT Proc",
-                 "M1 (%)": 5, "M2 (%)": 5, "M3 (%)": 10, "M4 (%)": 10, "M5 (%)": 10, "M6 (%)": 10},
+                 "M1 (%)": 5, "M2 (%)": 5, "M3 (%)": 10, "M4 (%)": 10, "M5 (%)": 10, "M6 (%)": 10, "M7 (%)": 10},
             ])
             _tmpl_buf = BytesIO()
             _auto_tmpl.to_excel(_tmpl_buf, index=False)
@@ -5047,7 +5047,7 @@ if "calc_data" in st.session_state:
                 try:
                     _auto_loaded = pd.read_excel(_auto_upload)
                     _need_cols   = ["Initiative Name","Client","Task (Type - Subtype)","Affects",
-                                    "M1 (%)","M2 (%)","M3 (%)","M4 (%)","M5 (%)","M6 (%)"]
+                                    "M1 (%)","M2 (%)","M3 (%)","M4 (%)","M5 (%)","M6 (%)","M7 (%)"]
                     for _nc in _need_cols:
                         if _nc not in _auto_loaded.columns: _auto_loaded[_nc] = None
                     st.session_state.automations_df = _auto_loaded[_need_cols].copy()
@@ -5082,11 +5082,12 @@ if "calc_data" in st.session_state:
                     "M4 (%)": st.column_config.NumberColumn("M4 (%)", min_value=0.0, max_value=100.0, default=0.0, format="%.1f%%"),
                     "M5 (%)": st.column_config.NumberColumn("M5 (%)", min_value=0.0, max_value=100.0, default=0.0, format="%.1f%%"),
                     "M6 (%)": st.column_config.NumberColumn("M6 (%)", min_value=0.0, max_value=100.0, default=0.0, format="%.1f%%"),
+                    "M7 (%)": st.column_config.NumberColumn("M7 (%)", min_value=0.0, max_value=100.0, default=0.0, format="%.1f%%"),
                 }
             )
 
             # ── Enforce cumulative roll-over: each month ≥ previous month ────────
-            _pct_cols = ["M1 (%)", "M2 (%)", "M3 (%)", "M4 (%)", "M5 (%)", "M6 (%)"]
+            _pct_cols = ["M1 (%)", "M2 (%)", "M3 (%)", "M4 (%)", "M5 (%)", "M6 (%)", "M7 (%)"]
             if not st.session_state.automations_df.empty:
                 _existing = [c for c in _pct_cols if c in st.session_state.automations_df.columns]
                 if _existing:
@@ -5132,7 +5133,7 @@ if "calc_data" in st.session_state:
             _hist_tmpl = pd.DataFrame([
                 {"POD": "POD A", "Client": "Acme Corp", "Required Role": "Accountant I",
                  "M1 (Hrs)": 20, "M2 (Hrs)": 20, "M3 (Hrs)": 20,
-                 "M4 (Hrs)": 0,  "M5 (Hrs)": 0,  "M6 (Hrs)": 0},
+                 "M4 (Hrs)": 0,  "M5 (Hrs)": 0,  "M6 (Hrs)": 0,  "M7 (Hrs)": 0},
             ])
             _ht_buf = BytesIO()
             _hist_tmpl.to_excel(_ht_buf, index=False)
@@ -5152,14 +5153,14 @@ if "calc_data" in st.session_state:
                         if 'Role' in _hist_up_df.columns and 'Required Role' not in _hist_up_df.columns:
                             _hist_up_df = _hist_up_df.rename(columns={'Role': 'Required Role'})
                         _hist_expected = ['Confirmed', 'POD', 'Client', 'Required Role',
-                                          'M1 (Hrs)', 'M2 (Hrs)', 'M3 (Hrs)', 'M4 (Hrs)', 'M5 (Hrs)', 'M6 (Hrs)']
+                                          'M1 (Hrs)', 'M2 (Hrs)', 'M3 (Hrs)', 'M4 (Hrs)', 'M5 (Hrs)', 'M6 (Hrs)', 'M7 (Hrs)']
                         for _hc2 in _hist_expected:
                             if _hc2 not in _hist_up_df.columns:
                                 _hist_up_df[_hc2] = True if _hc2 == 'Confirmed' else (0.0 if '(Hrs)' in _hc2 else '')
                         _hist_up_df = _hist_up_df[_hist_expected]
                         # All rows from upload are confirmed by default
                         _hist_up_df['Confirmed'] = True
-                        for _hc2 in ['M1 (Hrs)', 'M2 (Hrs)', 'M3 (Hrs)', 'M4 (Hrs)', 'M5 (Hrs)', 'M6 (Hrs)']:
+                        for _hc2 in ['M1 (Hrs)', 'M2 (Hrs)', 'M3 (Hrs)', 'M4 (Hrs)', 'M5 (Hrs)', 'M6 (Hrs)', 'M7 (Hrs)']:
                             _hist_up_df[_hc2] = pd.to_numeric(_hist_up_df[_hc2], errors='coerce').fillna(0.0)
                         # Normalize client names case-insensitively
                         _cli_norm_h = {c.lower().strip(): c for c in _avail_cli_h if c}
@@ -5212,11 +5213,11 @@ if "calc_data" in st.session_state:
             )
             _red_tmpl = pd.DataFrame([
                 {"Confirmed": True, "POD": "POD A", "Client": "", "Required Role": "",
-                 "M1 (Hrs)": 10, "M2 (Hrs)": 10, "M3 (Hrs)": 0, "M4 (Hrs)": 0, "M5 (Hrs)": 0, "M6 (Hrs)": 0},
+                 "M1 (Hrs)": 10, "M2 (Hrs)": 10, "M3 (Hrs)": 0, "M4 (Hrs)": 0, "M5 (Hrs)": 0, "M6 (Hrs)": 0, "M7 (Hrs)": 0},
                 {"Confirmed": True, "POD": "POD A", "Client": "", "Required Role": "Accountant I",
-                 "M1 (Hrs)": 5,  "M2 (Hrs)": 5,  "M3 (Hrs)": 0, "M4 (Hrs)": 0, "M5 (Hrs)": 0, "M6 (Hrs)": 0},
+                 "M1 (Hrs)": 5,  "M2 (Hrs)": 5,  "M3 (Hrs)": 0, "M4 (Hrs)": 0, "M5 (Hrs)": 0, "M6 (Hrs)": 0, "M7 (Hrs)": 0},
                 {"Confirmed": True, "POD": "",      "Client": "Acme Corp", "Required Role": "Accountant I",
-                 "M1 (Hrs)": 8,  "M2 (Hrs)": 0,  "M3 (Hrs)": 0, "M4 (Hrs)": 0, "M5 (Hrs)": 0, "M6 (Hrs)": 0},
+                 "M1 (Hrs)": 8,  "M2 (Hrs)": 0,  "M3 (Hrs)": 0, "M4 (Hrs)": 0, "M5 (Hrs)": 0, "M6 (Hrs)": 0, "M7 (Hrs)": 0},
             ])
             _rt_buf = BytesIO()
             _red_tmpl.to_excel(_rt_buf, index=False)
@@ -5237,14 +5238,14 @@ if "calc_data" in st.session_state:
                         if 'Role' in _red_up_df.columns and 'Required Role' not in _red_up_df.columns:
                             _red_up_df = _red_up_df.rename(columns={'Role': 'Required Role'})
                         _red_expected = ['Confirmed', 'POD', 'Client', 'Required Role',
-                                         'M1 (Hrs)', 'M2 (Hrs)', 'M3 (Hrs)', 'M4 (Hrs)', 'M5 (Hrs)', 'M6 (Hrs)']
+                                         'M1 (Hrs)', 'M2 (Hrs)', 'M3 (Hrs)', 'M4 (Hrs)', 'M5 (Hrs)', 'M6 (Hrs)', 'M7 (Hrs)']
                         for _rc in _red_expected:
                             if _rc not in _red_up_df.columns:
                                 _red_up_df[_rc] = False if _rc == 'Confirmed' else (0.0 if '(Hrs)' in _rc else '')
                         _red_up_df = _red_up_df[_red_expected]
                         # All rows from upload are confirmed by default
                         _red_up_df['Confirmed'] = True
-                        for _hc in ['M1 (Hrs)', 'M2 (Hrs)', 'M3 (Hrs)', 'M4 (Hrs)', 'M5 (Hrs)', 'M6 (Hrs)']:
+                        for _hc in ['M1 (Hrs)', 'M2 (Hrs)', 'M3 (Hrs)', 'M4 (Hrs)', 'M5 (Hrs)', 'M6 (Hrs)', 'M7 (Hrs)']:
                             _red_up_df[_hc] = pd.to_numeric(_red_up_df[_hc], errors='coerce').fillna(0.0)
                         # Normalize POD/Client values to match exact dropdown options (case-insensitive)
                         _avail_pods = st.session_state.get('_lista_pods', lista_pods)
@@ -5293,6 +5294,7 @@ if "calc_data" in st.session_state:
                     "M4 (Hrs)": st.column_config.NumberColumn("M4 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
                     "M5 (Hrs)": st.column_config.NumberColumn("M5 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
                     "M6 (Hrs)": st.column_config.NumberColumn("M6 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
+                    "M7 (Hrs)": st.column_config.NumberColumn("M7 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
                 }
             )
 
@@ -5311,10 +5313,10 @@ if "calc_data" in st.session_state:
             _dc_tmpl = pd.DataFrame([
                 {"Client": "Acme Corp", "POD": "POD A",
                  "M1 (%)": 5.0, "M2 (%)": 5.0, "M3 (%)": 0.0,
-                 "M4 (%)": 0.0, "M5 (%)": 0.0, "M6 (%)": 0.0},
+                 "M4 (%)": 0.0, "M5 (%)": 0.0, "M6 (%)": 0.0, "M7 (%)": 0.0},
                 {"Client": "Beta LLC",  "POD": "",
                  "M1 (%)": -10.0, "M2 (%)": -10.0, "M3 (%)": 0.0,
-                 "M4 (%)": 0.0,  "M5 (%)": 0.0,    "M6 (%)": 0.0},
+                 "M4 (%)": 0.0,  "M5 (%)": 0.0,    "M6 (%)": 0.0, "M7 (%)": 0.0},
             ])
             _dc_buf = BytesIO()
             _dc_tmpl.to_excel(_dc_buf, index=False)
@@ -5376,6 +5378,7 @@ if "calc_data" in st.session_state:
                     "M4 (%)": st.column_config.NumberColumn("M4 (%)", format="%.1f%%"),
                     "M5 (%)": st.column_config.NumberColumn("M5 (%)", format="%.1f%%"),
                     "M6 (%)": st.column_config.NumberColumn("M6 (%)", format="%.1f%%"),
+                    "M7 (%)": st.column_config.NumberColumn("M7 (%)", format="%.1f%%"),
                 },
             )
 
@@ -5403,7 +5406,7 @@ if "calc_data" in st.session_state:
                     st.markdown(
                         "**Monthly MRR Growth % per projected month.**  \n"
                         "M1 and M2 are locked (baseline / current period). "
-                        "M3–M6 are pre-seeded from **MRR Projected Growth %** in Global Parameters "
+                        "M3–M7 are pre-seeded from **MRR Projected Growth %** in Global Parameters "
                         "and can be overridden manually here for custom scenarios."
                     )
                     _mgdf = st.session_state.s2_mrr_growth_df.copy()
@@ -5424,6 +5427,8 @@ if "calc_data" in st.session_state:
                                 "M5 (%)", min_value=0.0, format="%.2f%%"),
                             "M6 (%)": st.column_config.NumberColumn(
                                 "M6 (%)", min_value=0.0, format="%.2f%%"),
+                            "M7 (%)": st.column_config.NumberColumn(
+                                "M7 (%)", min_value=0.0, format="%.2f%%"),
                         },
                         key="mrr_growth_editor"
                     )
@@ -5573,10 +5578,10 @@ if "calc_data" in st.session_state:
             _s3_use_real_cas = _s3_use_real
 
             summary_data_auto = []
-            monthly_prod_hrs  = {i: 0.0 for i in range(6)}
-            monthly_util_hrs  = {i: 0.0 for i in range(6)}
-            monthly_abs_hrs   = {i: 0.0 for i in range(6)}
-            monthly_att_hrs   = {i: 0.0 for i in range(6)}
+            monthly_prod_hrs  = {i: 0.0 for i in range(7)}
+            monthly_util_hrs  = {i: 0.0 for i in range(7)}
+            monthly_abs_hrs   = {i: 0.0 for i in range(7)}
+            monthly_att_hrs   = {i: 0.0 for i in range(7)}
             # Per-POD productive hours: {pod_name: {month_idx: prod_hrs}}
             _pod_prod_hrs_m   = {}
 
@@ -5670,7 +5675,7 @@ if "calc_data" in st.session_state:
                     _mpms = (_autos_src["PMS"].apply(_auto_matches_all)) | (_autos_src["PMS"] == _pmsk) if "PMS" in _autos_src.columns else pd.Series(True, index=_autos_src.index)
                     _ap_rows = _autos_src[_mc & _mt & _mpod & _mpms]
                     _effs = []
-                    for _mi2 in range(6):
+                    for _mi2 in range(7):
                         _evp = _evr = _eap = _ear = 0.0
                         if not _ap_rows.empty:
                             _mc2 = f"M{_mi2+1} (%)"
@@ -5744,7 +5749,7 @@ if "calc_data" in st.session_state:
                     monthly_att_hrs[_mi]  += (_bp + _br) * attrition
                     # Accumulate per-POD productive hours for POD-level waterfall
                     if _pod not in _pod_prod_hrs_m:
-                        _pod_prod_hrs_m[_pod] = {j: 0.0 for j in range(6)}
+                        _pod_prod_hrs_m[_pod] = {j: 0.0 for j in range(7)}
                     _pod_prod_hrs_m[_pod][_mi] += (_bp + _br)
 
             df_sum_auto    = pd.DataFrame(summary_data_auto)
@@ -7007,7 +7012,7 @@ if "calc_data" in st.session_state:
                         _mgdf_v      = st.session_state.s2_mrr_growth_df
                         _mg_col      = f"M{i+1} (%)"
                         _mg_val_pct  = float(_mgdf_v.at[0, _mg_col]) / 100 if _mg_col in _mgdf_v.columns else 0.0
-                        # Forecasted MRR Growth: only for M3-M6 (indices 2-5)
+                        # Forecasted MRR Growth: only for M3-M7 (indices 2-6)
                         if i >= 2 and float(mrr or 0) > 0:
                             _fcast_mrr_growth = float(mrr or 0) * _mg_val_pct
                         else:
@@ -7098,7 +7103,7 @@ if "calc_data" in st.session_state:
                         rows.setdefault("  New HC Required",                    {})[col] = _fmt(_new_hc_req,         'dec')
                         rows.setdefault("  Forecasted HC (Actual + New)",       {})[col] = _fmt(_fcast_total_hc,     'dec')
                         rows.setdefault("  Forecast Over/Under",                {})[col] = _fmt(_fcast_over_under,   'dec')
-                        # Store for Step 4 pre-population (only M3-M6 where forecast is active)
+                        # Store for Step 4 pre-population (only M3-M7 where forecast is active)
                         if i >= 2:
                             _proj_store[i] = {
                                 'forecasted_mrr_growth': _fcast_mrr_growth,
@@ -8399,7 +8404,7 @@ if "calc_data" in st.session_state:
             _el_cli     = st.session_state.final_dashboards.get('cliente', pd.DataFrame())
             _el_gen     = st.session_state.final_dashboards.get('general', pd.DataFrame())
             _el_hrs_fte = st.session_state.get('calc_data', {}).get('dict_hrs_per_fte', {})
-            _el_month_cols = [f"M{i+1} ({meses_proyeccion[i]})" for i in range(6)]
+            _el_month_cols = [f"M{i+1} ({meses_proyeccion[i]})" for i in range(7)]
 
             # ── Overall Role Summary — mirrors Capacity Overview HC section ──────
             _el_role_fte_map_ov = {
@@ -8425,13 +8430,13 @@ if "calc_data" in st.session_state:
                     "Scoped by the active Step 3 cascade filter (POD / Sr. Accountant). "
                     "Actual HC column requires an HC report upload."
                 )
-                _el_mcols_ov = [f"M{_ei+1} ({meses_proyeccion[_ei]})" for _ei in range(6)]
+                _el_mcols_ov = [f"M{_ei+1} ({meses_proyeccion[_ei]})" for _ei in range(7)]
 
                 # ── Build required FTEs per role & month, scoped by cascade ──
                 _ov_req_by_role = {r: {c: 0.0 for c in _el_mcols_ov} for r in _el_role_fte_map_ov}
                 if _ov_cascade_pods or _ov_cascade_srs:
                     # Scope Required FTEs from the client dashboard (hours → FTEs)
-                    for _ei in range(6):
+                    for _ei in range(7):
                         _mc_o = _el_mcols_ov[_ei]
                         _fcol_ov = f"M{_ei+1} ({meses_proyeccion[_ei]}) - Final Hours"
                         _av_ov   = _el_hrs_fte.get(_ei, 150.0)
@@ -8446,7 +8451,7 @@ if "calc_data" in st.session_state:
                                 _ov_req_by_role[_r_ov][_mc_o] = round(_h / _av_ov, 2) if _av_ov > 0 else 0.0
                 else:
                     for _r_ov, _cn_ov in _el_role_fte_map_ov.items():
-                        for _ei in range(6):
+                        for _ei in range(7):
                             _mc_o = _el_mcols_ov[_ei]
                             _ov_req_by_role[_r_ov][_mc_o] = round(
                                 float(_el_gen.iloc[_ei].get(_cn_ov, 0) or 0) if _ei < len(_el_gen) else 0.0, 2
@@ -8478,7 +8483,7 @@ if "calc_data" in st.session_state:
 
                 # ── Totals ──
                 _ov_total_req = {}
-                for _ei in range(6):
+                for _ei in range(7):
                     _mc = _el_mcols_ov[_ei]
                     _ov_total_req[_mc] = round(sum(_ov_req_by_role[r][_mc] for r in _el_role_fte_map_ov), 2)
                 _ov_total_act = (sum(v for v in _ov_act_by_role.values() if v is not None)
@@ -8586,7 +8591,7 @@ if "calc_data" in st.session_state:
                         _cc = str(_cr.get('Client', '')).strip()
                         _cr2 = str(_cr.get('Required Role', '')).strip()
                         _m1h = float(_cr.get(_m1_fcol, 0) or 0)
-                        for _ei in range(6):
+                        for _ei in range(7):
                             _mxc = f"M{_ei+1} ({meses_proyeccion[_ei]}) - Final Hours"
                             _mxh = float(_cr.get(_mxc, 0) or 0) if _mxc in _cr.index else _m1h
                             _el_ratio[(_cc, _cr2, _ei)] = _mxh / _m1h if _m1h > 0 else 1.0
@@ -8655,7 +8660,7 @@ if "calc_data" in st.session_state:
                 _el_sum_rows = {}
                 for r in roles_permitidos:
                     _el_req_r = {}
-                    for _ei in range(6):
+                    for _ei in range(7):
                         _mc = _el_month_cols[_ei]
                         if _el_pod == "Overall":
                             _el_req_r[_mc] = float(_el_gen.iloc[_ei].get(_el_role_fte_col[r], 0) or 0) \
@@ -8767,7 +8772,7 @@ if "calc_data" in st.session_state:
                     _util_goal = _role_util(_role)
 
                     _rd = {'Email': _email_d, 'Role': _role, 'POD': _pod_d}
-                    for _ei in range(6):
+                    for _ei in range(7):
                         _avail    = _el_hrs_fte.get(_ei, 150.0)
                         _prod_cap = _avail * _util_goal
                         _busy     = 0.0
@@ -8827,7 +8832,7 @@ if "calc_data" in st.session_state:
             _wf_exp = st.session_state.get('_wf_overall_export', pd.DataFrame())
             if not _wf_exp.empty:
                 _wf_exp.to_excel(writer, sheet_name='Capacity_Overview_Waterfall')
-            # Tab 1a: MRR Forecast — dedicated clean projection summary (M3-M6)
+            # Tab 1a: MRR Forecast — dedicated clean projection summary (M3-M7)
             _proj_exp_df = _build_proj_export_df(st.session_state.get('_projection_data', {}))
             if not _proj_exp_df.empty:
                 _proj_exp_df.to_excel(writer, sheet_name='MRR_Forecast', index=False)
@@ -9953,7 +9958,7 @@ if (
                     _mpm = ((_s4a_src["PMS"].apply(_s4am)) | (_s4a_src["PMS"]==_pmk)) if "PMS" in _s4a_src.columns else pd.Series(True, index=_s4a_src.index)
                     _arows = _s4a_src[_mc & _mt & _mpd & _mpm]
                     _effs = []
-                    for _mj2 in range(6):
+                    for _mj2 in range(7):
                         _evp=_evr=_eap=_ear=0.0
                         if not _arows.empty:
                             for _,_au in _arows.iterrows():
@@ -9993,16 +9998,16 @@ if (
                 _pk_arr   = _s4df.get('POD', pd.Series('', index=_s4df.index)).fillna('').astype(str).str.strip().values
                 _pmk_arr  = _s4df.get('PMS', pd.Series('', index=_s4df.index)).fillna('').astype(str).str.strip().values
 
-                # Build efficiency tensor (n_rows × 6 months × 4 factors) with one Python pass
-                _eff_t = np.zeros((_s4n, 6, 4))
+                # Build efficiency tensor (n_rows × 7 months × 4 factors) with one Python pass
+                _eff_t = np.zeros((_s4n, 7, 4))
                 for _ri in range(_s4n):
                     _ef2 = _s4ac.get((_ck_arr[_ri], _tk_arr[_ri], _pk_arr[_ri], _pmk_arr[_ri]), None)
                     if _ef2:
-                        for _mj in range(6):
+                        for _mj in range(7):
                             _eff_t[_ri, _mj, :] = _ef2[_mj]
 
                 # Per-month vectorised computation
-                for _mj3 in range(6):
+                for _mj3 in range(7):
                     _ac3 = _s4ap[_mj3]          # shape (n_rows,)
                     _lc3 = _s4lc[_mj3]          # shape (n_rows,)
                     _vp3 = _eff_t[:, _mj3, 0]
@@ -10847,12 +10852,12 @@ if (
                  "Task (Type - Subtype)": "AP - Invoice Processing",
                  "Affects": "Vol Proc + Vol Rev",
                  "M1 (%)": 10, "M2 (%)": 15, "M3 (%)": 20,
-                 "M4 (%)": 20, "M5 (%)": 20, "M6 (%)": 20},
+                 "M4 (%)": 20, "M5 (%)": 20, "M6 (%)": 20, "M7 (%)": 20},
                 {"Initiative Name": "AI Coding", "Client": "Acme Corp",
                  "Task (Type - Subtype)": "All",
                  "Affects": "AHT Proc",
                  "M1 (%)": 5, "M2 (%)": 5, "M3 (%)": 10,
-                 "M4 (%)": 10, "M5 (%)": 10, "M6 (%)": 10},
+                 "M4 (%)": 10, "M5 (%)": 10, "M6 (%)": 10, "M7 (%)": 10},
             ])
             _s4a_tmpl_buf = BytesIO()
             _s4a_tmpl.to_excel(_s4a_tmpl_buf, index=False)
@@ -10879,14 +10884,14 @@ if (
                         _s4a_need_cols = [
                             "Initiative Name", "POD", "PMS", "Client",
                             "Task (Type - Subtype)", "Affects",
-                            "M1 (%)", "M2 (%)", "M3 (%)", "M4 (%)", "M5 (%)", "M6 (%)",
+                            "M1 (%)", "M2 (%)", "M3 (%)", "M4 (%)", "M5 (%)", "M6 (%)", "M7 (%)",
                         ]
                         for _s4nc in _s4a_need_cols:
                             if _s4nc not in _s4a_loaded.columns:
                                 _s4a_loaded[_s4nc] = None
                         _s4a_loaded = _s4a_loaded[_s4a_need_cols].copy()
                         # Normalise % columns
-                        for _s4pc in ["M1 (%)", "M2 (%)", "M3 (%)", "M4 (%)", "M5 (%)", "M6 (%)"]:
+                        for _s4pc in ["M1 (%)", "M2 (%)", "M3 (%)", "M4 (%)", "M5 (%)", "M6 (%)", "M7 (%)"]:
                             _s4a_loaded[_s4pc] = pd.to_numeric(_s4a_loaded[_s4pc], errors='coerce').fillna(0.0)
                         # All uploaded rows confirmed by default
                         _s4a_loaded.insert(0, "Confirmed", True)
@@ -10925,10 +10930,11 @@ if (
                     "M4 (%)": st.column_config.NumberColumn("M4 (%)", min_value=0.0, max_value=100.0, default=0.0, format="%.1f%%"),
                     "M5 (%)": st.column_config.NumberColumn("M5 (%)", min_value=0.0, max_value=100.0, default=0.0, format="%.1f%%"),
                     "M6 (%)": st.column_config.NumberColumn("M6 (%)", min_value=0.0, max_value=100.0, default=0.0, format="%.1f%%"),
+                    "M7 (%)": st.column_config.NumberColumn("M7 (%)", min_value=0.0, max_value=100.0, default=0.0, format="%.1f%%"),
                 },
             )
             # Enforce cumulative roll-over (same as Step 2)
-            _s4a_pct_cols = ["M1 (%)", "M2 (%)", "M3 (%)", "M4 (%)", "M5 (%)", "M6 (%)"]
+            _s4a_pct_cols = ["M1 (%)", "M2 (%)", "M3 (%)", "M4 (%)", "M5 (%)", "M6 (%)", "M7 (%)"]
             if not st.session_state.s4v2_auto_df.empty:
                 _s4a_exist = [c for c in _s4a_pct_cols if c in st.session_state.s4v2_auto_df.columns]
                 if _s4a_exist:
@@ -10952,7 +10958,7 @@ if (
             _s4h_tmpl = pd.DataFrame([
                 {"POD": "POD A", "Client": "Acme Corp", "Required Role": "Accountant I",
                  "M1 (Hrs)": 20, "M2 (Hrs)": 20, "M3 (Hrs)": 20,
-                 "M4 (Hrs)": 0,  "M5 (Hrs)": 0,  "M6 (Hrs)": 0},
+                 "M4 (Hrs)": 0,  "M5 (Hrs)": 0,  "M6 (Hrs)": 0,  "M7 (Hrs)": 0},
             ])
             _s4h_buf = BytesIO()
             _s4h_tmpl.to_excel(_s4h_buf, index=False)
@@ -10972,13 +10978,13 @@ if (
                         if 'Role' in _s4h_up_df.columns and 'Required Role' not in _s4h_up_df.columns:
                             _s4h_up_df = _s4h_up_df.rename(columns={'Role': 'Required Role'})
                         _s4h_expected = ['Confirmed', 'POD', 'Client', 'Required Role',
-                                         'M1 (Hrs)', 'M2 (Hrs)', 'M3 (Hrs)', 'M4 (Hrs)', 'M5 (Hrs)', 'M6 (Hrs)']
+                                         'M1 (Hrs)', 'M2 (Hrs)', 'M3 (Hrs)', 'M4 (Hrs)', 'M5 (Hrs)', 'M6 (Hrs)', 'M7 (Hrs)']
                         for _s4hc in _s4h_expected:
                             if _s4hc not in _s4h_up_df.columns:
                                 _s4h_up_df[_s4hc] = True if _s4hc == 'Confirmed' else (0.0 if '(Hrs)' in _s4hc else '')
                         _s4h_up_df = _s4h_up_df[_s4h_expected]
                         _s4h_up_df['Confirmed'] = True
-                        for _s4hc in ['M1 (Hrs)', 'M2 (Hrs)', 'M3 (Hrs)', 'M4 (Hrs)', 'M5 (Hrs)', 'M6 (Hrs)']:
+                        for _s4hc in ['M1 (Hrs)', 'M2 (Hrs)', 'M3 (Hrs)', 'M4 (Hrs)', 'M5 (Hrs)', 'M6 (Hrs)', 'M7 (Hrs)']:
                             _s4h_up_df[_s4hc] = pd.to_numeric(_s4h_up_df[_s4hc], errors='coerce').fillna(0.0)
                         st.session_state.s4v2_hist_df = _s4h_up_df
                         st.success(f"✅ Loaded {len(_s4h_up_df)} row(s) — all marked Confirmed.")
@@ -11006,6 +11012,7 @@ if (
                     "M4 (Hrs)": st.column_config.NumberColumn("M4 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
                     "M5 (Hrs)": st.column_config.NumberColumn("M5 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
                     "M6 (Hrs)": st.column_config.NumberColumn("M6 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
+                    "M7 (Hrs)": st.column_config.NumberColumn("M7 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
                 }
             )
 
@@ -11024,9 +11031,9 @@ if (
             # Template download
             _s4r_tmpl = pd.DataFrame([
                 {"Confirmed": True, "POD": "POD A", "Client": "", "Required Role": "",
-                 "M1 (Hrs)": 10, "M2 (Hrs)": 10, "M3 (Hrs)": 0, "M4 (Hrs)": 0, "M5 (Hrs)": 0, "M6 (Hrs)": 0},
+                 "M1 (Hrs)": 10, "M2 (Hrs)": 10, "M3 (Hrs)": 0, "M4 (Hrs)": 0, "M5 (Hrs)": 0, "M6 (Hrs)": 0, "M7 (Hrs)": 0},
                 {"Confirmed": True, "POD": "", "Client": "Acme Corp", "Required Role": "Accountant I",
-                 "M1 (Hrs)": 8, "M2 (Hrs)": 0, "M3 (Hrs)": 0, "M4 (Hrs)": 0, "M5 (Hrs)": 0, "M6 (Hrs)": 0},
+                 "M1 (Hrs)": 8, "M2 (Hrs)": 0, "M3 (Hrs)": 0, "M4 (Hrs)": 0, "M5 (Hrs)": 0, "M6 (Hrs)": 0, "M7 (Hrs)": 0},
             ])
             _s4r_buf = BytesIO()
             _s4r_tmpl.to_excel(_s4r_buf, index=False)
@@ -11046,13 +11053,13 @@ if (
                         if 'Role' in _s4r_up_df.columns and 'Required Role' not in _s4r_up_df.columns:
                             _s4r_up_df = _s4r_up_df.rename(columns={'Role': 'Required Role'})
                         _s4r_expected = ['Confirmed', 'POD', 'Client', 'Required Role',
-                                         'M1 (Hrs)', 'M2 (Hrs)', 'M3 (Hrs)', 'M4 (Hrs)', 'M5 (Hrs)', 'M6 (Hrs)']
+                                         'M1 (Hrs)', 'M2 (Hrs)', 'M3 (Hrs)', 'M4 (Hrs)', 'M5 (Hrs)', 'M6 (Hrs)', 'M7 (Hrs)']
                         for _s4rc in _s4r_expected:
                             if _s4rc not in _s4r_up_df.columns:
                                 _s4r_up_df[_s4rc] = True if _s4rc == 'Confirmed' else (0.0 if '(Hrs)' in _s4rc else '')
                         _s4r_up_df = _s4r_up_df[_s4r_expected]
                         _s4r_up_df['Confirmed'] = True
-                        for _s4rc in ['M1 (Hrs)', 'M2 (Hrs)', 'M3 (Hrs)', 'M4 (Hrs)', 'M5 (Hrs)', 'M6 (Hrs)']:
+                        for _s4rc in ['M1 (Hrs)', 'M2 (Hrs)', 'M3 (Hrs)', 'M4 (Hrs)', 'M5 (Hrs)', 'M6 (Hrs)', 'M7 (Hrs)']:
                             _s4r_up_df[_s4rc] = pd.to_numeric(_s4r_up_df[_s4rc], errors='coerce').fillna(0.0)
                         st.session_state.s4v2_red_df = _s4r_up_df
                         st.success(f"✅ Loaded {len(_s4r_up_df)} row(s) — all marked Confirmed.")
@@ -11080,6 +11087,7 @@ if (
                     "M4 (Hrs)": st.column_config.NumberColumn("M4 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
                     "M5 (Hrs)": st.column_config.NumberColumn("M5 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
                     "M6 (Hrs)": st.column_config.NumberColumn("M6 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
+                    "M7 (Hrs)": st.column_config.NumberColumn("M7 (Hrs)", min_value=0.0, default=0.0, format="%.1f"),
                 }
             )
 
@@ -11098,10 +11106,10 @@ if (
             _s4dc_tmpl = pd.DataFrame([
                 {"Client": "Acme Corp", "POD": "POD A",
                  "M1 (%)": 5.0, "M2 (%)": 5.0, "M3 (%)": 0.0,
-                 "M4 (%)": 0.0, "M5 (%)": 0.0, "M6 (%)": 0.0},
+                 "M4 (%)": 0.0, "M5 (%)": 0.0, "M6 (%)": 0.0, "M7 (%)": 0.0},
                 {"Client": "Beta LLC",  "POD": "",
                  "M1 (%)": -10.0, "M2 (%)": -10.0, "M3 (%)": 0.0,
-                 "M4 (%)": 0.0,  "M5 (%)": 0.0,    "M6 (%)": 0.0},
+                 "M4 (%)": 0.0,  "M5 (%)": 0.0,    "M6 (%)": 0.0, "M7 (%)": 0.0},
             ])
             _s4dc_buf = BytesIO()
             _s4dc_tmpl.to_excel(_s4dc_buf, index=False)
@@ -11154,6 +11162,7 @@ if (
                     "M4 (%)": st.column_config.NumberColumn("M4 (%)", format="%.1f%%"),
                     "M5 (%)": st.column_config.NumberColumn("M5 (%)", format="%.1f%%"),
                     "M6 (%)": st.column_config.NumberColumn("M6 (%)", format="%.1f%%"),
+                    "M7 (%)": st.column_config.NumberColumn("M7 (%)", format="%.1f%%"),
                 },
             )
 
@@ -11599,7 +11608,7 @@ with tab_vol_aht:
 
             # Month selector (for FTE conversion)
             _va_month_idx = _c4.selectbox(
-                "Month", options=list(range(6)),
+                "Month", options=list(range(7)),
                 format_func=lambda i: meses_proyeccion[i],
                 key="va_month_sel"
             )
@@ -12306,7 +12315,7 @@ with tab_recon:
                 # MRR Forecast comparison (on-page)
                 if 'MRR_Forecast' in _levels and not _levels['MRR_Forecast'].empty:
                     st.subheader("📈 MRR Forecast Comparison")
-                    st.caption("Forecasted MRR Growth and HC projections (M3–M6) — V1 vs V2")
+                    st.caption("Forecasted MRR Growth and HC projections (M3–M7) — V1 vs V2")
                     st.dataframe(_levels['MRR_Forecast'], use_container_width=True)
 
                 if 'MRR_Growth_Settings' in _levels and not _levels['MRR_Growth_Settings'].empty:
