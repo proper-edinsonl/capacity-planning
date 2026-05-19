@@ -14,6 +14,17 @@ from sklearn.preprocessing import OneHotEncoder
 # --- APP VERSION ---
 APP_VERSION = "v3.5.0"
 
+def _lc_short_m0(gl_series):
+    """Bool array: True if Go Live month has < 15 working days remaining (< 3 weeks)."""
+    gl_pd  = pd.to_datetime(pd.Series(gl_series), errors='coerce')
+    hgl    = gl_pd.notna()
+    gl_eom = (gl_pd.dt.to_period('M').dt.to_timestamp('M') + pd.Timedelta(days=1))
+    wd     = np.busday_count(
+        gl_pd.fillna(pd.Timestamp('2000-01-01')).values.astype('datetime64[D]'),
+        gl_eom.fillna(pd.Timestamp('2001-01-01')).values.astype('datetime64[D]')
+    )
+    return hgl.values & (wd < 15)
+
 # --- SCENARIOS DIRECTORY ---
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SCENARIOS_DIR = os.path.join(_APP_DIR, "scenarios")
@@ -525,9 +536,13 @@ def _make_ai_prediction_fragment(pfx, add_to_scenario, add_to_baseline=False):
                             _mes_start = (today + relativedelta(months=_ai_month)).replace(day=1)
                             if pd.notna(_gl_parsed):
                                 _m_diff = (_mes_start.year - _gl_parsed.year) * 12 + (_mes_start.month - _gl_parsed.month)
+                                _gl_eom_p = (_gl_parsed + pd.offsets.MonthEnd(0) + pd.Timedelta(days=1)).date()
+                                _wd_m0_p  = int(np.busday_count(str(_gl_parsed.date()), str(_gl_eom_p)))
+                                _sm0_p    = _wd_m0_p < 15
                                 if   _m_diff == 0: _lc = 1.17
-                                elif _m_diff == 1: _lc = 1.03
-                                elif _m_diff == 2: _lc = 1.02
+                                elif _m_diff == 1: _lc = 1.17 if _sm0_p else 1.03
+                                elif _m_diff == 2: _lc = 1.03 if _sm0_p else 1.02
+                                elif _m_diff == 3: _lc = 1.02 if _sm0_p else 1.0
                                 else:              _lc = 1.0
                             else:
                                 _lc = 1.17
@@ -4186,9 +4201,16 @@ with tab1:
                         _hgl   = pd.notna(pd.Series(_b_gl)).values
                         _gl_ts = pd.DatetimeIndex(pd.to_datetime(pd.Series(_b_gl), errors='coerce').fillna(start_m))
                         _md    = np.where(_hgl, (start_m.year-_gl_ts.year.values)*12+(start_m.month-_gl_ts.month.values), 999).astype(int)
+                        _sm0   = _lc_short_m0(_b_gl)
                         _lc   = np.select(
-                            [~_hgl|(_ap==0), (_md==0)&_hgl&(_ap>0), (_md==1)&_hgl&(_ap>0), (_md==2)&_hgl&(_ap>0)],
-                            [1.0, 1.17, 1.03, 1.02], default=1.0
+                            [~_hgl|(_ap==0),
+                             (_md==0)&_hgl&(_ap>0),
+                             (_md==1)&_hgl&(_ap>0)&~_sm0,
+                             (_md==1)&_hgl&(_ap>0)&_sm0,
+                             (_md==2)&_hgl&(_ap>0)&~_sm0,
+                             (_md==2)&_hgl&(_ap>0)&_sm0,
+                             (_md==3)&_hgl&(_ap>0)&_sm0],
+                            [1.0, 1.17, 1.03, 1.17, 1.02, 1.03, 1.02], default=1.0
                         )
 
                         _bp = (_b_ptix * _ap * _b_paht * _lc * day_scale) / 60
@@ -5640,12 +5662,16 @@ if "calc_data" in st.session_state:
                                    (_sm.month - _gl_ts.month.values),
                                    999).astype(int)
                 _ap     = _apct_m[_mi]
+                _sm0    = _lc_short_m0(_gl_raw)
                 _lc_m[_mi] = np.select(
                     [~_has_gl | (_ap == 0),
                      (_mdiff == 0) & _has_gl & (_ap > 0),
-                     (_mdiff == 1) & _has_gl & (_ap > 0),
-                     (_mdiff == 2) & _has_gl & (_ap > 0)],
-                    [1.0, 1.17, 1.03, 1.02],
+                     (_mdiff == 1) & _has_gl & (_ap > 0) & ~_sm0,
+                     (_mdiff == 1) & _has_gl & (_ap > 0) & _sm0,
+                     (_mdiff == 2) & _has_gl & (_ap > 0) & ~_sm0,
+                     (_mdiff == 2) & _has_gl & (_ap > 0) & _sm0,
+                     (_mdiff == 3) & _has_gl & (_ap > 0) & _sm0],
+                    [1.0, 1.17, 1.03, 1.17, 1.02, 1.03, 1.02],
                     default=1.0
                 )
 
@@ -6059,9 +6085,13 @@ if "calc_data" in st.session_state:
                 _lc = 1.0
                 if pd.notna(_gl) and _apct > 0:
                     _md = (_m1_start.year - _gl.year) * 12 + (_m1_start.month - _gl.month)
+                    _gl_eom_c = (_gl + pd.offsets.MonthEnd(0) + pd.Timedelta(days=1)).date()
+                    _wd_m0_c  = int(np.busday_count(str(_gl.date()), str(_gl_eom_c)))
+                    _sm0_c    = _wd_m0_c < 15
                     if   _md == 0: _lc = 1.17
-                    elif _md == 1: _lc = 1.03
-                    elif _md == 2: _lc = 1.02
+                    elif _md == 1: _lc = 1.17 if _sm0_c else 1.03
+                    elif _md == 2: _lc = 1.03 if _sm0_c else 1.02
+                    elif _md == 3: _lc = 1.02 if _sm0_c else 1.0
 
                 _bp = (_ptix * _apct * _paht * _lc) / 60
                 _br = (_rtix * _apct * _raht * _lc) / 60
@@ -7133,9 +7163,17 @@ if "calc_data" in st.session_state:
                             _aht_md   = np.where(_aht_hagl,
                                 (_aht_start_m.year  - _aht_gl_f.dt.year)  * 12 +
                                 (_aht_start_m.month - _aht_gl_f.dt.month), 999)
+                            _aht_sm0  = _lc_short_m0(_df_m['Go Live'].values)
+                            _aht_ap   = _aht_hagl.values if hasattr(_aht_hagl, 'values') else np.array(_aht_hagl)
                             _aht_lc = np.select(
-                                [~_aht_hagl, (_aht_md==0), (_aht_md==1), (_aht_md==2)],
-                                [1.0, 1.17, 1.03, 1.02], default=1.0)
+                                [~_aht_hagl,
+                                 (_aht_md==0),
+                                 (_aht_md==1)&~_aht_sm0,
+                                 (_aht_md==1)&_aht_sm0,
+                                 (_aht_md==2)&~_aht_sm0,
+                                 (_aht_md==2)&_aht_sm0,
+                                 (_aht_md==3)&_aht_sm0],
+                                [1.0, 1.17, 1.03, 1.17, 1.02, 1.03, 1.02], default=1.0)
                         else:
                             _aht_lc = np.ones(len(_df_m)) if not _df_m.empty else np.array([1.0])
                         _aht_ptix = _safe_num(_df_m.get('Closed tickets with Proc time', 0)) if not _df_m.empty else pd.Series([0.0])
@@ -7605,9 +7643,16 @@ if "calc_data" in st.session_state:
                                         _paht_md  = np.where(_paht_hgl,
                                             (_paht_sm.year  - _paht_glf.dt.year)  * 12 +
                                             (_paht_sm.month - _paht_glf.dt.month), 999)
+                                        _paht_sm0 = _lc_short_m0(_pdf_m['Go Live'].values)
                                         _paht_lc = np.select(
-                                            [~_paht_hgl, (_paht_md==0), (_paht_md==1), (_paht_md==2)],
-                                            [1.0, 1.17, 1.03, 1.02], default=1.0)
+                                            [~_paht_hgl,
+                                             (_paht_md==0),
+                                             (_paht_md==1)&~_paht_sm0,
+                                             (_paht_md==1)&_paht_sm0,
+                                             (_paht_md==2)&~_paht_sm0,
+                                             (_paht_md==2)&_paht_sm0,
+                                             (_paht_md==3)&_paht_sm0],
+                                            [1.0, 1.17, 1.03, 1.17, 1.02, 1.03, 1.02], default=1.0)
                                     else:
                                         _paht_lc = np.ones(len(_pdf_m)) if not _pdf_m.empty else np.array([1.0])
                                     _paht_ptix = _safe_num(_pdf_m.get('Closed tickets with Proc time', 0)) if not _pdf_m.empty else pd.Series([0.0])
@@ -8009,9 +8054,16 @@ if "calc_data" in st.session_state:
                                     _saht_md  = np.where(_saht_hgl,
                                         (_saht_sm.year  - _saht_glf.dt.year)  * 12 +
                                         (_saht_sm.month - _saht_glf.dt.month), 999)
+                                    _saht_sm0 = _lc_short_m0(_sr_m['Go Live'].values)
                                     _saht_lc = np.select(
-                                        [~_saht_hgl, (_saht_md==0), (_saht_md==1), (_saht_md==2)],
-                                        [1.0, 1.17, 1.03, 1.02], default=1.0)
+                                        [~_saht_hgl,
+                                         (_saht_md==0),
+                                         (_saht_md==1)&~_saht_sm0,
+                                         (_saht_md==1)&_saht_sm0,
+                                         (_saht_md==2)&~_saht_sm0,
+                                         (_saht_md==2)&_saht_sm0,
+                                         (_saht_md==3)&_saht_sm0],
+                                        [1.0, 1.17, 1.03, 1.17, 1.02, 1.03, 1.02], default=1.0)
                                 else:
                                     _saht_lc = np.ones(len(_sr_m)) if not _sr_m.empty else np.array([1.0])
                                 _saht_ptix = _safe_num(_sr_m.get('Closed tickets with Proc time', 0)) if not _sr_m.empty else pd.Series([0.0])
@@ -9939,9 +9991,16 @@ if (
                     _glts = pd.DatetimeIndex(pd.to_datetime(pd.Series(_s4gl), errors='coerce').fillna(_smj))
                     _mdf  = np.where(_hgl, (_smj.year-_glts.year.values)*12+(_smj.month-_glts.month.values), 999).astype(int)
                     _ap2  = _s4ap[_mj]
+                    _s4sm0 = _lc_short_m0(_s4gl)
                     _s4lc[_mj] = np.select(
-                        [~_hgl|(_ap2==0), (_mdf==0)&_hgl&(_ap2>0), (_mdf==1)&_hgl&(_ap2>0), (_mdf==2)&_hgl&(_ap2>0)],
-                        [1.0, 1.17, 1.03, 1.02], default=1.0)
+                        [~_hgl|(_ap2==0),
+                         (_mdf==0)&_hgl&(_ap2>0),
+                         (_mdf==1)&_hgl&(_ap2>0)&~_s4sm0,
+                         (_mdf==1)&_hgl&(_ap2>0)&_s4sm0,
+                         (_mdf==2)&_hgl&(_ap2>0)&~_s4sm0,
+                         (_mdf==2)&_hgl&(_ap2>0)&_s4sm0,
+                         (_mdf==3)&_hgl&(_ap2>0)&_s4sm0],
+                        [1.0, 1.17, 1.03, 1.17, 1.02, 1.03, 1.02], default=1.0)
 
                 # Build per-combo automation efficiency lookup dict
                 def _s4am(v): return pd.isna(v) or str(v).strip() in ('', 'All')
@@ -10428,9 +10487,16 @@ if (
                 _s4aht_md  = np.where(_s4aht_hgl,
                     (_s4aht_sm.year  - _s4aht_glf.dt.year)  * 12 +
                     (_s4aht_sm.month - _s4aht_glf.dt.month), 999)
+                _s4aht_sm0 = _lc_short_m0(_src_m['Go Live'].values)
                 _s4aht_lc  = np.select(
-                    [~_s4aht_hgl, (_s4aht_md==0), (_s4aht_md==1), (_s4aht_md==2)],
-                    [1.0, 1.17, 1.03, 1.02], default=1.0)
+                    [~_s4aht_hgl,
+                     (_s4aht_md==0),
+                     (_s4aht_md==1)&~_s4aht_sm0,
+                     (_s4aht_md==1)&_s4aht_sm0,
+                     (_s4aht_md==2)&~_s4aht_sm0,
+                     (_s4aht_md==2)&_s4aht_sm0,
+                     (_s4aht_md==3)&_s4aht_sm0],
+                    [1.0, 1.17, 1.03, 1.17, 1.02, 1.03, 1.02], default=1.0)
             else:
                 _s4aht_lc = np.ones(len(_src_m)) if not _src_m.empty else np.array([1.0])
             _s4_ptix = _safe_num_s4(_src_m.get('Closed tickets with Proc time', pd.Series(dtype=float))) if not _src_m.empty else pd.Series([0.0])
