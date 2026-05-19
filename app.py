@@ -526,8 +526,8 @@ def _make_ai_prediction_fragment(pfx, add_to_scenario, add_to_baseline=False):
                             if pd.notna(_gl_parsed):
                                 _m_diff = (_mes_start.year - _gl_parsed.year) * 12 + (_mes_start.month - _gl_parsed.month)
                                 if   _m_diff == 0: _lc = 1.17
-                                elif _m_diff == 1: _lc = 0.86
-                                elif _m_diff == 2: _lc = 0.99
+                                elif _m_diff == 1: _lc = 1.03
+                                elif _m_diff == 2: _lc = 1.02
                                 else:              _lc = 1.0
                             else:
                                 _lc = 1.17
@@ -4188,7 +4188,7 @@ with tab1:
                         _md    = np.where(_hgl, (start_m.year-_gl_ts.year.values)*12+(start_m.month-_gl_ts.month.values), 999).astype(int)
                         _lc   = np.select(
                             [~_hgl|(_ap==0), (_md==0)&_hgl&(_ap>0), (_md==1)&_hgl&(_ap>0), (_md==2)&_hgl&(_ap>0)],
-                            [1.0, 1.17, 0.86, 0.99], default=1.0
+                            [1.0, 1.17, 1.03, 1.02], default=1.0
                         )
 
                         _bp = (_b_ptix * _ap * _b_paht * _lc * day_scale) / 60
@@ -5640,7 +5640,7 @@ if "calc_data" in st.session_state:
                      (_mdiff == 0) & _has_gl & (_ap > 0),
                      (_mdiff == 1) & _has_gl & (_ap > 0),
                      (_mdiff == 2) & _has_gl & (_ap > 0)],
-                    [1.0, 1.17, 0.86, 0.99],
+                    [1.0, 1.17, 1.03, 1.02],
                     default=1.0
                 )
 
@@ -6055,8 +6055,8 @@ if "calc_data" in st.session_state:
                 if pd.notna(_gl) and _apct > 0:
                     _md = (_m1_start.year - _gl.year) * 12 + (_m1_start.month - _gl.month)
                     if   _md == 0: _lc = 1.17
-                    elif _md == 1: _lc = 0.86
-                    elif _md == 2: _lc = 0.99
+                    elif _md == 1: _lc = 1.03
+                    elif _md == 2: _lc = 1.02
 
                 _bp = (_ptix * _apct * _paht * _lc) / 60
                 _br = (_rtix * _apct * _raht * _lc) / 60
@@ -7130,7 +7130,7 @@ if "calc_data" in st.session_state:
                                 (_aht_start_m.month - _aht_gl_f.dt.month), 999)
                             _aht_lc = np.select(
                                 [~_aht_hagl, (_aht_md==0), (_aht_md==1), (_aht_md==2)],
-                                [1.0, 1.17, 0.86, 0.99], default=1.0)
+                                [1.0, 1.17, 1.03, 1.02], default=1.0)
                         else:
                             _aht_lc = np.ones(len(_df_m)) if not _df_m.empty else np.array([1.0])
                         _aht_ptix = _safe_num(_df_m.get('Closed tickets with Proc time', 0)) if not _df_m.empty else pd.Series([0.0])
@@ -7602,7 +7602,7 @@ if "calc_data" in st.session_state:
                                             (_paht_sm.month - _paht_glf.dt.month), 999)
                                         _paht_lc = np.select(
                                             [~_paht_hgl, (_paht_md==0), (_paht_md==1), (_paht_md==2)],
-                                            [1.0, 1.17, 0.86, 0.99], default=1.0)
+                                            [1.0, 1.17, 1.03, 1.02], default=1.0)
                                     else:
                                         _paht_lc = np.ones(len(_pdf_m)) if not _pdf_m.empty else np.array([1.0])
                                     _paht_ptix = _safe_num(_pdf_m.get('Closed tickets with Proc time', 0)) if not _pdf_m.empty else pd.Series([0.0])
@@ -8006,7 +8006,7 @@ if "calc_data" in st.session_state:
                                         (_saht_sm.month - _saht_glf.dt.month), 999)
                                     _saht_lc = np.select(
                                         [~_saht_hgl, (_saht_md==0), (_saht_md==1), (_saht_md==2)],
-                                        [1.0, 1.17, 0.86, 0.99], default=1.0)
+                                        [1.0, 1.17, 1.03, 1.02], default=1.0)
                                 else:
                                     _saht_lc = np.ones(len(_sr_m)) if not _sr_m.empty else np.array([1.0])
                                 _saht_ptix = _safe_num(_sr_m.get('Closed tickets with Proc time', 0)) if not _sr_m.empty else pd.Series([0.0])
@@ -9936,7 +9936,7 @@ if (
                     _ap2  = _s4ap[_mj]
                     _s4lc[_mj] = np.select(
                         [~_hgl|(_ap2==0), (_mdf==0)&_hgl&(_ap2>0), (_mdf==1)&_hgl&(_ap2>0), (_mdf==2)&_hgl&(_ap2>0)],
-                        [1.0, 1.17, 0.86, 0.99], default=1.0)
+                        [1.0, 1.17, 1.03, 1.02], default=1.0)
 
                 # Build per-combo automation efficiency lookup dict
                 def _s4am(v): return pd.isna(v) or str(v).strip() in ('', 'All')
@@ -10425,7 +10425,7 @@ if (
                     (_s4aht_sm.month - _s4aht_glf.dt.month), 999)
                 _s4aht_lc  = np.select(
                     [~_s4aht_hgl, (_s4aht_md==0), (_s4aht_md==1), (_s4aht_md==2)],
-                    [1.0, 1.17, 0.86, 0.99], default=1.0)
+                    [1.0, 1.17, 1.03, 1.02], default=1.0)
             else:
                 _s4aht_lc = np.ones(len(_src_m)) if not _src_m.empty else np.array([1.0])
             _s4_ptix = _safe_num_s4(_src_m.get('Closed tickets with Proc time', pd.Series(dtype=float))) if not _src_m.empty else pd.Series([0.0])
