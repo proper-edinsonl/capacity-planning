@@ -1116,35 +1116,23 @@ def _load_volume_aht(uploaded_file, log):
                 else:
                     _churn_excluded = 0
 
-                # Build client_key → [sr_email, ...] (deduped per client)
-                _cli_srs_map  = {}   # {client_key → [sr_email, ...]}
-                _cli_key_type = {}   # {client_key → 'rid' | 'name'}
+                # Build record_id → [sr_email, ...] — HubSpot ID is the ONLY key
+                _cli_srs_map = {}   # {record_id → [sr_email, ...]}
                 for _, _rr in _srs_for_ratios.iterrows():
                     _em_r = str(_rr.get(_c_email, '') or '').strip().lower()
                     if not _em_r or _em_r in ('nan', 'none', ''):
                         continue
-                    _rid_r = ''
-                    if _c_rid:
-                        _rid_r = _clean_record_id(pd.Series([_rr.get(_c_rid, '')])).iloc[0]
-                    # Use client name only if the column exists
-                    _cn_r  = str(_rr.get(_c_client, '') or '').strip().lower() if _c_client else ''
-                    _ckey  = _rid_r if _rid_r else _cn_r
-                    if not _ckey:
+                    if not _c_rid:
                         continue
-                    _cli_srs_map.setdefault(_ckey, [])
-                    if _em_r not in _cli_srs_map[_ckey]:
-                        _cli_srs_map[_ckey].append(_em_r)
-                    _cli_key_type[_ckey] = 'rid' if _rid_r else 'name'
+                    _rid_r = _clean_record_id(pd.Series([_rr.get(_c_rid, '')])).iloc[0]
+                    if not _rid_r:
+                        continue
+                    _cli_srs_map.setdefault(_rid_r, [])
+                    if _em_r not in _cli_srs_map[_rid_r]:
+                        _cli_srs_map[_rid_r].append(_em_r)
 
                 # Share weights: 1 / max(n_srs, 1) — zero-div safe
-                _sw_rid_map  = {}   # {record_id       → weight}
-                _sw_name_map = {}   # {client_name_low → weight}
-                for _ck, _emlist in _cli_srs_map.items():
-                    _w = 1.0 / max(len(_emlist), 1)
-                    if _cli_key_type.get(_ck) == 'rid':
-                        _sw_rid_map[_ck]  = _w
-                    else:
-                        _sw_name_map[_ck] = _w
+                _sw_rid_map = {_ck: 1.0 / max(len(_el), 1) for _ck, _el in _cli_srs_map.items()}
 
                 # Client count per Sr. directly from srs sheet (post churn filter)
                 _srs_cli_cnt = {}
@@ -1156,45 +1144,27 @@ def _load_volume_aht(uploaded_file, log):
                 st.session_state['_srs_ratios_data'] = {
                     'cli_cnt_by_email':  _srs_cli_cnt,
                     'share_weight_rid':  _sw_rid_map,
-                    'share_weight_name': _sw_name_map,
+                    'share_weight_name': {},   # name-based matching removed
                 }
                 log(f"  srs ratios: {len(_srs_cli_cnt)} Srs · "
                     f"{len(_cli_srs_map)} active clients "
                     f"({_churn_excluded} churn excluded, {_n_shared} shared)")
 
                 # ── Deduped lookup for df['Sr. Accountant'] assignment ───────────────
-                # If no 'client' column, deduplicate on Hubspot ID instead
-                _c_dedup = _c_client if _c_client else _c_rid
-                _srs_dedup = _srs.drop_duplicates(subset=[_c_dedup], keep='first')
-                _srs_rid_map  = {}
-                _srs_name_map = {}
+                # Sole key: Hubspot ID (record_id). Name matching removed.
+                _srs_dedup = _srs.drop_duplicates(subset=[_c_rid], keep='first') if _c_rid else _srs
+                _srs_rid_map = {}
                 for _, _sr_row in _srs_dedup.iterrows():
                     _sr_email = str(_sr_row.get(_c_email, '') or '').strip().lower()
-                    if not _sr_email or _sr_email in ('nan', 'none', ''):
+                    if not _sr_email or _sr_email in ('nan', 'none', '') or not _c_rid:
                         continue
-                    # record_id key (Hubspot ID column → client's record_id)
-                    if _c_rid:
-                        _raw_rid = _sr_row.get(_c_rid, '')
-                        _sr_rid  = _clean_record_id(pd.Series([_raw_rid])).iloc[0]
-                        if _sr_rid:
-                            _srs_rid_map[_sr_rid] = _sr_email
-                    # name key (fallback — only if 'client' column exists)
-                    if _c_client:
-                        _sr_cli = str(_sr_row.get(_c_client, '') or '').strip().lower()
-                        if _sr_cli:
-                            _srs_name_map[_sr_cli] = _sr_email
+                    _sr_rid = _clean_record_id(pd.Series([_sr_row.get(_c_rid, '')])).iloc[0]
+                    if _sr_rid:
+                        _srs_rid_map[_sr_rid] = _sr_email
 
-                # Apply to df: record_id match first, then client_name fallback
-                _df_rid_s   = df['record_id'] if 'record_id' in df.columns else pd.Series('', index=df.index)
-                _df_name_s  = df['client_name'].astype(str).str.strip().str.lower() if 'client_name' in df.columns else pd.Series('', index=df.index)
-                _resolved   = []
-                for _rid_v, _name_v in zip(_df_rid_s, _df_name_s):
-                    if _rid_v and _rid_v in _srs_rid_map:
-                        _resolved.append(_srs_rid_map[_rid_v])
-                    elif _name_v in _srs_name_map:
-                        _resolved.append(_srs_name_map[_name_v])
-                    else:
-                        _resolved.append(None)
+                # Apply to df: HubSpot ID match only
+                _df_rid_s = df['record_id'] if 'record_id' in df.columns else pd.Series('', index=df.index)
+                _resolved = [_srs_rid_map.get(_rid_v) for _rid_v in _df_rid_s]
 
                 _new_sr_series = pd.Series(_resolved, index=df.index)
                 _updated = _new_sr_series.notna()
@@ -1202,7 +1172,7 @@ def _load_volume_aht(uploaded_file, log):
                     df['Sr. Accountant'] = ''
                 df.loc[_updated, 'Sr. Accountant'] = _new_sr_series[_updated]
                 log(f"  srs sheet: updated Sr. Accountant for {_updated.sum()} rows "
-                    f"({len(_srs_rid_map)} by record_id, {len(_srs_name_map)} by name)")
+                    f"(by HubSpot ID only — {len(_srs_rid_map)} mappings)")
             else:
                 log("  srs sheet: missing 'Email' column (and no 'client'/'Hubspot ID') — skipped")
         except Exception as _srs_e:
