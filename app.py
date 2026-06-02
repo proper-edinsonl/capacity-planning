@@ -1359,21 +1359,14 @@ def _apply_hubspot(df_vol, uploaded_file, log, is_update=False):
         else:
             _no_match = _vol_with_rid['client_name'].isna()
             _vol_with_rid.loc[_no_match, 'client_name'] = _orig_names[_no_match.values]
-        # For rows still missing HubSpot fields, fall back to name-based lookup
-        _hs_name_only_f = hs_by_name[[c for c in ['client_name'] + _hs_fields if c in hs_by_name.columns]]
-        _missing_mrr = _vol_with_rid['MRR'].isna() if 'MRR' in _vol_with_rid.columns else pd.Series(True, index=_vol_with_rid.index)
-        if _missing_mrr.any():
-            _fb = _vol_with_rid[_missing_mrr].drop(columns=[c for c in _hs_fields if c in _vol_with_rid.columns], errors='ignore')
-            _fb = _fb.merge(_hs_name_only_f, on='client_name', how='left')
-            _vol_with_rid = pd.concat([_vol_with_rid[~_missing_mrr], _fb], ignore_index=True)
+        # Rows with record_id use HubSpot ID exclusively — no name-based fallback.
+        pass
 
-    # Merge "no rid" side on client_name
-    if not _vol_no_rid.empty:
-        _hs_name_only = hs_by_name[[c for c in ['client_name'] + _hs_fields if c in hs_by_name.columns]]
-        _vol_no_rid = _vol_no_rid.merge(_hs_name_only, on='client_name', how='left')
+    # "No rid" rows have no HubSpot ID — skip HubSpot enrichment entirely.
+    # (These clients are not in HubSpot or haven't been assigned a record_id yet.)
 
     df_vol = pd.concat([_vol_with_rid, _vol_no_rid], ignore_index=True)
-    log(f"  HubSpot enrichment applied (record_id merge): {len(hs_by_rid)} by ID, {len(hs_by_name)} by name")
+    log(f"  HubSpot enrichment applied (record_id only): {len(hs_by_rid)} mappings used")
 
     # Ensure client_name exists after merge restructuring
     if 'client_name' not in df_vol.columns:
@@ -1702,8 +1695,18 @@ def _build_client_master_map():
         }
         for _, row in _cmap.iterrows()
     }
+    # _rid_map: full data keyed by HubSpot record_id — the canonical single source of truth
+    # All field lookups should prefer this map (record_id) over the name-keyed maps below.
     st.session_state._rid_map = {
-        row['record_id']: row['client_key']
+        str(row['record_id']).strip(): {
+            'client_key':    row['client_key'],
+            'client_name':   row['client_name'],
+            'pod':           row['pod'],
+            'sr_accountant': row['sr_accountant'],
+            'mrr':           row['mrr'],
+            'go_live':       row['go_live'],
+            'fsd':           row['fsd'],
+        }
         for _, row in _cmap.iterrows()
         if str(row.get('record_id', '')).strip()
     }
@@ -5524,48 +5527,78 @@ if "calc_data" in st.session_state:
             # ── Apply master map: overwrite POD / Sr. / Go Live / FSD from
             #    the unified lookup built across Master DB + HubSpot + reconciliation
             _build_client_master_map()   # ensure map is fresh before cascade
-            _cmap_cas = st.session_state.get('client_master_map', pd.DataFrame())
+            _cmap_cas    = st.session_state.get('client_master_map', pd.DataFrame())
+            _rid_map_cas = st.session_state.get('_rid_map', {})   # {record_id → {pod, sr, mrr, ...}}
+
             if not _cmap_cas.empty and 'client_name' in df.columns:
-                _df_key = df['client_name'].astype(str).str.lower().str.strip()
+                # ── Name-keyed fallback dicts (used only when record_id is absent) ──
                 _pod_lkp = dict(zip(_cmap_cas['client_key'], _cmap_cas['pod']))
                 _sr_lkp  = dict(zip(_cmap_cas['client_key'], _cmap_cas['sr_accountant']))
                 _gl_lkp  = dict(zip(_cmap_cas['client_key'], _cmap_cas['go_live']))
                 _fsd_lkp = dict(zip(_cmap_cas['client_key'], _cmap_cas['fsd']))
                 _mrr_lkp = dict(zip(_cmap_cas['client_key'], _cmap_cas['mrr']))
-                # POD: fill from map (HubSpot/reconcile beats Master DB blank)
-                df['POD'] = _df_key.map(_pod_lkp).fillna(df.get('POD', 'No POD'))
+
+                # ── Record_id-keyed dicts (primary — HubSpot ID wins) ──
+                _pod_rid_d  = {r: d['pod']           for r, d in _rid_map_cas.items()}
+                _sr_rid_d   = {r: d['sr_accountant'] for r, d in _rid_map_cas.items()}
+                _gl_rid_d   = {r: d['go_live']       for r, d in _rid_map_cas.items()}
+                _fsd_rid_d  = {r: d['fsd']           for r, d in _rid_map_cas.items()}
+                _mrr_rid_d  = {r: d['mrr']           for r, d in _rid_map_cas.items()}
+
+                # ── Build resolved series: record_id first, name fallback ──────────
+                _df_key = df['client_name'].astype(str).str.lower().str.strip()
+                if 'record_id' in df.columns and _rid_map_cas:
+                    _df_rid_cas   = _clean_record_id(df['record_id'])
+                    _pod_from_map  = _df_rid_cas.map(_pod_rid_d).fillna(_df_key.map(_pod_lkp))
+                    _sr_from_map   = _df_rid_cas.map(_sr_rid_d).fillna(_df_key.map(_sr_lkp))
+                    _gl_from_map   = _df_rid_cas.map(_gl_rid_d).fillna(_df_key.map(_gl_lkp))
+                    _fsd_from_map  = _df_rid_cas.map(_fsd_rid_d).fillna(_df_key.map(_fsd_lkp))
+                    _mrr_from_map  = _df_rid_cas.map(_mrr_rid_d).fillna(_df_key.map(_mrr_lkp))
+                else:
+                    _pod_from_map  = _df_key.map(_pod_lkp)
+                    _sr_from_map   = _df_key.map(_sr_lkp)
+                    _gl_from_map   = _df_key.map(_gl_lkp)
+                    _fsd_from_map  = _df_key.map(_fsd_lkp)
+                    _mrr_from_map  = _df_key.map(_mrr_lkp)
+
+                # ── Apply fields ──────────────────────────────────────────────────
+                df['POD'] = _pod_from_map.fillna(df.get('POD', 'No POD'))
                 df['POD'] = df['POD'].fillna('No POD').astype(str).str.strip()
                 df['POD'] = df['POD'].where(~df['POD'].str.lower().isin({'nan','none',''}), 'No POD')
-                # Sr. Accountant: fill gaps from map
+
                 if 'Sr. Accountant' not in df.columns:
                     df['Sr. Accountant'] = ''
-                _sr_from_map = _df_key.map(_sr_lkp)
-                _sr_empty = df['Sr. Accountant'].astype(str).str.strip().str.lower().isin({'','nan','none'})
+                _sr_empty = df['Sr. Accountant'].astype(str).str.strip().str.lower().isin({'','nan','none','pending'})
                 df.loc[_sr_empty, 'Sr. Accountant'] = _sr_from_map[_sr_empty]
-                # Go Live / FSD: apply reconciliation dates (overrides Master DB)
-                _gl_from_map  = _df_key.map(_gl_lkp)
-                _fsd_from_map = _df_key.map(_fsd_lkp)
-                _mrr_from_map = _df_key.map(_mrr_lkp)
+
                 _gl_has_map  = _gl_from_map.notna()
                 _fsd_has_map = _fsd_from_map.notna()
-                df.loc[_gl_has_map,  'Go Live']              = pd.to_datetime(_gl_from_map[_gl_has_map],   errors='coerce')
-                df.loc[_fsd_has_map, 'Final Service Date']   = pd.to_datetime(_fsd_from_map[_fsd_has_map], errors='coerce')
+                df.loc[_gl_has_map,  'Go Live']            = pd.to_datetime(_gl_from_map[_gl_has_map],   errors='coerce')
+                df.loc[_fsd_has_map, 'Final Service Date'] = pd.to_datetime(_fsd_from_map[_fsd_has_map], errors='coerce')
                 if 'MRR' in df.columns:
                     _mrr_has_map = _mrr_from_map.notna() & (_mrr_from_map > 0)
                     df.loc[_mrr_has_map, 'MRR'] = _mrr_from_map[_mrr_has_map]
-                # Persist the fully-updated df so the Volume Input export captures
-                # all master-map changes (POD, Sr., Go Live, FSD, MRR, AI clients)
+
                 st.session_state['df_vol_export'] = df.copy()
-                # Also sync df_clients_unique with master map dates/MRR
+
+                # ── Sync df_clients_unique (record_id first, name fallback) ───────
                 if not df_clients_unique.empty and 'client_name' in df_clients_unique.columns:
                     _duc_key = df_clients_unique['client_name'].astype(str).str.lower().str.strip()
-                    for _col_tgt, _lkp_d in [('Go Live', _gl_lkp), ('Final Service Date', _fsd_lkp), ('MRR', _mrr_lkp)]:
-                        if _col_tgt in df_clients_unique.columns:
-                            _mapped = _duc_key.map(_lkp_d)
-                            _has    = _mapped.notna()
-                            if _col_tgt == 'MRR':
-                                _has = _has & (_mapped > 0)
-                            df_clients_unique.loc[_has, _col_tgt] = _mapped[_has]
+                    _duc_rid_cas = (_clean_record_id(df_clients_unique['record_id'])
+                                   if 'record_id' in df_clients_unique.columns else
+                                   pd.Series('', index=df_clients_unique.index))
+                    for _col_tgt, _rid_d, _name_d in [
+                        ('Go Live',            _gl_rid_d,  _gl_lkp),
+                        ('Final Service Date',  _fsd_rid_d, _fsd_lkp),
+                        ('MRR',                _mrr_rid_d, _mrr_lkp),
+                    ]:
+                        if _col_tgt not in df_clients_unique.columns:
+                            continue
+                        _mapped = _duc_rid_cas.map(_rid_d).fillna(_duc_key.map(_name_d))
+                        _has    = _mapped.notna()
+                        if _col_tgt == 'MRR':
+                            _has = _has & (_mapped > 0)
+                        df_clients_unique.loc[_has, _col_tgt] = _mapped[_has]
             dict_hrs_per_fte  = st.session_state.calc_data['dict_hrs_per_fte']
             dict_workable_days = st.session_state.calc_data['dict_workable_days']
 
@@ -5816,14 +5849,26 @@ if "calc_data" in st.session_state:
 
             df_resumen['Monthly_Cost'] = df_resumen['Required Role'].map(cost_map).fillna(0.0)
 
-            # Map Sr. Accountant from master map (single source of truth)
-            _sr_lkp_res = st.session_state.get('_sr_map', {})
-            if not _sr_lkp_res:
-                # Fallback: build from df if master map not available
-                if 'Sr. Accountant' in df.columns:
-                    _sr_src = df.dropna(subset=['client_name']).copy()
-                    _sr_src['_key_lower'] = _sr_src['client_name'].astype(str).str.lower().str.strip()
-                    _sr_lkp_res = _sr_src.groupby('_key_lower')['Sr. Accountant'].first().to_dict()
+            # Map Sr. Accountant — record_id primary, name fallback.
+            # Build client_name → sr lookup from df (which already has record_id-resolved Sr.)
+            # so df_resumen inherits the HubSpot-ID-based Sr. assignment transitively.
+            _rid_map_res = st.session_state.get('_rid_map', {})
+            _sr_lkp_res  = st.session_state.get('_sr_map', {})
+            if _rid_map_res and 'record_id' in df.columns and 'client_name' in df.columns:
+                # Build name→sr via record_id: df already has record_id-resolved Sr. values
+                _sr_src_rid = df.dropna(subset=['client_name']).copy()
+                _sr_src_rid['_key_lower'] = _sr_src_rid['client_name'].astype(str).str.lower().str.strip()
+                _sr_src_rid['_rid_clean'] = _clean_record_id(_sr_src_rid['record_id'])
+                _sr_src_rid['_sr_resolved'] = (
+                    _sr_src_rid['_rid_clean']
+                    .map({r: d['sr_accountant'] for r, d in _rid_map_res.items()})
+                    .fillna(_sr_src_rid['_key_lower'].map(_sr_lkp_res))
+                )
+                _sr_lkp_res = _sr_src_rid.groupby('_key_lower')['_sr_resolved'].first().dropna().to_dict()
+            elif not _sr_lkp_res and 'Sr. Accountant' in df.columns:
+                _sr_src = df.dropna(subset=['client_name']).copy()
+                _sr_src['_key_lower'] = _sr_src['client_name'].astype(str).str.lower().str.strip()
+                _sr_lkp_res = _sr_src.groupby('_key_lower')['Sr. Accountant'].first().to_dict()
             df_resumen['Sr. Accountant'] = (
                 df_resumen['Client'].astype(str).str.lower().str.strip()
                 .map(_sr_lkp_res).fillna('')
