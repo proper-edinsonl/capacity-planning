@@ -1090,7 +1090,9 @@ def _load_volume_aht(uploaded_file, log):
             _c_rid    = next((v for k, v in _srs_col.items()
                               if 'hubspot' in k and 'id' in k), None)
 
-            if _c_email and _c_client:
+            # Allow srs sheet with only Email + Hubspot ID (no 'client' column):
+            # in that case treat Hubspot ID as the client record_id directly.
+            if _c_email and (_c_client or _c_rid):
                 # Filter: only Active Srs (ignore Attrition rows)
                 if _c_status:
                     _srs = _srs[_srs[_c_status].astype(str).str.strip().str.lower() != 'attrition']
@@ -1124,7 +1126,8 @@ def _load_volume_aht(uploaded_file, log):
                     _rid_r = ''
                     if _c_rid:
                         _rid_r = _clean_record_id(pd.Series([_rr.get(_c_rid, '')])).iloc[0]
-                    _cn_r  = str(_rr.get(_c_client, '') or '').strip().lower()
+                    # Use client name only if the column exists
+                    _cn_r  = str(_rr.get(_c_client, '') or '').strip().lower() if _c_client else ''
                     _ckey  = _rid_r if _rid_r else _cn_r
                     if not _ckey:
                         continue
@@ -1159,26 +1162,29 @@ def _load_volume_aht(uploaded_file, log):
                     f"{len(_cli_srs_map)} active clients "
                     f"({_churn_excluded} churn excluded, {_n_shared} shared)")
 
-                # ── Deduped lookup for df['Sr. Accountant'] update (unchanged) ────────
-                _srs_dedup = _srs.drop_duplicates(subset=[_c_client], keep='first')
+                # ── Deduped lookup for df['Sr. Accountant'] assignment ───────────────
+                # If no 'client' column, deduplicate on Hubspot ID instead
+                _c_dedup = _c_client if _c_client else _c_rid
+                _srs_dedup = _srs.drop_duplicates(subset=[_c_dedup], keep='first')
                 _srs_rid_map  = {}
                 _srs_name_map = {}
                 for _, _sr_row in _srs_dedup.iterrows():
                     _sr_email = str(_sr_row.get(_c_email, '') or '').strip().lower()
                     if not _sr_email or _sr_email in ('nan', 'none', ''):
                         continue
-                    # record_id key
+                    # record_id key (Hubspot ID column → client's record_id)
                     if _c_rid:
                         _raw_rid = _sr_row.get(_c_rid, '')
                         _sr_rid  = _clean_record_id(pd.Series([_raw_rid])).iloc[0]
                         if _sr_rid:
                             _srs_rid_map[_sr_rid] = _sr_email
-                    # name key (fallback)
-                    _sr_cli = str(_sr_row.get(_c_client, '') or '').strip().lower()
-                    if _sr_cli:
-                        _srs_name_map[_sr_cli] = _sr_email
+                    # name key (fallback — only if 'client' column exists)
+                    if _c_client:
+                        _sr_cli = str(_sr_row.get(_c_client, '') or '').strip().lower()
+                        if _sr_cli:
+                            _srs_name_map[_sr_cli] = _sr_email
 
-                # Apply to df: record_id match first, then client_name
+                # Apply to df: record_id match first, then client_name fallback
                 _df_rid_s   = df['record_id'] if 'record_id' in df.columns else pd.Series('', index=df.index)
                 _df_name_s  = df['client_name'].astype(str).str.strip().str.lower() if 'client_name' in df.columns else pd.Series('', index=df.index)
                 _resolved   = []
@@ -1198,7 +1204,7 @@ def _load_volume_aht(uploaded_file, log):
                 log(f"  srs sheet: updated Sr. Accountant for {_updated.sum()} rows "
                     f"({len(_srs_rid_map)} by record_id, {len(_srs_name_map)} by name)")
             else:
-                log("  srs sheet: missing 'client' or 'Email' column — skipped")
+                log("  srs sheet: missing 'Email' column (and no 'client'/'Hubspot ID') — skipped")
         except Exception as _srs_e:
             log(f"  srs sheet: could not read ({_srs_e}) — skipped")
 
