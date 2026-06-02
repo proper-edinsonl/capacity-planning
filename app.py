@@ -12,7 +12,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 
 # --- APP VERSION ---
-APP_VERSION = "v3.5.0"
+APP_VERSION = "v3.6.0"
 
 def _lc_short_m0(gl_series):
     """Bool array: True if Go Live month has < 15 working days remaining (< 3 weeks)."""
