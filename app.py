@@ -4170,10 +4170,12 @@ with tab1:
                         # active_pct: always relative to real network days of this month
                         _ap = np.clip(np.maximum(_dias.astype(float), 0) / actual_net_days, 0.0, 1.0) if actual_net_days > 0 else np.zeros(len(df))
 
-                        # Day-scale: how this month's network days compare to the base month.
-                        #   Fixed days  → scale = 1.0  (requirement stays constant every month)
-                        #   Network days → scale = current / base  (hours flex with day count)
-                        day_scale = 1.0 if calc_mode == "Fixed days per month" \
+                        # Day-scale: how this month's working days compare to the base month.
+                        #   Fixed days  → scale = fixed_days / base_net_days
+                        #     (base month untouched; every projection month normalized to fixed_days)
+                        #   Network days → scale = actual / base
+                        #     (hours flex with each month's real Mon-Fri count)
+                        day_scale = (fixed_days / base_net_days) if calc_mode == "Fixed days per month" \
                                     else (actual_net_days / base_net_days)
 
                         # Vectorised learning_mult
@@ -5636,8 +5638,10 @@ if "calc_data" in st.session_state:
                                                  (_em + pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
                 # Capacity days (FTE denominator — may be fixed by user)
                 _nd  = fixed_days if calc_mode == "Fixed days per month" else _actual_nd
-                # Day-scale: fixed mode keeps hours constant; network mode scales vs base month
-                _dscale = 1.0 if calc_mode == "Fixed days per month" else (_actual_nd / _base_nd_s2)
+                # Day-scale: each projection month normalised against the base month.
+                #   Fixed mode  → fixed_days / base    (projections all use fixed_days)
+                #   Network mode → actual / base       (projections use real Mon-Fri count)
+                _dscale = (fixed_days / _base_nd_s2) if calc_mode == "Fixed days per month" else (_actual_nd / _base_nd_s2)
                 _month_params.append((_mi, _ms, _sm, _em, _nd, _actual_nd, _dscale))
 
             # ── Vectorised active_pct and learning_mult for all rows × months ─
