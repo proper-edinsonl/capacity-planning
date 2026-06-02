@@ -6375,13 +6375,22 @@ if "calc_data" in st.session_state:
                 # Join POD from df_resumen (POD→Client map, deduplicated).
                 # Drop any existing POD column first to avoid pandas creating
                 # POD_x / POD_y conflicts that make _crow.get('POD') return ''.
-                if 'POD' in df_resumen.columns and 'Client' in df_resumen.columns:
-                    _duc_mrr = _duc_mrr.drop(columns=[c for c in ['POD'] if c in _duc_mrr.columns])
-                    _cli_pod_map_mrr = (
-                        df_resumen[['POD', 'Client']].drop_duplicates()
-                        .rename(columns={'Client': 'client_name'})
-                    )
-                    _duc_mrr = _duc_mrr.merge(_cli_pod_map_mrr, on='client_name', how='left')
+                # Build POD map: prefer df (same client_name key, no rename needed),
+                # fall back to df_resumen. Use normalized join key to avoid
+                # case/whitespace mismatches causing NaN PODs.
+                _duc_mrr = _duc_mrr.drop(columns=[c for c in ['POD'] if c in _duc_mrr.columns])
+                if 'POD' in df.columns and 'client_name' in df.columns:
+                    _cli_pod_map_mrr = df[['client_name', 'POD']].drop_duplicates('client_name')
+                elif 'POD' in df_resumen.columns and 'Client' in df_resumen.columns:
+                    _cli_pod_map_mrr = (df_resumen[['POD', 'Client']].drop_duplicates()
+                                        .rename(columns={'Client': 'client_name'}))
+                else:
+                    _cli_pod_map_mrr = pd.DataFrame(columns=['client_name', 'POD'])
+                if not _cli_pod_map_mrr.empty:
+                    _cli_pod_map_mrr = _cli_pod_map_mrr.copy()
+                    _cli_pod_map_mrr['_jk'] = _cli_pod_map_mrr['client_name'].astype(str).str.strip().str.lower()
+                    _duc_mrr['_jk'] = _duc_mrr['client_name'].astype(str).str.strip().str.lower()
+                    _duc_mrr = _duc_mrr.merge(_cli_pod_map_mrr[['_jk', 'POD']], on='_jk', how='left').drop(columns=['_jk'])
                 _cli_mrr_rows = []
                 for _, _crow in _duc_mrr.iterrows():
                     _cm_name = str(_crow.get('client_name', '')).strip()
