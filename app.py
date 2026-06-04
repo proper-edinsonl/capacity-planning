@@ -12,7 +12,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 
 # --- APP VERSION ---
-APP_VERSION = "v6.4.2026.12.15PM"
+APP_VERSION = "v6.4.2026.1.45PM"
 
 def _lc_short_m0(gl_series):
     """Bool array: True if Go Live month has < 15 working days remaining (< 3 weeks)."""
@@ -2886,9 +2886,12 @@ def _build_proj_export_df(pdata):
         _hbr   = _pd_i.get('hc_by_role') or {}
         _ahbr  = _pd_i.get('actual_hc_by_role') or {}
         # Tasks HC — executor roles only (AC1 + AC2 + GA), excludes Sr. and Managers
-        _t_req   = (_hbr.get('Accountant I') or 0) + (_hbr.get('Accountant II') or 0) + (_hbr.get('General Accountant') or 0)
-        _t_hired = ((_ahbr.get('Accountant I') or 0) + (_ahbr.get('Accountant II') or 0) + (_ahbr.get('General Accountant') or 0)) if _ahbr.get('Accountant I') is not None else None
-        _t_delta = (_t_hired - _t_req) if _t_hired is not None else None
+        # Required = current month required + forecast additions (true future demand)
+        _t_curr_req  = _pd_i.get('current_required_tasks_hc') or 0
+        _t_addition  = (_hbr.get('Accountant I') or 0) + (_hbr.get('Accountant II') or 0) + (_hbr.get('General Accountant') or 0)
+        _t_req       = _t_curr_req + _t_addition
+        _t_hired     = ((_ahbr.get('Accountant I') or 0) + (_ahbr.get('Accountant II') or 0) + (_ahbr.get('General Accountant') or 0)) if _ahbr.get('Accountant I') is not None else None
+        _t_delta     = (_t_hired - _t_req) if _t_hired is not None else None
         _rows.append({
             'Month':                          f'M{_pmi + 1}',
             'Forecasted MRR Growth ($)':      _pd_i.get('forecasted_mrr_growth'),
@@ -2901,6 +2904,256 @@ def _build_proj_export_df(pdata):
             'Δ Tasks HC (Over/Under)':        _t_delta,
         })
     return pd.DataFrame(_rows)
+
+
+# ============================================================
+#  EXCEL EXPORT — PROFESSIONAL FORMATTING (POST-PROCESS)
+# ============================================================
+def _apply_pro_formatting(xlsx_bytes: bytes) -> bytes:
+    """Apply professional formatting to an exported workbook.
+    Loads with openpyxl, applies number formats / headers / freezes / colors /
+    conditional formatting, returns the re-saved bytes. ~3-8s overhead.
+    """
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.utils import get_column_letter
+        from openpyxl.formatting.rule import ColorScaleRule, CellIsRule, FormulaRule
+        from io import BytesIO
+    except Exception:
+        return xlsx_bytes  # openpyxl unavailable, skip silently
+
+    # ── Palette ──────────────────────────────────────────────
+    HDR_BG, HDR_FG = '1F3864', 'FFFFFF'
+    SECTION_BG, SR_HDR_BG, TOTAL_BG, WFPOD_SEC, BAND_BG = (
+        'D9E1F2', 'BDD7EE', 'FFF2CC', 'E2EFDA', 'F2F2F2',
+    )
+    TAB_COLORS = {
+        'overall': '4472C4', 'pod': '70AD47', 'sr': 'FFC000',
+        'client':  '7030A0', 'audit': 'C00000',
+    }
+    MONTH_NAMES = {'jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec',
+                   'january','february','march','april','june','july','august',
+                   'september','october','november','december'}
+
+    def detect_format(col_name):
+        if not col_name: return None
+        c = str(col_name).lower()
+        if any(k in c for k in ['mrr ($', 'cost ($', 'margin ($', 'saving ($', 'budget', 'revenue / hc']):
+            return '$#,##0'
+        if 'mrr' in c and '($)' in c: return '$#,##0'
+        if '%' in c or 'rate' in c or 'productivity' in c: return '0.0%'
+        if 'over/under' in c or c.startswith('δ') or ' δ ' in c or 'delta' in c:
+            return '+0.00;[Red]-0.00;0.00'
+        if 'fte' in c or 'tasks hc' in c or 'fcast hc' in c or 'required hc' in c or 'actual hc' in c:
+            return '0.00'
+        if 'aht' in c and 'min' in c: return '0.0" min"'
+        if 'hrs' in c or 'hours' in c: return '#,##0'
+        if 'hubspot id' in c or 'record id' in c: return '0'
+        if any(k in c for k in ['tickets', 'clients', 'reports', 'count', 'doors', 'sqft', 'books', 'days']):
+            return '#,##0'
+        if any(k in c for k in ['date', 'go live', 'hire']): return 'mmm dd, yyyy'
+        return None
+
+    # Sheet-level format overrides — values stored as literal % numbers (1 = 1%, not 0.01)
+    SHEET_OVERRIDES = {
+        'MRR_Growth_Settings': {'ALL_PERCENT_LITERAL': True},
+        'Employee_Level': {
+            'util %': '0.0"%"', 'util': '0.0"%"',
+            '% remaining': '0.0"%"', 'productivity': '0.0"%"',
+        },
+        'Sr_Ratios': {'% remaining': '0.0"%"', '% remaining (mec)': '0.0"%"'},
+        'Client_MRR': {'ALL_MONTH_AS_DOLLAR': True, 'mrr (base)': '$#,##0'},
+    }
+
+    def resolve_format(sheet_name, header):
+        ov = SHEET_OVERRIDES.get(sheet_name, {})
+        h = str(header).lower().strip() if header else ''
+        for pat, fmt in ov.items():
+            if pat in ('ALL_PERCENT_LITERAL', 'ALL_MONTH_AS_DOLLAR'): continue
+            if pat in h: return fmt
+        if ov.get('ALL_PERCENT_LITERAL') and h and 'm' in h: return '0.0"%"'
+        if ov.get('ALL_MONTH_AS_DOLLAR'):
+            if any(m in h for m in MONTH_NAMES): return '$#,##0'
+        return detect_format(header)
+
+    FREEZE_MAP = {
+        'Capacity_Overview_Waterfall': 'B2', 'MRR_Forecast': 'A2',
+        'MRR_Growth_Settings': 'A2', 'Sr_Accountant_Waterfalls': 'B2',
+        'General_Summary': 'B2', 'Summary_by_POD': 'C2',
+        'POD_x_SrAccountant': 'D2', 'Client_Role_Detail': 'F2',
+        'Baseline_Audit': 'E2', 'Employee_Level': 'C2',
+        'Sr_Ratios': 'C2', 'Client_FTEs_by_Month': 'E2',
+        'Client_MRR': 'D2', 'Client_Mapping': 'B2',
+    }
+    TAB_MAP = {
+        'Capacity_Overview_Waterfall': TAB_COLORS['overall'],
+        'MRR_Forecast': TAB_COLORS['overall'],
+        'MRR_Growth_Settings': TAB_COLORS['overall'],
+        'General_Summary': TAB_COLORS['overall'],
+        'Summary_by_POD': TAB_COLORS['pod'],
+        'POD_x_SrAccountant': TAB_COLORS['pod'],
+        'Sr_Accountant_Waterfalls': TAB_COLORS['sr'],
+        'Sr_Ratios': TAB_COLORS['sr'],
+        'Client_Role_Detail': TAB_COLORS['client'],
+        'Client_FTEs_by_Month': TAB_COLORS['client'],
+        'Client_MRR': TAB_COLORS['client'],
+        'Client_Mapping': TAB_COLORS['client'],
+        'Baseline_Audit': TAB_COLORS['audit'],
+        'Employee_Level': TAB_COLORS['audit'],
+    }
+    TABULAR = {
+        'Summary_by_POD', 'POD_x_SrAccountant', 'Client_Role_Detail',
+        'Baseline_Audit', 'Employee_Level', 'Sr_Ratios',
+        'Client_FTEs_by_Month', 'Client_MRR', 'Client_Mapping',
+        'General_Summary', 'MRR_Forecast', 'MRR_Growth_Settings',
+    }
+    SECTION_HIGHLIGHT_SHEETS = {
+        'Capacity_Overview_Waterfall', 'Sr_Accountant_Waterfalls',
+        'Summary_by_POD', 'POD_x_SrAccountant', 'Client_Role_Detail',
+    }
+
+    # ── Load workbook ────────────────────────────────────────
+    try:
+        wb = openpyxl.load_workbook(BytesIO(xlsx_bytes))
+    except Exception:
+        return xlsx_bytes
+
+    hdr_fill = PatternFill('solid', fgColor=HDR_BG)
+    hdr_font = Font(bold=True, color=HDR_FG, size=11)
+    hdr_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    band_fill = PatternFill('solid', fgColor=BAND_BG)
+    sec_fill   = PatternFill('solid', fgColor=SECTION_BG)
+    sr_fill    = PatternFill('solid', fgColor=SR_HDR_BG)
+    total_fill = PatternFill('solid', fgColor=TOTAL_BG)
+    pod_fill   = PatternFill('solid', fgColor=WFPOD_SEC)
+    sec_font   = Font(bold=True, size=11)
+    sr_font    = Font(bold=True, size=12)
+
+    for sn in wb.sheetnames:
+        try:
+            ws = wb[sn]
+            n_rows = ws.max_row
+            n_cols = ws.max_column
+            # For very large sheets (>2000 rows), skip per-cell heavy ops to keep export fast
+            is_huge = n_rows > 2000
+
+            # 1. Header row
+            for c in range(1, n_cols + 1):
+                cell = ws.cell(1, c)
+                cell.fill = hdr_fill
+                cell.font = hdr_font
+                cell.alignment = hdr_align
+            ws.row_dimensions[1].height = 30
+
+            # 2. Number formats per column (skip per-cell pass on huge sheets — too slow)
+            headers = [ws.cell(1, c).value for c in range(1, n_cols + 1)]
+            if not is_huge:
+                for c, hdr in enumerate(headers, start=1):
+                    fmt = resolve_format(sn, hdr)
+                    if not fmt: continue
+                    for r in range(2, n_rows + 1):
+                        cell = ws.cell(r, c)
+                        if cell.value is not None and not isinstance(cell.value, str):
+                            cell.number_format = fmt
+            else:
+                # Huge sheet: only format the first data row to set column-default-ish behavior
+                # (openpyxl doesn't support true column-default number format)
+                for c, hdr in enumerate(headers, start=1):
+                    fmt = resolve_format(sn, hdr)
+                    if not fmt: continue
+                    for r in range(2, min(202, n_rows + 1)):   # cap at 200 rows
+                        cell = ws.cell(r, c)
+                        if cell.value is not None and not isinstance(cell.value, str):
+                            cell.number_format = fmt
+
+            # 3. Column widths (sampled from first 50 rows)
+            for c in range(1, n_cols + 1):
+                col_letter = get_column_letter(c)
+                max_len = 0
+                hv = ws.cell(1, c).value
+                if hv: max_len = min(len(str(hv)), 42)
+                for r in range(2, min(52, n_rows + 1)):
+                    v = ws.cell(r, c).value
+                    if v is not None:
+                        ln = len(str(v))
+                        if ln > max_len: max_len = ln
+                ws.column_dimensions[col_letter].width = max(10, min(max_len + 2, 42))
+
+            # 4. Banded rows for tabular sheets — use conditional formatting (instant, no row iteration)
+            if sn in TABULAR and n_rows > 1:
+                rng_all = f'A2:{get_column_letter(n_cols)}{n_rows}'
+                ws.conditional_formatting.add(rng_all, FormulaRule(
+                    formula=['MOD(ROW(),2)=0'], fill=band_fill
+                ))
+
+            # 5. Section row highlights — skip on huge sheets (no ━/▶/=== rows there anyway)
+            if (sn in SECTION_HIGHLIGHT_SHEETS or sn.startswith('WF_')) and not is_huge:
+                for r in range(2, n_rows + 1):
+                    v = ws.cell(r, 1).value
+                    s = str(v).strip() if v is not None else ''
+                    target_fill = target_font = None
+                    if s.startswith('━'):
+                        target_fill, target_font = sec_fill, sec_font
+                    elif s.startswith('▶'):
+                        target_fill, target_font = sr_fill, sr_font
+                    elif s.startswith('==='):
+                        target_fill, target_font = pod_fill, sec_font
+                    else:
+                        for cc in range(1, min(n_cols + 1, 7)):
+                            cv = ws.cell(r, cc).value
+                            if cv and isinstance(cv, str) and '>>>' in cv:
+                                target_fill, target_font = total_fill, sec_font
+                                break
+                    if target_fill:
+                        for c in range(1, n_cols + 1):
+                            cell = ws.cell(r, c)
+                            cell.fill = target_fill
+                            cell.font = target_font
+            # 6. Conditional formatting (Δ and margin %)
+            for c in range(1, n_cols + 1):
+                hv = ws.cell(1, c).value
+                if not hv: continue
+                h = str(hv).lower()
+                col_letter = get_column_letter(c)
+                rng = f'{col_letter}2:{col_letter}{n_rows}'
+                if 'δ' in h or 'over/under' in h or 'delta' in h:
+                    ws.conditional_formatting.add(rng, CellIsRule(
+                        operator='lessThan', formula=['-0.5'],
+                        fill=PatternFill('solid', fgColor='FFC7CE'),
+                        font=Font(color='9C0006'),
+                    ))
+                    ws.conditional_formatting.add(rng, CellIsRule(
+                        operator='greaterThan', formula=['0.5'],
+                        fill=PatternFill('solid', fgColor='C6EFCE'),
+                        font=Font(color='006100'),
+                    ))
+                if 'margin' in h and '%' in h:
+                    ws.conditional_formatting.add(rng, ColorScaleRule(
+                        start_type='num', start_value=0,    start_color='F8696B',
+                        mid_type='num',   mid_value=0.35,   mid_color='FFEB84',
+                        end_type='num',   end_value=0.6,    end_color='63BE7B',
+                    ))
+
+            # 7. Freeze panes
+            if sn in FREEZE_MAP:
+                ws.freeze_panes = FREEZE_MAP[sn]
+            elif sn.startswith('WF_'):
+                ws.freeze_panes = 'B2'
+
+            # 8. Tab color
+            if sn in TAB_MAP:
+                ws.sheet_properties.tabColor = TAB_MAP[sn]
+            elif sn.startswith('WF_'):
+                ws.sheet_properties.tabColor = TAB_COLORS['pod']
+        except Exception:
+            # If any single sheet fails, skip it and continue with others
+            continue
+
+    out = BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
 
 AFFECTS_OPTIONS = [
     "Vol Proc",
@@ -7215,10 +7468,12 @@ if "calc_data" in st.session_state:
                         rows.setdefault("  Fcast HC — Accountant II",           {})[col] = _fmt(_fcast_hc.get('Accountant II'),      'dec')
                         rows.setdefault("  Fcast HC — General Accountant",      {})[col] = _fmt(_fcast_hc.get('General Accountant'), 'dec')
                         rows.setdefault("  Fcast HC — Sr. Accountant",          {})[col] = _fmt(_fcast_hc.get('Sr. Accountant'),     'dec')
-                        # Fcast Tasks HC — executor roles only (AC1 + AC2 + GA)
-                        _fc_tasks_req   = ((_fcast_hc.get('Accountant I') or 0) + (_fcast_hc.get('Accountant II') or 0) + (_fcast_hc.get('General Accountant') or 0))
-                        _fc_tasks_hired = ((hc_acc1 or 0) + (hc_acc2 or 0) + (hc_gen or 0)) if hc_acc1 is not None else None
-                        _fc_tasks_delta = (_fc_tasks_hired - _fc_tasks_req) if _fc_tasks_hired is not None else None
+                        # Fcast Tasks HC — current month required + forecast addition (AC1+AC2+GA)
+                        # Delta = Hired − (Current Req + Forecast Addition) → true future shortage
+                        _fc_tasks_addition = ((_fcast_hc.get('Accountant I') or 0) + (_fcast_hc.get('Accountant II') or 0) + (_fcast_hc.get('General Accountant') or 0))
+                        _fc_tasks_req      = _tasks_req_v + _fc_tasks_addition
+                        _fc_tasks_hired    = ((hc_acc1 or 0) + (hc_acc2 or 0) + (hc_gen or 0)) if hc_acc1 is not None else None
+                        _fc_tasks_delta    = (_fc_tasks_hired - _fc_tasks_req) if _fc_tasks_hired is not None else None
                         rows.setdefault("  Fcast Tasks HC Required",            {})[col] = _fmt(_fc_tasks_req,       'dec')
                         rows.setdefault("  Fcast Tasks HC Hired",               {})[col] = _fmt(_fc_tasks_hired,     'dec')
                         rows.setdefault("  Fcast Δ Tasks HC (Over/Under)",      {})[col] = _fmt(_fc_tasks_delta,     'dec')
@@ -7236,6 +7491,7 @@ if "calc_data" in st.session_state:
                                     'General Accountant': hc_gen,
                                     'Sr. Accountant':     hc_sr,
                                 },
+                                'current_required_tasks_hc': _tasks_req_v,   # AC1+AC2+GA this month
                             }
                         _prev_mrr = float(mrr or 0)
 
@@ -9547,10 +9803,17 @@ if "calc_data" in st.session_state:
             st.session_state.final_dashboards.get('cliente', pd.DataFrame())
             ['Sr. Accountant'].dropna().astype(str).replace('', pd.NA).dropna().unique()
         ) if 'cliente' in st.session_state.get('final_dashboards', {}) else 0
+        # ── Apply professional formatting (post-process) ──────────────────────────
+        try:
+            with st.spinner("🎨 Applying professional formatting…"):
+                _formatted_bytes = _apply_pro_formatting(output.getvalue())
+        except Exception as _e_fmt:
+            st.warning(f"⚠️ Format pass failed — using unformatted buffer ({_e_fmt})")
+            _formatted_bytes = output.getvalue()
         # ── Cache the export buffer keyed by role mode ───────────────────────────
         _mode_tag_exp   = st.session_state.get('_cascade_role_mode', 'ideal')
         _other_tag_exp  = 'real' if _mode_tag_exp == 'ideal' else 'ideal'
-        st.session_state[f'_cascade_export_buf_{_mode_tag_exp}'] = output.getvalue()
+        st.session_state[f'_cascade_export_buf_{_mode_tag_exp}'] = _formatted_bytes
         # ── Client_Mapping diagnostic ────────────────────────────────────────────
         _cm_diag_msg = st.session_state.get('_cm_diag', '')
         if _cm_diag_msg:
@@ -9583,7 +9846,7 @@ if "calc_data" in st.session_state:
             # destroys/recreates the widget; the label and file name carry mode info.
             st.download_button(
                 label=f"📥 Download — {_this_lbl}",
-                data=output.getvalue(),
+                data=_formatted_bytes,
                 file_name=f"Capacity_Projection_Cascade_ROI_{datetime.now().strftime('%Y%m%d')}_{_mode_tag_exp}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary",
