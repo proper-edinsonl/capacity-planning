@@ -12,7 +12,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 
 # --- APP VERSION ---
-APP_VERSION = "v3.6.0"
+APP_VERSION = "v6.4.2026.12.15PM"
 
 def _lc_short_m0(gl_series):
     """Bool array: True if Go Live month has < 15 working days remaining (< 3 weeks)."""
@@ -1041,6 +1041,12 @@ def _clean_record_id(series):
 def _load_volume_aht(uploaded_file, log):
     """Load the Volume & AHT source file."""
     uploaded_file.seek(0)
+    # Cache raw bytes so the export can re-read srs/dc sheets if session state is stale
+    try:
+        st.session_state['_vol_file_bytes'] = uploaded_file.read()
+        uploaded_file.seek(0)
+    except Exception:
+        pass
     xl = pd.ExcelFile(uploaded_file)
     sheet = 'Query result' if 'Query result' in xl.sheet_names else xl.sheet_names[0]
     log(f"  Reading sheet '{sheet}' from {uploaded_file.name}")
@@ -1162,6 +1168,7 @@ def _load_volume_aht(uploaded_file, log):
                     if _sr_rid:
                         _srs_rid_map[_sr_rid] = _sr_email
 
+                st.session_state['_srs_rid_email_map'] = _srs_rid_map.copy()
                 # Apply to df: HubSpot ID match only
                 _df_rid_s = df['record_id'] if 'record_id' in df.columns else pd.Series('', index=df.index)
                 _resolved = [_srs_rid_map.get(_rid_v) for _rid_v in _df_rid_s]
@@ -1177,6 +1184,27 @@ def _load_volume_aht(uploaded_file, log):
                 log("  srs sheet: missing 'Email' column (and no 'client'/'Hubspot ID') — skipped")
         except Exception as _srs_e:
             log(f"  srs sheet: could not read ({_srs_e}) — skipped")
+
+    # ── Read dc sheet — HubSpot backup for Client_Mapping export ─────────────
+    if 'dc' in xl.sheet_names:
+        try:
+            uploaded_file.seek(0)
+            _dc_raw = pd.read_excel(uploaded_file, sheet_name='dc')
+            _dc_raw.columns = _dc_raw.columns.astype(str).str.strip()
+            st.session_state['_dc_sheet_raw'] = _dc_raw
+            log(f"  dc sheet: {len(_dc_raw)} rows loaded")
+        except Exception as _dc_e:
+            log(f"  dc sheet: could not read ({_dc_e}) — skipped")
+
+    # ── Cache raw srs sheet for Client_Mapping export ────────────────────────
+    if 'srs' in xl.sheet_names:
+        try:
+            uploaded_file.seek(0)
+            _srs_raw = pd.read_excel(uploaded_file, sheet_name='srs')
+            _srs_raw.columns = _srs_raw.columns.astype(str).str.strip()
+            st.session_state['_srs_sheet_raw'] = _srs_raw
+        except Exception:
+            pass
 
     return df
 
@@ -2342,7 +2370,11 @@ def _process_hc_report(file_bytes: bytes):
         'mgr_total':      n_mgr_total,
         'mgr_by_pod':     mgr_by_pod,
         'mix_pct':        mix_pct,
-        'detail':         active_pods[['Full name', 'Work Email', 'Job title', 'Capacity Role', 'POD']],
+        'detail':         active_pods[
+            [c for c in ['Full name', 'Work Email', 'Job title', 'Capacity Role', 'POD',
+                         'Start Date', 'Last Working Day']
+             if c in active_pods.columns]
+        ],
         'attrited_detail': attrited_detail,
         'employees':       employees,   # [{email,name,role,pod,start_date,last_working_day}] — all pods, all statuses
     }
@@ -2850,8 +2882,13 @@ def _build_proj_export_df(pdata):
         return pd.DataFrame()
     _rows = []
     for _pmi in sorted(pdata.keys()):   # 2..5 → M3..M6
-        _pd_i = pdata[_pmi]
-        _hbr  = _pd_i.get('hc_by_role') or {}
+        _pd_i  = pdata[_pmi]
+        _hbr   = _pd_i.get('hc_by_role') or {}
+        _ahbr  = _pd_i.get('actual_hc_by_role') or {}
+        # Tasks HC — executor roles only (AC1 + AC2 + GA), excludes Sr. and Managers
+        _t_req   = (_hbr.get('Accountant I') or 0) + (_hbr.get('Accountant II') or 0) + (_hbr.get('General Accountant') or 0)
+        _t_hired = ((_ahbr.get('Accountant I') or 0) + (_ahbr.get('Accountant II') or 0) + (_ahbr.get('General Accountant') or 0)) if _ahbr.get('Accountant I') is not None else None
+        _t_delta = (_t_hired - _t_req) if _t_hired is not None else None
         _rows.append({
             'Month':                          f'M{_pmi + 1}',
             'Forecasted MRR Growth ($)':      _pd_i.get('forecasted_mrr_growth'),
@@ -2859,6 +2896,9 @@ def _build_proj_export_df(pdata):
             'HC — Accountant II':             _hbr.get('Accountant II'),
             'HC — General Accountant':        _hbr.get('General Accountant'),
             'HC — Sr. Accountant':            _hbr.get('Sr. Accountant'),
+            'Tasks HC Required':              _t_req,
+            'Tasks HC Hired':                 _t_hired,
+            'Δ Tasks HC (Over/Under)':        _t_delta,
         })
     return pd.DataFrame(_rows)
 
@@ -6176,6 +6216,7 @@ if "calc_data" in st.session_state:
                     'Comm Properties':              _row.get('Commercial Properties', ''),
                     'SQFT':                         _row.get('SQFT Commercial', ''),
                     'Corp Books':                   _row.get('Corp Books', ''),
+                    'Vol Variation %':              _get_ci(_row, 'volume variation %', ''),
                     'PMS':                          str(_row.get('PMS', '')).strip(),
                     'Go Live':                      str(_gl)[:10] if pd.notna(_gl) else '',
                     'Final Service Date':           str(_fsd)[:10] if pd.notna(_fsd) else '',
@@ -7043,6 +7084,13 @@ if "calc_data" in st.session_state:
                         rows.setdefault("  · Δ Accountant II",            {})[col] = _fmt(d_acc2, 'dec')
                         rows.setdefault("  · Δ General Accountant",       {})[col] = _fmt(d_gen, 'dec')
                         rows.setdefault("  · Δ Sr. Accountant",           {})[col] = _fmt(d_sr, 'dec')
+                        # Tasks HC delta — excludes Sr. and Managers (executor roles only)
+                        _tasks_req_v   = (fte_acc1 or 0) + (fte_acc2 or 0) + (fte_gen or 0)
+                        _tasks_hired_v = ((hc_acc1 or 0) + (hc_acc2 or 0) + (hc_gen or 0)) if hc_acc1 is not None else None
+                        _tasks_delta_v = (_tasks_hired_v - _tasks_req_v) if _tasks_hired_v is not None else None
+                        rows.setdefault("━ Tasks HC Required",            {})[col] = _fmt(_tasks_req_v, 'fte')
+                        rows.setdefault("━ Tasks HC Hired",               {})[col] = _fmt(_tasks_hired_v, 'fte')
+                        rows.setdefault("━ Δ Tasks HC (Over/Under)",      {})[col] = _fmt(_tasks_delta_v, 'dec')
                         rows.setdefault("━ MRR ($)",                      {})[col] = _fmt(mrr, '$')
                         rows.setdefault("  (+) New MRR ($)",              {})[col] = _fmt(new_mrr_val if new_mrr_val else None, '$')
                         rows.setdefault("  (-) Churn MRR ($)",            {})[col] = _fmt(churn_mrr_val if churn_mrr_val else None, '$')
@@ -7167,6 +7215,13 @@ if "calc_data" in st.session_state:
                         rows.setdefault("  Fcast HC — Accountant II",           {})[col] = _fmt(_fcast_hc.get('Accountant II'),      'dec')
                         rows.setdefault("  Fcast HC — General Accountant",      {})[col] = _fmt(_fcast_hc.get('General Accountant'), 'dec')
                         rows.setdefault("  Fcast HC — Sr. Accountant",          {})[col] = _fmt(_fcast_hc.get('Sr. Accountant'),     'dec')
+                        # Fcast Tasks HC — executor roles only (AC1 + AC2 + GA)
+                        _fc_tasks_req   = ((_fcast_hc.get('Accountant I') or 0) + (_fcast_hc.get('Accountant II') or 0) + (_fcast_hc.get('General Accountant') or 0))
+                        _fc_tasks_hired = ((hc_acc1 or 0) + (hc_acc2 or 0) + (hc_gen or 0)) if hc_acc1 is not None else None
+                        _fc_tasks_delta = (_fc_tasks_hired - _fc_tasks_req) if _fc_tasks_hired is not None else None
+                        rows.setdefault("  Fcast Tasks HC Required",            {})[col] = _fmt(_fc_tasks_req,       'dec')
+                        rows.setdefault("  Fcast Tasks HC Hired",               {})[col] = _fmt(_fc_tasks_hired,     'dec')
+                        rows.setdefault("  Fcast Δ Tasks HC (Over/Under)",      {})[col] = _fmt(_fc_tasks_delta,     'dec')
                         rows.setdefault("  New HC Required",                    {})[col] = _fmt(_new_hc_req,         'dec')
                         rows.setdefault("  Forecasted HC (Actual + New)",       {})[col] = _fmt(_fcast_total_hc,     'dec')
                         rows.setdefault("  Forecast Over/Under",                {})[col] = _fmt(_fcast_over_under,   'dec')
@@ -7175,6 +7230,12 @@ if "calc_data" in st.session_state:
                             _proj_store[i] = {
                                 'forecasted_mrr_growth': _fcast_mrr_growth,
                                 'hc_by_role':            {k: v for k, v in _fcast_hc.items()},
+                                'actual_hc_by_role':     {
+                                    'Accountant I':       hc_acc1,
+                                    'Accountant II':      hc_acc2,
+                                    'General Accountant': hc_gen,
+                                    'Sr. Accountant':     hc_sr,
+                                },
                             }
                         _prev_mrr = float(mrr or 0)
 
@@ -7648,6 +7709,13 @@ if "calc_data" in st.session_state:
                                     _pod_rows.setdefault("  · Δ Accountant II",            {})[col] = _fmt(d_p_acc2, 'dec')
                                     _pod_rows.setdefault("  · Δ General Accountant",       {})[col] = _fmt(d_p_gen, 'dec')
                                     _pod_rows.setdefault("  · Δ Sr. Accountant",           {})[col] = _fmt(d_p_sr, 'dec')
+                                    # Tasks HC delta — executor roles only (AC1 + AC2 + GA)
+                                    _p_tasks_req_v   = (_prole_fte('Accountant I') or 0) + (_prole_fte('Accountant II') or 0) + (_prole_fte('General Accountant') or 0)
+                                    _p_tasks_hired_v = ((hc_p_acc1 or 0) + (hc_p_acc2 or 0) + (hc_p_gen or 0)) if hc_p_acc1 is not None else None
+                                    _p_tasks_delta_v = (_p_tasks_hired_v - _p_tasks_req_v) if _p_tasks_hired_v is not None else None
+                                    _pod_rows.setdefault("━ Tasks HC Required",            {})[col] = _fmt(_p_tasks_req_v, 'fte')
+                                    _pod_rows.setdefault("━ Tasks HC Hired",               {})[col] = _fmt(_p_tasks_hired_v, 'fte')
+                                    _pod_rows.setdefault("━ Δ Tasks HC (Over/Under)",      {})[col] = _fmt(_p_tasks_delta_v, 'dec')
                                     _pod_rows.setdefault("━ MRR ($)",                      {})[col] = _fmt(_pod_mrr, '$')
                                     _pod_rows.setdefault("  (+) New MRR ($)",              {})[col] = _fmt(_p_new_mrr if _p_new_mrr > 0 else None, '$')
                                     _pod_rows.setdefault("  (-) Churn MRR ($)",            {})[col] = _fmt(_p_churn_mrr if _p_churn_mrr > 0 else None, '$')
@@ -8929,11 +8997,7 @@ if "calc_data" in st.session_state:
             _mrr_grow_exp = st.session_state.get('s2_mrr_growth_df', pd.DataFrame())
             if not _mrr_grow_exp.empty:
                 _mrr_grow_exp.to_excel(writer, sheet_name='MRR_Growth_Settings', index=False)
-            # Tab 1b: By POD waterfalls — one sheet per POD
-            _wf_pods_exp = st.session_state.get('_wf_pod_all_export', {})
-            for _pn_exp, _df_pw_exp in sorted(_wf_pods_exp.items()):
-                if not _df_pw_exp.empty:
-                    _df_pw_exp.to_excel(writer, sheet_name=_xl_sheet(_pn_exp, 'WF_'))
+            # Tab 1b: WF_POD sheets written below after all section DataFrames are built
 
             # Tab 1c: All Sr. Accountant waterfalls — full cascade format, stacked in one sheet
             _cli_exp   = st.session_state.final_dashboards.get('cliente', pd.DataFrame())
@@ -9077,6 +9141,15 @@ if "calc_data" in st.session_state:
                         _rows_x.setdefault("  · Δ Accountant II",            {})[_col_x] = _dx_acc2
                         _rows_x.setdefault("  · Δ General Accountant",       {})[_col_x] = _dx_gen
                         _rows_x.setdefault("  · Δ Sr. Accountant",           {})[_col_x] = _dx_sr
+                        # Tasks HC delta — executor roles only (AC1 + AC2 + GA)
+                        _s_tasks_req_v   = (round(_srole_x(_sr_df,'Accountant I',       _c_fte), 2)
+                                          + round(_srole_x(_sr_df,'Accountant II',      _c_fte), 2)
+                                          + round(_srole_x(_sr_df,'General Accountant', _c_fte), 2))
+                        _s_tasks_hired_v = ((_hcx_acc1 or 0) + (_hcx_acc2 or 0) + (_hcx_gen or 0)) if _hcx_acc1 is not None else None
+                        _s_tasks_delta_v = round(_s_tasks_hired_v - _s_tasks_req_v, 2) if _s_tasks_hired_v is not None else None
+                        _rows_x.setdefault("━ Tasks HC Required",            {})[_col_x] = round(_s_tasks_req_v, 2)
+                        _rows_x.setdefault("━ Tasks HC Hired",               {})[_col_x] = _s_tasks_hired_v
+                        _rows_x.setdefault("━ Δ Tasks HC (Over/Under)",      {})[_col_x] = _s_tasks_delta_v
                         _rows_x.setdefault("━ MRR ($)",                      {})[_col_x] = round(_sr_mrr, 2) if _sr_mrr else None
                         _rows_x.setdefault("  (+) New MRR ($)",              {})[_col_x] = round(_sr_new_mrr, 2) if _sr_new_mrr else None
                         _rows_x.setdefault("  (-) Churn MRR ($)",            {})[_col_x] = round(_sr_churn_mrr, 2) if _sr_churn_mrr else None
@@ -9101,7 +9174,8 @@ if "calc_data" in st.session_state:
             # Tab 2: General Waterfall Summary (raw month-level data)
             st.session_state.final_dashboards['general'].to_excel(writer, index=False, sheet_name='General_Summary')
             # Tab 3: Summary by POD
-            st.session_state.final_dashboards['pod'].to_excel(writer, index=False, sheet_name='Summary_by_POD')
+            _pod_summary_df = st.session_state.final_dashboards.get('pod', pd.DataFrame())
+            _pod_summary_df.to_excel(writer, index=False, sheet_name='Summary_by_POD')
             # Tab 4: POD x Sr. Accountant — aggregated by POD + Sr. (no Client column)
             _cli_pod_sr = st.session_state.final_dashboards['cliente'].copy()
             _psr_grp_cols = [c for c in ['POD', 'Sr. Accountant', 'Required Role'] if c in _cli_pod_sr.columns]
@@ -9129,7 +9203,8 @@ if "calc_data" in st.session_state:
                     except: _tot_exp[_nc] = ''
                 _cli_exp_frames.append(pd.DataFrame([_tot_exp]))
             _cli_detail_exp = pd.concat(_cli_exp_frames, ignore_index=True) if _cli_exp_frames else _cli_raw_exp
-            _insert_rid_after_client(_cli_detail_exp).to_excel(writer, index=False, sheet_name='Client_Role_Detail')
+            _cli_detail_rid_exp = _insert_rid_after_client(_cli_detail_exp)
+            _cli_detail_rid_exp.to_excel(writer, index=False, sheet_name='Client_Role_Detail')
             # Tab 6: Baseline Audit — most detailed level (drop internal email cols)
             if not st.session_state.final_dashboards.get('baseline', pd.DataFrame()).empty:
                 _bl_exp = st.session_state.final_dashboards['baseline'].copy()
@@ -9140,6 +9215,7 @@ if "calc_data" in st.session_state:
             if not _el_df_exp.empty:
                 _el_df_exp.to_excel(writer, index=False, sheet_name='Employee_Level')
             # Tab 8: Sr. Ratios — computed inline so it's always fresh (no tab visit required)
+            _sr_df_x = pd.DataFrame()
             _sr_hc_exp  = st.session_state.get('hc_data', None)
             _sr_wday_exp = st.session_state.get('calc_data', {}).get('dict_workable_days', {})
             if _sr_hc_exp and _sr_wday_exp:
@@ -9258,6 +9334,7 @@ if "calc_data" in st.session_state:
                     _sr_df_x.to_excel(writer, index=False, sheet_name='Sr_Ratios')
                     st.session_state['_s3_sr_ratios_df'] = _sr_df_x.copy()
             # Tab 9: Client FTEs by Month — POD + Sr. + Client totals across all roles
+            _cli_fte_df  = pd.DataFrame()
             _cli_fte_src = st.session_state.final_dashboards.get('cliente', pd.DataFrame())
             if not _cli_fte_src.empty:
                 _fte_id_cols  = [c for c in ['POD', 'Sr. Accountant', 'Client'] if c in _cli_fte_src.columns]
@@ -9299,6 +9376,171 @@ if "calc_data" in st.session_state:
             _cmrr_exp = st.session_state.final_dashboards.get('client_mrr', pd.DataFrame())
             if not _cmrr_exp.empty:
                 _cmrr_exp.to_excel(writer, index=False, sheet_name='Client_MRR')
+            # Tab 11: Client Mapping — HubSpot ID → Sr. email, Client Name, Client Status
+            # Reads srs + dc LIVE from vol bytes each run. No reliance on session_state caches.
+            def _hid_int(v):
+                try:    return int(float(str(v).strip().replace(',', '')))
+                except: return None
+            def _ci_col_lookup(df_x, *candidates_contains):
+                """Find first col where ALL terms in any candidate group are in col name (lower)."""
+                for col in df_x.columns:
+                    cl = str(col).lower().strip()
+                    for group in candidates_contains:
+                        if all(t in cl for t in group):
+                            return col
+                return None
+            _sr_int_map = {}   # int(hubspot_id) → email
+            _cm_rows    = {}   # int(hubspot_id) → {client_name, client_status}
+            _cm_dbg     = {'src_srs': 0, 'src_dc': 0, 'src_dfcl': 0, 'src_hs': 0}
+            _vol_bytes  = st.session_state.get('_vol_file_bytes', None)
+            # Fallback: read bytes directly from the live file_uploader widget if cache is stale
+            if not _vol_bytes:
+                _live_up = st.session_state.get('main_data_upload', None)
+                if _live_up is not None:
+                    try:
+                        _live_up.seek(0)
+                        _vol_bytes = _live_up.read()
+                        _live_up.seek(0)
+                        st.session_state['_vol_file_bytes'] = _vol_bytes
+                    except Exception:
+                        pass
+            _dfcl_exp   = st.session_state.get('df_clean', pd.DataFrame())
+            _hs_exp     = st.session_state.get('hs_parsed')
+            from io import BytesIO as _BIO
+            # ── SRS sheet: try vol bytes first, then cached raw ──────────────
+            _srs_now = pd.DataFrame()
+            if _vol_bytes:
+                try:
+                    _xln = pd.ExcelFile(_BIO(_vol_bytes))
+                    if 'srs' in _xln.sheet_names:
+                        _srs_now = pd.read_excel(_BIO(_vol_bytes), sheet_name='srs')
+                        _srs_now.columns = _srs_now.columns.astype(str).str.strip()
+                except Exception as _e_srs:
+                    st.warning(f"⚠️ Client_Mapping: srs bytes read failed — {_e_srs}")
+            if _srs_now.empty:
+                _srs_now = st.session_state.get('_srs_sheet_raw', pd.DataFrame())
+            if not _srs_now.empty:
+                _e_c = _ci_col_lookup(_srs_now, ('email',))
+                _r_c = _ci_col_lookup(_srs_now, ('hubspot', 'id'), ('record', 'id'))
+                if _e_c and _r_c:
+                    for _r, _e in zip(_srs_now[_r_c], _srs_now[_e_c]):
+                        _ki = _hid_int(_r)
+                        _ei = str(_e).strip().lower()
+                        if _ki and '@' in _ei:
+                            _sr_int_map[_ki] = _ei
+                            _cm_dbg['src_srs'] += 1
+            # Fallback Sr. map: df_clean (already enriched with srs at upload)
+            if not _dfcl_exp.empty:
+                _rid_c = _ci_col_lookup(_dfcl_exp, ('record_id',), ('record', 'id'), ('hubspot', 'id'))
+                _sr_c  = _ci_col_lookup(_dfcl_exp, ('sr. accountant',), ('sr accountant',))
+                if _rid_c and _sr_c:
+                    for _r, _e in zip(_dfcl_exp[_rid_c], _dfcl_exp[_sr_c]):
+                        _ki = _hid_int(_r)
+                        _ei = str(_e).strip().lower()
+                        if _ki and '@' in _ei and _ki not in _sr_int_map:
+                            _sr_int_map[_ki] = _ei
+                            _cm_dbg['src_dfcl'] += 1
+            # ── DC sheet: try vol bytes first, then cached raw ───────────────
+            _dc_now = pd.DataFrame()
+            if _vol_bytes:
+                try:
+                    _xln = pd.ExcelFile(_BIO(_vol_bytes))
+                    if 'dc' in _xln.sheet_names:
+                        _dc_now = pd.read_excel(_BIO(_vol_bytes), sheet_name='dc')
+                        _dc_now.columns = _dc_now.columns.astype(str).str.strip()
+                except Exception as _e_dc:
+                    st.warning(f"⚠️ Client_Mapping: dc bytes read failed — {_e_dc}")
+            if _dc_now.empty:
+                _dc_now = st.session_state.get('_dc_sheet_raw', pd.DataFrame())
+            if not _dc_now.empty:
+                _dc_rid  = _ci_col_lookup(_dc_now, ('record', 'id'), ('hubspot', 'id'))
+                _dc_name = _ci_col_lookup(_dc_now, ('company', 'name'), ('client', 'name'))
+                _dc_lc   = _ci_col_lookup(_dc_now, ('lifecycle',))
+                if _dc_rid:
+                    for _, _row in _dc_now.iterrows():
+                        _ki = _hid_int(_row.get(_dc_rid))
+                        if not _ki: continue
+                        _lc = str(_row.get(_dc_lc, '') or '') if _dc_lc else ''
+                        if 'churn' in _lc.lower(): continue
+                        _nm = str(_row.get(_dc_name, '') or '') if _dc_name else ''
+                        _cm_rows[_ki] = {'client_name': _nm, 'client_status': _lc}
+                        _cm_dbg['src_dc'] += 1
+            # Fallback universe: df_clean (when dc not available)
+            if not _cm_rows and not _dfcl_exp.empty:
+                _rid_c = _ci_col_lookup(_dfcl_exp, ('record_id',), ('record', 'id'), ('hubspot', 'id'))
+                _nm_c  = _ci_col_lookup(_dfcl_exp, ('client_name',), ('client', 'name'), ('company',))
+                if _rid_c:
+                    _nm_series = _dfcl_exp[_nm_c] if _nm_c else pd.Series('', index=_dfcl_exp.index)
+                    for _r, _nm in zip(_dfcl_exp[_rid_c], _nm_series):
+                        _ki = _hid_int(_r)
+                        if _ki:
+                            _cm_rows.setdefault(_ki, {'client_name': str(_nm), 'client_status': ''})
+            # ── HubSpot file: adds/overwrites ─────────────────────────────────
+            if _hs_exp is not None and not _hs_exp.empty:
+                _hs_rid  = _ci_col_lookup(_hs_exp, ('record_id',), ('record', 'id'), ('hubspot', 'id'))
+                _hs_name = _ci_col_lookup(_hs_exp, ('client_name',), ('company', 'name'), ('company',))
+                _hs_lc   = _ci_col_lookup(_hs_exp, ('_lifecycle',), ('lifecycle',))
+                if _hs_rid:
+                    for _, _row in _hs_exp.iterrows():
+                        _ki = _hid_int(_row.get(_hs_rid))
+                        if not _ki: continue
+                        _lc = str(_row.get(_hs_lc, '') or '') if _hs_lc else ''
+                        if 'churn' in _lc.lower():
+                            _cm_rows.pop(_ki, None)
+                            continue
+                        _nm = str(_row.get(_hs_name, '') or '') if _hs_name else ''
+                        _cm_rows[_ki] = {'client_name': _nm, 'client_status': _lc}
+                        _cm_dbg['src_hs'] += 1
+            # ── Build final DF + diagnostic message ───────────────────────────
+            _cm_df = pd.DataFrame([
+                {
+                    'HubSpot ID':           _ki,
+                    'Sr. Accountant Email': _sr_int_map.get(_ki, 'Pending to Map'),
+                    'Client Name':          _dat['client_name'],
+                    'Client Status':        _dat['client_status'],
+                }
+                for _ki, _dat in sorted(_cm_rows.items())
+            ]) if _cm_rows else pd.DataFrame(columns=['HubSpot ID', 'Sr. Accountant Email', 'Client Name', 'Client Status'])
+            _cm_df.to_excel(writer, index=False, sheet_name='Client_Mapping')
+            st.session_state['_cm_diag'] = (
+                f"Client_Mapping built: {len(_cm_df)} rows · "
+                f"Sr map: {len(_sr_int_map)} · "
+                f"sources [srs:{_cm_dbg['src_srs']} dc:{_cm_dbg['src_dc']} df_clean:{_cm_dbg['src_dfcl']} hs:{_cm_dbg['src_hs']}] · "
+                f"vol_bytes:{'yes' if _vol_bytes else 'NO'}"
+            )
+            # WF_POD sheets — waterfall + HC + 6 filtered sections per POD
+            _wf_pods_exp = st.session_state.get('_wf_pod_all_export', {})
+            _hc_pod_role_df = _hc_xp.get('by_pod_role', pd.DataFrame()) if _hc_xp else pd.DataFrame()
+            _hc_detail_df   = _hc_xp.get('detail',      pd.DataFrame()) if _hc_xp else pd.DataFrame()
+            _pod_sections = [
+                ('HC Summary',           _hc_pod_role_df),
+                ('HC Detail',            _hc_detail_df),
+                ('Summary by POD',       _pod_summary_df),
+                ('Sr. Ratios',           _sr_df_x),
+                ('POD x Sr. Accountant', _cli_pod_sr),
+                ('Client Role Detail',   _cli_detail_rid_exp),
+                ('Client FTEs by Month', _cli_fte_df),
+                ('Client MRR',           _cmrr_exp),
+            ]
+            for _pn_exp, _df_pw_exp in sorted(_wf_pods_exp.items()):
+                if _df_pw_exp.empty:
+                    continue
+                _sn_exp = _xl_sheet(_pn_exp, 'WF_')
+                _df_pw_exp.to_excel(writer, sheet_name=_sn_exp, startrow=0)
+                _ws_exp = writer.sheets[_sn_exp]
+                _row_exp = len(_df_pw_exp) + 3  # header row + data rows + 1 blank
+                for _sec_title, _sec_df in _pod_sections:
+                    if _sec_df is None or (hasattr(_sec_df, 'empty') and _sec_df.empty):
+                        continue
+                    if 'POD' not in _sec_df.columns:
+                        continue
+                    _filt_exp = _sec_df[_sec_df['POD'].astype(str).str.strip().str.upper() == str(_pn_exp).strip().upper()]
+                    if _filt_exp.empty:
+                        continue
+                    _ws_exp.write(_row_exp, 0, f'=== {_sec_title} ===')
+                    _row_exp += 1
+                    _filt_exp.to_excel(writer, sheet_name=_sn_exp, startrow=_row_exp, index=False)
+                    _row_exp += len(_filt_exp) + 3  # header + data rows + 1 blank
 
         _n_pod_sheets = len(st.session_state.get('_wf_pod_all_export', {}))
         _n_srs_exp = len(
@@ -9309,6 +9551,10 @@ if "calc_data" in st.session_state:
         _mode_tag_exp   = st.session_state.get('_cascade_role_mode', 'ideal')
         _other_tag_exp  = 'real' if _mode_tag_exp == 'ideal' else 'ideal'
         st.session_state[f'_cascade_export_buf_{_mode_tag_exp}'] = output.getvalue()
+        # ── Client_Mapping diagnostic ────────────────────────────────────────────
+        _cm_diag_msg = st.session_state.get('_cm_diag', '')
+        if _cm_diag_msg:
+            st.info(f"🗺️ {_cm_diag_msg}")
 
         # ── Mode-mismatch warning ─────────────────────────────────────────────────
         # Check if the user has changed the radio since the last cascade run
