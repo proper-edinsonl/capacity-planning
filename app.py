@@ -12,7 +12,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 
 # --- APP VERSION ---
-APP_VERSION = "v6.4.2026.2.45PM"
+APP_VERSION = "v6.4.2026.2.51PM"
 
 def _lc_short_m0(gl_series):
     """Bool array: True if Go Live month has < 15 working days remaining (< 3 weeks)."""
@@ -9787,29 +9787,26 @@ if "calc_data" in st.session_state:
             _meth_ws.set_column('B:B', 90)
             _meth_ws.set_column('C:F', 18)
             _meth_ws.hide_gridlines(2)
-            _r = 0
-            _meth_ws.merge_range(_r, 0, _r, 5, '📊 How the Sr. Ratios Calculation Works', _f_title)
-            _meth_ws.set_row(_r, 32); _r += 2
-            _meth_ws.merge_range(_r, 0, _r, 5,
+            _rc = [0]   # mutable counter (nonlocal workaround for non-function scope)
+            _meth_ws.merge_range(_rc[0], 0, _rc[0], 5, '📊 How the Sr. Ratios Calculation Works', _f_title)
+            _meth_ws.set_row(_rc[0], 32); _rc[0] += 2
+            _meth_ws.merge_range(_rc[0], 0, _rc[0], 5,
                 'The Sr. Ratios model answers a single question for every Sr. Accountant: '
                 '"Is this Sr. overloaded, balanced, or has free capacity this month?"', _f_body)
-            _meth_ws.set_row(_r, 30); _r += 2
+            _meth_ws.set_row(_rc[0], 30); _rc[0] += 2
 
             def _write_section(title):
-                nonlocal _r
-                _meth_ws.merge_range(_r, 0, _r, 5, title, _f_h1)
-                _meth_ws.set_row(_r, 24); _r += 1
+                _meth_ws.merge_range(_rc[0], 0, _rc[0], 5, title, _f_h1)
+                _meth_ws.set_row(_rc[0], 24); _rc[0] += 1
             def _write_pair(label, content, height=None):
-                nonlocal _r
-                _meth_ws.write(_r, 0, label, _f_h2)
-                _meth_ws.merge_range(_r, 1, _r, 5, content, _f_body)
-                if height: _meth_ws.set_row(_r, height)
-                _r += 1
+                _meth_ws.write(_rc[0], 0, label, _f_h2)
+                _meth_ws.merge_range(_rc[0], 1, _rc[0], 5, content, _f_body)
+                if height: _meth_ws.set_row(_rc[0], height)
+                _rc[0] += 1
             def _write_formula(label, formula, height=28):
-                nonlocal _r
-                _meth_ws.write(_r, 0, label, _f_h2)
-                _meth_ws.merge_range(_r, 1, _r, 5, formula, _f_form)
-                _meth_ws.set_row(_r, height); _r += 1
+                _meth_ws.write(_rc[0], 0, label, _f_h2)
+                _meth_ws.merge_range(_rc[0], 1, _rc[0], 5, formula, _f_form)
+                _meth_ws.set_row(_rc[0], height); _rc[0] += 1
 
             # ── Layer 1 ──
             _write_section('Layer 1 — How much can the Sr. work this month?')
@@ -9817,7 +9814,7 @@ if "calc_data" in st.session_state:
             _write_pair('Constants', '• 7.5 hrs/day = 8-hour shift minus 30-min break\n'
                                      '• workable_days = Mon-Fri minus holidays', 45)
             _write_pair('Example', '22-day month → 7.5 × 22 = 165 hours total')
-            _r += 1
+            _rc[0] += 1
 
             # ── Layer 2 ──
             _write_section('Layer 2 — How much time is "burned" on management overhead?')
@@ -9832,14 +9829,14 @@ if "calc_data" in st.session_state:
                 '• Day_Scale adjusts proportionally for shorter or longer months', 60)
             _write_pair('Example', 'Sr. with 8 direct reports in a 22-day month → '
                                    '(35 + 1.5×8) × (22/20) = 47 × 1.10 = 51.7 hrs Ops Rhythm', 30)
-            _r += 1
+            _rc[0] += 1
 
             # ── Layer 3 ──
             _write_section('Layer 3 — Productive Capacity (what\'s actually left)')
             _write_formula('Formula', 'Productive Capacity = max(0, Total Work Hours − Ops Rhythm Hours)')
             _write_pair('Meaning', 'The Sr.\'s true ceiling for client work after management overhead.', 28)
             _write_pair('Example', '165 − 51.7 = 113.3 productive hours available')
-            _r += 1
+            _rc[0] += 1
 
             # ── Layer 4 ──
             _write_section('Layer 4 — What are they actually doing?')
@@ -9850,70 +9847,73 @@ if "calc_data" in st.session_state:
                                            'to avoid double-counting.', 30)
             _write_formula('Formula',
                 'Productive Hours = Σ (Hours where Sr. = processor OR reviewer, weighted by sharing)', 28)
-            _r += 1
+            _rc[0] += 1
 
             # ── Final calc & Status ──
             _write_section('Final Calculation & Status')
             _write_formula('Formula',
                 'Remaining Hours = Productive Capacity − Productive Hours\n'
                 '% Remaining     = (Remaining / Productive Capacity) × 100', 42)
-            _meth_ws.write(_r, 0, 'Status thresholds', _f_h2); _r += 1
-            for h, val in [('% Remaining', 'Status', 'Meaning'),
-                           ('> +7%', '🟢 Available', 'Has free capacity, can take more'),
-                           ('−7% to +7%', '✅ On Track', 'Well balanced'),
-                           ('< −7%', '🔴 Potential Burnout', 'Overloaded, risk')][:1]:
-                _meth_ws.write_row(_r, 1, h, _f_tbl_h); _r += 1
+            _meth_ws.write(_rc[0], 0, 'Status thresholds', _f_h2); _rc[0] += 1
+            _meth_ws.write(_rc[0], 1, '% Remaining', _f_tbl_h)
+            _meth_ws.write(_rc[0], 2, 'Status', _f_tbl_h)
+            _meth_ws.merge_range(_rc[0], 3, _rc[0], 5, 'Meaning', _f_tbl_h); _rc[0] += 1
             for vals in [('> +7%', '🟢 Available', 'Has free capacity, can take more'),
                          ('−7% to +7%', '✅ On Track', 'Well balanced'),
                          ('< −7%', '🔴 Potential Burnout', 'Overloaded, risk')]:
-                _meth_ws.write(_r, 1, vals[0], _f_tbl)
-                _meth_ws.write(_r, 2, vals[1], _f_tbl)
-                _meth_ws.merge_range(_r, 3, _r, 5, vals[2], _f_tbl_l)
-                _r += 1
-            _r += 1
+                _meth_ws.write(_rc[0], 1, vals[0], _f_tbl)
+                _meth_ws.write(_rc[0], 2, vals[1], _f_tbl)
+                _meth_ws.merge_range(_rc[0], 3, _rc[0], 5, vals[2], _f_tbl_l)
+                _rc[0] += 1
+            _rc[0] += 1
 
             # ── Direct Reports & Clients health checks ──
             _write_section('Bonus — Direct Reports & Clients Health Check')
-            _meth_ws.write_row(_r, 1, ['Range', 'Direct Reports', 'Clients Assigned'], _f_tbl_h); _r += 1
+            _meth_ws.write(_rc[0], 1, 'Range', _f_tbl_h)
+            _meth_ws.write(_rc[0], 2, 'Direct Reports', _f_tbl_h)
+            _meth_ws.merge_range(_rc[0], 3, _rc[0], 5, 'Clients Assigned', _f_tbl_h); _rc[0] += 1
             for vals in [('✅', '7–9', '3–5'),
                          ('⬇️', '< 7 (under-managed)', '< 3 (under-utilized)'),
                          ('⬆️', '> 9 (over-managed)', '> 5 (over-loaded)')]:
-                _meth_ws.write(_r, 1, vals[0], _f_tbl)
-                _meth_ws.write(_r, 2, vals[1], _f_tbl_l)
-                _meth_ws.merge_range(_r, 3, _r, 5, vals[2], _f_tbl_l)
-                _r += 1
-            _r += 1
+                _meth_ws.write(_rc[0], 1, vals[0], _f_tbl)
+                _meth_ws.write(_rc[0], 2, vals[1], _f_tbl_l)
+                _meth_ws.merge_range(_rc[0], 3, _rc[0], 5, vals[2], _f_tbl_l)
+                _rc[0] += 1
+            _rc[0] += 1
 
             # ── Examples ──
             _write_section('🎯 Three Examples — 22 working days month')
 
-            _meth_ws.write(_r, 0, '🔴 María — Overloaded, burnout risk', _f_red); _r += 1
-            _meth_ws.merge_range(_r, 0, _r, 5,
+            _meth_ws.write(_rc[0], 0, '🔴 María — Overloaded, burnout risk', _f_red); _rc[0] += 1
+            _meth_ws.merge_range(_rc[0], 0, _rc[0], 5,
                 'Direct Reports = 11   ·   Productive Hours = 145\n'
                 'Total Work = 7.5 × 22 = 165 · Day Scale = 1.10 · Ops = (35 + 1.5×11) × 1.10 = 56.7\n'
                 'Productive Capacity = 165 − 56.7 = 108.3 · Remaining = 108.3 − 145 = -36.7 (−33.9%)\n'
                 '→ Status: 🔴 Potential Burnout · DRs: ⬆️ (>9)', _f_form)
-            _meth_ws.set_row(_r, 75); _r += 2
+            _meth_ws.set_row(_rc[0], 75); _rc[0] += 2
 
-            _meth_ws.write(_r, 0, '✅ Juan — Well balanced, on track', _f_blu); _r += 1
-            _meth_ws.merge_range(_r, 0, _r, 5,
+            _meth_ws.write(_rc[0], 0, '✅ Juan — Well balanced, on track', _f_blu); _rc[0] += 1
+            _meth_ws.merge_range(_rc[0], 0, _rc[0], 5,
                 'Direct Reports = 8   ·   Productive Hours = 105\n'
                 'Total Work = 7.5 × 22 = 165 · Day Scale = 1.10 · Ops = (35 + 1.5×8) × 1.10 = 51.7\n'
                 'Productive Capacity = 165 − 51.7 = 113.3 · Remaining = 113.3 − 105 = 8.3 (+7.3%)\n'
                 '→ Status: ✅ On Track · DRs: ✅ (7–9)', _f_form)
-            _meth_ws.set_row(_r, 75); _r += 2
+            _meth_ws.set_row(_rc[0], 75); _rc[0] += 2
 
-            _meth_ws.write(_r, 0, '🟢 Carla — Available, room to grow', _f_grn); _r += 1
-            _meth_ws.merge_range(_r, 0, _r, 5,
+            _meth_ws.write(_rc[0], 0, '🟢 Carla — Available, room to grow', _f_grn); _rc[0] += 1
+            _meth_ws.merge_range(_rc[0], 0, _rc[0], 5,
                 'Direct Reports = 6   ·   Productive Hours = 65\n'
                 'Total Work = 7.5 × 22 = 165 · Day Scale = 1.10 · Ops = (35 + 1.5×6) × 1.10 = 48.4\n'
                 'Productive Capacity = 165 − 48.4 = 116.6 · Remaining = 116.6 − 65 = 51.6 (+44.2%)\n'
                 '→ Status: 🟢 Available · DRs: ⬇️ (<7)', _f_form)
-            _meth_ws.set_row(_r, 75); _r += 2
+            _meth_ws.set_row(_rc[0], 75); _rc[0] += 2
 
             # ── Side-by-side ──
             _write_section('Side-by-Side Comparison')
-            _meth_ws.write_row(_r, 0, ['Metric', '🔴 María', '✅ Juan', '🟢 Carla'], _f_tbl_h); _r += 1
+            _meth_ws.write(_rc[0], 0, 'Metric', _f_tbl_h)
+            _meth_ws.write(_rc[0], 1, '🔴 María', _f_tbl_h)
+            _meth_ws.write(_rc[0], 2, '✅ Juan', _f_tbl_h)
+            _meth_ws.write(_rc[0], 3, '🟢 Carla', _f_tbl_h); _rc[0] += 1
             for vals in [('Direct Reports', '11 ⬆️', '8 ✅', '6 ⬇️'),
                          ('Total Work Hours', '165.0', '165.0', '165.0'),
                          ('Ops Rhythm Hours', '56.7', '51.7', '48.4'),
@@ -9922,11 +9922,11 @@ if "calc_data" in st.session_state:
                          ('Remaining Hours', '−36.7', '+8.3', '+51.6'),
                          ('% Remaining', '−33.9%', '+7.3%', '+44.2%'),
                          ('Status', '🔴 Burnout', '✅ On Track', '🟢 Available')]:
-                _meth_ws.write(_r, 0, vals[0], _f_tbl_l)
-                _meth_ws.write(_r, 1, vals[1], _f_tbl)
-                _meth_ws.write(_r, 2, vals[2], _f_tbl)
-                _meth_ws.write(_r, 3, vals[3], _f_tbl)
-                _r += 1
+                _meth_ws.write(_rc[0], 0, vals[0], _f_tbl_l)
+                _meth_ws.write(_rc[0], 1, vals[1], _f_tbl)
+                _meth_ws.write(_rc[0], 2, vals[2], _f_tbl)
+                _meth_ws.write(_rc[0], 3, vals[3], _f_tbl)
+                _rc[0] += 1
             _meth_ws.freeze_panes(2, 0)
             _meth_ws.set_tab_color('#FFC000')   # yellow (Sr. family)
 
