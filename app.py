@@ -12,7 +12,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 
 # --- APP VERSION ---
-APP_VERSION = "v6.4.2026.2.51PM"
+APP_VERSION = "v6.4.2026.3.07PM"
 
 def _lc_short_m0(gl_series):
     """Bool array: True if Go Live month has < 15 working days remaining (< 3 weeks)."""
@@ -6893,12 +6893,14 @@ if "calc_data" in st.session_state:
                 _sc   = _sr_auto_net_days / _SR_OPS_BASE_DAYS_A
                 _oph  = (_SR_OPS_FIXED_MONTHLY_A + _SR_OPS_VAR_PER_DR_A * _drc) * _sc
                 _toh  = _SR_HRS_PER_DAY_A * _sr_auto_net_days
-                _cph  = max(_toh - _oph, 0.0)
-                _rmh  = _cph - _prh
-                _pct  = (_rmh / _cph * 100) if _cph > 0 else 0.0
+                _cph  = max(_toh - _oph, 0.0)        # kept for display only
+                # Remaining = Total Work - Productive Hours - Ops Rhythm  (direct formula)
+                _rmh  = _toh - _prh - _oph
+                _pct  = (_rmh / _toh * 100) if _toh > 0 else 0.0
                 _clih = float(_sr_auto_mec.get(_sea, 0.0)) + float(_sr_auto_other.get(_sea, 0.0))
-                _rmmc = _cph - _clih
-                _pctm = (_rmmc / _cph * 100) if _cph > 0 else 0.0
+                # Remaining (MEC) = Total Work - MEC&Other - Ops Rhythm
+                _rmmc = _toh - _clih - _oph
+                _pctm = (_rmmc / _toh * 100) if _toh > 0 else 0.0
                 def _ast(p):
                     if p > _THRESHOLD_PCT_A:   return '🟢 Available'
                     if p >= -_THRESHOLD_PCT_A: return '✅ On Track'
@@ -9556,13 +9558,15 @@ if "calc_data" in st.session_state:
                     _sc_x  = _sr_ndays_x / _SR_BASE_DAYS_X
                     _oph_x = (_SR_OPS_FIXED_X + _SR_OPS_VAR_X * _drc_x) * _sc_x
                     _toh_x = _SR_HRS_DAY_X * _sr_ndays_x
-                    _cph_x = max(_toh_x - _oph_x, 0.0)
+                    _cph_x = max(_toh_x - _oph_x, 0.0)   # kept for display only
                     _prh_v = float(_sr_prh_x.get(_sea_x, 0.0))
-                    _rmh_x = _cph_x - _prh_v
-                    _pct_x = (_rmh_x / _cph_x * 100) if _cph_x > 0 else 0.0
+                    # Remaining = Total Work - Productive Hours - Ops Rhythm  (direct formula)
+                    _rmh_x = _toh_x - _prh_v - _oph_x
+                    _pct_x = (_rmh_x / _toh_x * 100) if _toh_x > 0 else 0.0
                     _clh_x = float(_sr_mec_x.get(_sea_x, 0.0)) + float(_sr_oth_x.get(_sea_x, 0.0))
-                    _rmm_x = _cph_x - _clh_x
-                    _ptm_x = (_rmm_x / _cph_x * 100) if _cph_x > 0 else 0.0
+                    # Remaining (MEC) = Total Work - MEC&Other - Ops Rhythm
+                    _rmm_x = _toh_x - _clh_x - _oph_x
+                    _ptm_x = (_rmm_x / _toh_x * 100) if _toh_x > 0 else 0.0
                     _cli_c = int(_sr_cli_x.get(_sea_x, 0))
                     _drf_x = '✅' if _DR_MIN_X  <= _drc_x  <= _DR_MAX_X  else ('⬇️' if _drc_x  < _DR_MIN_X  else '⬆️')
                     _clf_x = '✅' if _CLI_MIN_X <= _cli_c <= _CLI_MAX_X else ('⬇️' if _cli_c < _CLI_MIN_X else '⬆️')
@@ -9832,14 +9836,7 @@ if "calc_data" in st.session_state:
             _rc[0] += 1
 
             # ── Layer 3 ──
-            _write_section('Layer 3 — Productive Capacity (what\'s actually left)')
-            _write_formula('Formula', 'Productive Capacity = max(0, Total Work Hours − Ops Rhythm Hours)')
-            _write_pair('Meaning', 'The Sr.\'s true ceiling for client work after management overhead.', 28)
-            _write_pair('Example', '165 − 51.7 = 113.3 productive hours available')
-            _rc[0] += 1
-
-            # ── Layer 4 ──
-            _write_section('Layer 4 — What are they actually doing?')
+            _write_section('Layer 3 — What are they actually doing?')
             _write_pair('Source', 'The model looks at the volume file and sums:\n'
                                   '• Capacity Processing Hours where Sr. = processor\n'
                                   '• Capacity Reviewing Hours where Sr. = reviewer', 60)
@@ -9851,9 +9848,15 @@ if "calc_data" in st.session_state:
 
             # ── Final calc & Status ──
             _write_section('Final Calculation & Status')
-            _write_formula('Formula',
-                'Remaining Hours = Productive Capacity − Productive Hours\n'
-                '% Remaining     = (Remaining / Productive Capacity) × 100', 42)
+            _write_formula('Formula (Main)',
+                'Remaining Hours = Total Work Hours − Productive Hours − Ops Rhythm\n'
+                '% Remaining     = (Remaining / Total Work Hours) × 100', 42)
+            _write_formula('Formula (MEC variant)',
+                'Remaining Hrs (MEC) = Total Work Hours − MEC & Other Client Hrs − Ops Rhythm\n'
+                '% Remaining (MEC)   = (Remaining (MEC) / Total Work Hours) × 100', 42)
+            _write_pair('Note', 'A "Productive Capacity" column is shown too (Total Work − Ops Rhythm) as a reference '
+                                'for the ceiling of client work after overhead, but it is NOT used in the Remaining '
+                                'formula directly.', 45)
             _meth_ws.write(_rc[0], 0, 'Status thresholds', _f_h2); _rc[0] += 1
             _meth_ws.write(_rc[0], 1, '% Remaining', _f_tbl_h)
             _meth_ws.write(_rc[0], 2, 'Status', _f_tbl_h)
@@ -9888,7 +9891,7 @@ if "calc_data" in st.session_state:
             _meth_ws.merge_range(_rc[0], 0, _rc[0], 5,
                 'Direct Reports = 11   ·   Productive Hours = 145\n'
                 'Total Work = 7.5 × 22 = 165 · Day Scale = 1.10 · Ops = (35 + 1.5×11) × 1.10 = 56.7\n'
-                'Productive Capacity = 165 − 56.7 = 108.3 · Remaining = 108.3 − 145 = -36.7 (−33.9%)\n'
+                'Remaining = 165 − 145 − 56.7 = −36.7 · % = −36.7 / 165 = −22.2%\n'
                 '→ Status: 🔴 Potential Burnout · DRs: ⬆️ (>9)', _f_form)
             _meth_ws.set_row(_rc[0], 75); _rc[0] += 2
 
@@ -9896,7 +9899,7 @@ if "calc_data" in st.session_state:
             _meth_ws.merge_range(_rc[0], 0, _rc[0], 5,
                 'Direct Reports = 8   ·   Productive Hours = 105\n'
                 'Total Work = 7.5 × 22 = 165 · Day Scale = 1.10 · Ops = (35 + 1.5×8) × 1.10 = 51.7\n'
-                'Productive Capacity = 165 − 51.7 = 113.3 · Remaining = 113.3 − 105 = 8.3 (+7.3%)\n'
+                'Remaining = 165 − 105 − 51.7 = 8.3 · % = 8.3 / 165 = +5.0%\n'
                 '→ Status: ✅ On Track · DRs: ✅ (7–9)', _f_form)
             _meth_ws.set_row(_rc[0], 75); _rc[0] += 2
 
@@ -9904,7 +9907,7 @@ if "calc_data" in st.session_state:
             _meth_ws.merge_range(_rc[0], 0, _rc[0], 5,
                 'Direct Reports = 6   ·   Productive Hours = 65\n'
                 'Total Work = 7.5 × 22 = 165 · Day Scale = 1.10 · Ops = (35 + 1.5×6) × 1.10 = 48.4\n'
-                'Productive Capacity = 165 − 48.4 = 116.6 · Remaining = 116.6 − 65 = 51.6 (+44.2%)\n'
+                'Remaining = 165 − 65 − 48.4 = 51.6 · % = 51.6 / 165 = +31.3%\n'
                 '→ Status: 🟢 Available · DRs: ⬇️ (<7)', _f_form)
             _meth_ws.set_row(_rc[0], 75); _rc[0] += 2
 
@@ -9917,10 +9920,9 @@ if "calc_data" in st.session_state:
             for vals in [('Direct Reports', '11 ⬆️', '8 ✅', '6 ⬇️'),
                          ('Total Work Hours', '165.0', '165.0', '165.0'),
                          ('Ops Rhythm Hours', '56.7', '51.7', '48.4'),
-                         ('Productive Capacity', '108.3', '113.3', '116.6'),
                          ('Productive Hours (consumed)', '145.0', '105.0', '65.0'),
-                         ('Remaining Hours', '−36.7', '+8.3', '+51.6'),
-                         ('% Remaining', '−33.9%', '+7.3%', '+44.2%'),
+                         ('Remaining (= Total − Prod − Ops)', '−36.7', '+8.3', '+51.6'),
+                         ('% Remaining (vs Total Work)', '−22.2%', '+5.0%', '+31.3%'),
                          ('Status', '🔴 Burnout', '✅ On Track', '🟢 Available')]:
                 _meth_ws.write(_rc[0], 0, vals[0], _f_tbl_l)
                 _meth_ws.write(_rc[0], 1, vals[1], _f_tbl)
@@ -10262,15 +10264,17 @@ if "calc_data" in st.session_state:
                     _scale    = _sr_net_days / _SR_OPS_BASE_DAYS
                     _ops_hrs  = (_SR_OPS_FIXED_MONTHLY + _SR_OPS_VAR_PER_DR * _dr_cnt) * _scale
                     _tot_hrs  = _SR_HRS_PER_DAY * _sr_net_days
-                    _cap_hrs  = max(_tot_hrs - _ops_hrs, 0.0)
-                    _rem_hrs  = _cap_hrs - _prod_hrs
-                    _pct_rem  = (_rem_hrs / _cap_hrs * 100) if _cap_hrs > 0 else 0.0
+                    _cap_hrs  = max(_tot_hrs - _ops_hrs, 0.0)   # kept for display only
+                    # Remaining = Total Work - Productive Hours - Ops Rhythm  (direct formula)
+                    _rem_hrs  = _tot_hrs - _prod_hrs - _ops_hrs
+                    _pct_rem  = (_rem_hrs / _tot_hrs * 100) if _tot_hrs > 0 else 0.0
 
                     # MEC & Other client hrs combined (proc if Ideal Proc=Sr, rev if Ideal Rev=Sr)
                     _cli_hrs   = (float(_mec_rev_by_email.get(_sr_em, 0.0))
                                   + float(_other_rev_by_email.get(_sr_em, 0.0)))
-                    _rem_mec   = _cap_hrs - _cli_hrs
-                    _pct_mec   = (_rem_mec / _cap_hrs * 100) if _cap_hrs > 0 else 0.0
+                    # Remaining (MEC) = Total Work - MEC&Other - Ops Rhythm
+                    _rem_mec   = _tot_hrs - _cli_hrs - _ops_hrs
+                    _pct_mec   = (_rem_mec / _tot_hrs * 100) if _tot_hrs > 0 else 0.0
 
                     # Ratio flags
                     _dr_flag  = '✅' if _DR_MIN  <= _dr_cnt  <= _DR_MAX  else ('⬇️' if _dr_cnt  < _DR_MIN  else '⬆️')
