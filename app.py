@@ -12,7 +12,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 
 # --- APP VERSION ---
-APP_VERSION = "v6.4.2026.1.45PM"
+APP_VERSION = "v6.4.2026.2.45PM"
 
 def _lc_short_m0(gl_series):
     """Bool array: True if Go Live month has < 15 working days remaining (< 3 weeks)."""
@@ -6808,7 +6808,7 @@ if "calc_data" in st.session_state:
         if _sr_auto_hc and _sr_auto_wday:
             _SR_OPS_FIXED_MONTHLY_A = 35.0
             _SR_OPS_VAR_PER_DR_A    = 1.5
-            _SR_HRS_PER_DAY_A       = 8.0
+            _SR_HRS_PER_DAY_A       = 7.5   # 8h shift minus 30 min break
             _SR_OPS_BASE_DAYS_A     = 20
             _THRESHOLD_PCT_A        = 7.0
             _DR_MIN_A, _DR_MAX_A    = 7, 9
@@ -9476,7 +9476,7 @@ if "calc_data" in st.session_state:
             _sr_wday_exp = st.session_state.get('calc_data', {}).get('dict_workable_days', {})
             if _sr_hc_exp and _sr_wday_exp:
                 _SR_OPS_FIXED_X = 35.0;  _SR_OPS_VAR_X = 1.5
-                _SR_HRS_DAY_X   = 8.0;   _SR_BASE_DAYS_X = 20;  _SR_THRESH_X = 7.0
+                _SR_HRS_DAY_X   = 7.5;   _SR_BASE_DAYS_X = 20;  _SR_THRESH_X = 7.0   # 7.5 = 8h shift − 30 min break
                 _DR_MIN_X, _DR_MAX_X   = 7, 9
                 _CLI_MIN_X, _CLI_MAX_X = 3, 5
                 _sr_mi_x     = st.session_state.get('_sr_ratios_month', None)
@@ -9764,13 +9764,181 @@ if "calc_data" in st.session_state:
                 f"sources [srs:{_cm_dbg['src_srs']} dc:{_cm_dbg['src_dc']} df_clean:{_cm_dbg['src_dfcl']} hs:{_cm_dbg['src_hs']}] · "
                 f"vol_bytes:{'yes' if _vol_bytes else 'NO'}"
             )
-            # WF_POD sheets — waterfall + HC + 6 filtered sections per POD
+            # Sr. Ratios Methodology — explanatory sheet (linked from every WF_POD)
+            _meth_ws = writer.book.add_worksheet('Sr_Ratios_Methodology')
+            _meth_book = writer.book
+            _f_title = _meth_book.add_format({'bold': True, 'font_size': 16, 'font_color': '#1F3864', 'valign': 'vcenter'})
+            _f_h1    = _meth_book.add_format({'bold': True, 'font_size': 13, 'font_color': '#FFFFFF', 'bg_color': '#1F3864',
+                                              'valign': 'vcenter', 'align': 'left', 'left': 0, 'right': 0})
+            _f_h2    = _meth_book.add_format({'bold': True, 'font_size': 11, 'font_color': '#1F3864', 'valign': 'top'})
+            _f_body  = _meth_book.add_format({'text_wrap': True, 'valign': 'top', 'font_size': 11})
+            _f_form  = _meth_book.add_format({'font_name': 'Consolas', 'font_size': 10, 'bg_color': '#F2F2F2',
+                                              'text_wrap': True, 'valign': 'top', 'left': 1, 'right': 1, 'top': 1, 'bottom': 1,
+                                              'border_color': '#BFBFBF'})
+            _f_red   = _meth_book.add_format({'bold': True, 'font_color': '#C00000', 'font_size': 11, 'valign': 'top'})
+            _f_grn   = _meth_book.add_format({'bold': True, 'font_color': '#00B050', 'font_size': 11, 'valign': 'top'})
+            _f_blu   = _meth_book.add_format({'bold': True, 'font_color': '#4472C4', 'font_size': 11, 'valign': 'top'})
+            _f_tbl_h = _meth_book.add_format({'bold': True, 'bg_color': '#1F3864', 'font_color': '#FFFFFF',
+                                              'align': 'center', 'valign': 'vcenter', 'border': 1})
+            _f_tbl   = _meth_book.add_format({'border': 1, 'valign': 'vcenter', 'align': 'center'})
+            _f_tbl_l = _meth_book.add_format({'border': 1, 'valign': 'vcenter', 'align': 'left'})
+
+            _meth_ws.set_column('A:A', 26)
+            _meth_ws.set_column('B:B', 90)
+            _meth_ws.set_column('C:F', 18)
+            _meth_ws.hide_gridlines(2)
+            _r = 0
+            _meth_ws.merge_range(_r, 0, _r, 5, '📊 How the Sr. Ratios Calculation Works', _f_title)
+            _meth_ws.set_row(_r, 32); _r += 2
+            _meth_ws.merge_range(_r, 0, _r, 5,
+                'The Sr. Ratios model answers a single question for every Sr. Accountant: '
+                '"Is this Sr. overloaded, balanced, or has free capacity this month?"', _f_body)
+            _meth_ws.set_row(_r, 30); _r += 2
+
+            def _write_section(title):
+                nonlocal _r
+                _meth_ws.merge_range(_r, 0, _r, 5, title, _f_h1)
+                _meth_ws.set_row(_r, 24); _r += 1
+            def _write_pair(label, content, height=None):
+                nonlocal _r
+                _meth_ws.write(_r, 0, label, _f_h2)
+                _meth_ws.merge_range(_r, 1, _r, 5, content, _f_body)
+                if height: _meth_ws.set_row(_r, height)
+                _r += 1
+            def _write_formula(label, formula, height=28):
+                nonlocal _r
+                _meth_ws.write(_r, 0, label, _f_h2)
+                _meth_ws.merge_range(_r, 1, _r, 5, formula, _f_form)
+                _meth_ws.set_row(_r, height); _r += 1
+
+            # ── Layer 1 ──
+            _write_section('Layer 1 — How much can the Sr. work this month?')
+            _write_formula('Formula', 'Total Work Hours = 7.5 hrs/day × workable_days_in_month')
+            _write_pair('Constants', '• 7.5 hrs/day = 8-hour shift minus 30-min break\n'
+                                     '• workable_days = Mon-Fri minus holidays', 45)
+            _write_pair('Example', '22-day month → 7.5 × 22 = 165 hours total')
+            _r += 1
+
+            # ── Layer 2 ──
+            _write_section('Layer 2 — How much time is "burned" on management overhead?')
+            _write_pair('Why', 'A Sr. doesn\'t spend 100% of their time on client work. They lose time to meetings, '
+                               'admin, 1:1s, coaching, and reviewing their direct reports\' work.', 30)
+            _write_formula('Formula',
+                'Ops Rhythm Hours = (35 + 1.5 × Direct_Reports) × Day_Scale\n'
+                'Day_Scale = workable_days / 20  (20 = reference month)', 42)
+            _write_pair('Constants',
+                '• 35 hrs/month fixed = baseline admin / standups / planning\n'
+                '• 1.5 hrs/month per direct report = 1:1s, reviews, coaching\n'
+                '• Day_Scale adjusts proportionally for shorter or longer months', 60)
+            _write_pair('Example', 'Sr. with 8 direct reports in a 22-day month → '
+                                   '(35 + 1.5×8) × (22/20) = 47 × 1.10 = 51.7 hrs Ops Rhythm', 30)
+            _r += 1
+
+            # ── Layer 3 ──
+            _write_section('Layer 3 — Productive Capacity (what\'s actually left)')
+            _write_formula('Formula', 'Productive Capacity = max(0, Total Work Hours − Ops Rhythm Hours)')
+            _write_pair('Meaning', 'The Sr.\'s true ceiling for client work after management overhead.', 28)
+            _write_pair('Example', '165 − 51.7 = 113.3 productive hours available')
+            _r += 1
+
+            # ── Layer 4 ──
+            _write_section('Layer 4 — What are they actually doing?')
+            _write_pair('Source', 'The model looks at the volume file and sums:\n'
+                                  '• Capacity Processing Hours where Sr. = processor\n'
+                                  '• Capacity Reviewing Hours where Sr. = reviewer', 60)
+            _write_pair('Share weighting', 'If a client is shared between multiple Srs, hours are weighted (1 / n_srs) '
+                                           'to avoid double-counting.', 30)
+            _write_formula('Formula',
+                'Productive Hours = Σ (Hours where Sr. = processor OR reviewer, weighted by sharing)', 28)
+            _r += 1
+
+            # ── Final calc & Status ──
+            _write_section('Final Calculation & Status')
+            _write_formula('Formula',
+                'Remaining Hours = Productive Capacity − Productive Hours\n'
+                '% Remaining     = (Remaining / Productive Capacity) × 100', 42)
+            _meth_ws.write(_r, 0, 'Status thresholds', _f_h2); _r += 1
+            for h, val in [('% Remaining', 'Status', 'Meaning'),
+                           ('> +7%', '🟢 Available', 'Has free capacity, can take more'),
+                           ('−7% to +7%', '✅ On Track', 'Well balanced'),
+                           ('< −7%', '🔴 Potential Burnout', 'Overloaded, risk')][:1]:
+                _meth_ws.write_row(_r, 1, h, _f_tbl_h); _r += 1
+            for vals in [('> +7%', '🟢 Available', 'Has free capacity, can take more'),
+                         ('−7% to +7%', '✅ On Track', 'Well balanced'),
+                         ('< −7%', '🔴 Potential Burnout', 'Overloaded, risk')]:
+                _meth_ws.write(_r, 1, vals[0], _f_tbl)
+                _meth_ws.write(_r, 2, vals[1], _f_tbl)
+                _meth_ws.merge_range(_r, 3, _r, 5, vals[2], _f_tbl_l)
+                _r += 1
+            _r += 1
+
+            # ── Direct Reports & Clients health checks ──
+            _write_section('Bonus — Direct Reports & Clients Health Check')
+            _meth_ws.write_row(_r, 1, ['Range', 'Direct Reports', 'Clients Assigned'], _f_tbl_h); _r += 1
+            for vals in [('✅', '7–9', '3–5'),
+                         ('⬇️', '< 7 (under-managed)', '< 3 (under-utilized)'),
+                         ('⬆️', '> 9 (over-managed)', '> 5 (over-loaded)')]:
+                _meth_ws.write(_r, 1, vals[0], _f_tbl)
+                _meth_ws.write(_r, 2, vals[1], _f_tbl_l)
+                _meth_ws.merge_range(_r, 3, _r, 5, vals[2], _f_tbl_l)
+                _r += 1
+            _r += 1
+
+            # ── Examples ──
+            _write_section('🎯 Three Examples — 22 working days month')
+
+            _meth_ws.write(_r, 0, '🔴 María — Overloaded, burnout risk', _f_red); _r += 1
+            _meth_ws.merge_range(_r, 0, _r, 5,
+                'Direct Reports = 11   ·   Productive Hours = 145\n'
+                'Total Work = 7.5 × 22 = 165 · Day Scale = 1.10 · Ops = (35 + 1.5×11) × 1.10 = 56.7\n'
+                'Productive Capacity = 165 − 56.7 = 108.3 · Remaining = 108.3 − 145 = -36.7 (−33.9%)\n'
+                '→ Status: 🔴 Potential Burnout · DRs: ⬆️ (>9)', _f_form)
+            _meth_ws.set_row(_r, 75); _r += 2
+
+            _meth_ws.write(_r, 0, '✅ Juan — Well balanced, on track', _f_blu); _r += 1
+            _meth_ws.merge_range(_r, 0, _r, 5,
+                'Direct Reports = 8   ·   Productive Hours = 105\n'
+                'Total Work = 7.5 × 22 = 165 · Day Scale = 1.10 · Ops = (35 + 1.5×8) × 1.10 = 51.7\n'
+                'Productive Capacity = 165 − 51.7 = 113.3 · Remaining = 113.3 − 105 = 8.3 (+7.3%)\n'
+                '→ Status: ✅ On Track · DRs: ✅ (7–9)', _f_form)
+            _meth_ws.set_row(_r, 75); _r += 2
+
+            _meth_ws.write(_r, 0, '🟢 Carla — Available, room to grow', _f_grn); _r += 1
+            _meth_ws.merge_range(_r, 0, _r, 5,
+                'Direct Reports = 6   ·   Productive Hours = 65\n'
+                'Total Work = 7.5 × 22 = 165 · Day Scale = 1.10 · Ops = (35 + 1.5×6) × 1.10 = 48.4\n'
+                'Productive Capacity = 165 − 48.4 = 116.6 · Remaining = 116.6 − 65 = 51.6 (+44.2%)\n'
+                '→ Status: 🟢 Available · DRs: ⬇️ (<7)', _f_form)
+            _meth_ws.set_row(_r, 75); _r += 2
+
+            # ── Side-by-side ──
+            _write_section('Side-by-Side Comparison')
+            _meth_ws.write_row(_r, 0, ['Metric', '🔴 María', '✅ Juan', '🟢 Carla'], _f_tbl_h); _r += 1
+            for vals in [('Direct Reports', '11 ⬆️', '8 ✅', '6 ⬇️'),
+                         ('Total Work Hours', '165.0', '165.0', '165.0'),
+                         ('Ops Rhythm Hours', '56.7', '51.7', '48.4'),
+                         ('Productive Capacity', '108.3', '113.3', '116.6'),
+                         ('Productive Hours (consumed)', '145.0', '105.0', '65.0'),
+                         ('Remaining Hours', '−36.7', '+8.3', '+51.6'),
+                         ('% Remaining', '−33.9%', '+7.3%', '+44.2%'),
+                         ('Status', '🔴 Burnout', '✅ On Track', '🟢 Available')]:
+                _meth_ws.write(_r, 0, vals[0], _f_tbl_l)
+                _meth_ws.write(_r, 1, vals[1], _f_tbl)
+                _meth_ws.write(_r, 2, vals[2], _f_tbl)
+                _meth_ws.write(_r, 3, vals[3], _f_tbl)
+                _r += 1
+            _meth_ws.freeze_panes(2, 0)
+            _meth_ws.set_tab_color('#FFC000')   # yellow (Sr. family)
+
+            # WF_POD sheets — waterfall + HC + filtered sections per POD
             _wf_pods_exp = st.session_state.get('_wf_pod_all_export', {})
             _hc_pod_role_df = _hc_xp.get('by_pod_role', pd.DataFrame()) if _hc_xp else pd.DataFrame()
             _hc_detail_df   = _hc_xp.get('detail',      pd.DataFrame()) if _hc_xp else pd.DataFrame()
+            _emp_level_df   = st.session_state.get('_s3_emp_level_df', pd.DataFrame())
             _pod_sections = [
                 ('HC Summary',           _hc_pod_role_df),
                 ('HC Detail',            _hc_detail_df),
+                ('Employee Level',       _emp_level_df),
                 ('Summary by POD',       _pod_summary_df),
                 ('Sr. Ratios',           _sr_df_x),
                 ('POD x Sr. Accountant', _cli_pod_sr),
@@ -9778,13 +9946,26 @@ if "calc_data" in st.session_state:
                 ('Client FTEs by Month', _cli_fte_df),
                 ('Client MRR',           _cmrr_exp),
             ]
+            _link_fmt = writer.book.add_format({
+                'font_color': '#0563C1', 'bold': True, 'underline': 1,
+                'font_size': 11, 'bg_color': '#FFF2CC', 'align': 'left',
+                'valign': 'vcenter', 'border': 1, 'border_color': '#BFBFBF',
+            })
             for _pn_exp, _df_pw_exp in sorted(_wf_pods_exp.items()):
                 if _df_pw_exp.empty:
                     continue
                 _sn_exp = _xl_sheet(_pn_exp, 'WF_')
-                _df_pw_exp.to_excel(writer, sheet_name=_sn_exp, startrow=0)
+                _df_pw_exp.to_excel(writer, sheet_name=_sn_exp, startrow=2)
                 _ws_exp = writer.sheets[_sn_exp]
-                _row_exp = len(_df_pw_exp) + 3  # header row + data rows + 1 blank
+                # Methodology link at the top of every WF_POD
+                _ws_exp.merge_range(0, 0, 0, max(1, _df_pw_exp.shape[1]),
+                    "📖 How Sr. Ratios are calculated — click here to read methodology",
+                    _link_fmt)
+                _ws_exp.write_url(0, 0, "internal:'Sr_Ratios_Methodology'!A1",
+                    string="📖 How Sr. Ratios are calculated — click here to read methodology",
+                    cell_format=_link_fmt)
+                _ws_exp.set_row(0, 26)
+                _row_exp = len(_df_pw_exp) + 5  # link row + blank + header + data + 1 blank
                 for _sec_title, _sec_df in _pod_sections:
                     if _sec_df is None or (hasattr(_sec_df, 'empty') and _sec_df.empty):
                         continue
