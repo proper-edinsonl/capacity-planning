@@ -12,7 +12,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 
 # --- APP VERSION ---
-APP_VERSION = "v6.4.2026.3.07PM"
+APP_VERSION = "v6.5.2026.4.18PM"
 
 def _lc_short_m0(gl_series):
     """Bool array: True if Go Live month has < 15 working days remaining (< 3 weeks)."""
@@ -2334,6 +2334,54 @@ def _process_hc_report(file_bytes: bytes):
         by_sr_norm[_norm_name(_sn)] = _sr_data
         by_sr_email[_email]         = _sr_data
 
+    # ── Assistant Managers → direct reports (parallel structure to Sr.) ────────
+    _am_jt_lower = active_pods['Job title'].astype(str).str.lower().str.strip()
+    _am_staff    = active_pods[_am_jt_lower.str.contains('assistant manager', na=False)]
+    _am_email_map = {
+        str(r['Work Email']).strip().lower(): str(r['Full name']).strip()
+        for _, r in _am_staff.iterrows()
+        if str(r.get('Work Email', '')).strip()
+    }
+    _am_email_set = set(_am_email_map.keys())
+    _am_dr_mask = _all_active_cap['_mgr_email_norm'].isin(_am_email_set)
+    _am_dr_df   = _all_active_cap[_am_dr_mask].copy()
+    by_am_email = {}
+    for _email, _nm in _am_email_map.items():
+        _rpts     = _am_dr_df[_am_dr_df['_mgr_email_norm'] == _email]
+        _dr_total = int((_rpts['Capacity Role'] != 'Other').sum())
+        _own_row  = _am_staff[_am_staff['Work Email'].astype(str).str.strip().str.lower() == _email]
+        _am_start = pd.to_datetime(
+            _own_row['Start Date'].iloc[0] if not _own_row.empty and 'Start Date' in _own_row.columns else pd.NaT,
+            errors='coerce'
+        )
+        _am_pod_v = str(_own_row['POD'].iloc[0]) if not _own_row.empty else ''
+        by_am_email[_email] = {
+            'name':       _nm,
+            'dr_total':   _dr_total,
+            'email':      _email,
+            'start_date': _am_start,
+            'pod':        _am_pod_v,
+        }
+
+    # ── General Accountants → no direct reports, just identity + start date ────
+    _ga_jt_lower = active_pods['Job title'].astype(str).str.lower().str.strip()
+    _ga_staff    = active_pods[_ga_jt_lower.str.contains('general accountant', na=False)]
+    by_ga_email = {}
+    for _, _r in _ga_staff.iterrows():
+        _email = str(_r.get('Work Email', '')).strip().lower()
+        if not _email or _email in ('nan', 'none'):
+            continue
+        _nm = str(_r.get('Full name', '')).strip()
+        _ga_start = pd.to_datetime(_r.get('Start Date', pd.NaT), errors='coerce')
+        _ga_pod   = str(_r.get('POD', '')).strip()
+        by_ga_email[_email] = {
+            'name':       _nm,
+            'dr_total':   0,           # GAs do not manage anyone
+            'email':      _email,
+            'start_date': _ga_start,
+            'pod':        _ga_pod,
+        }
+
     # ── Attrited (non-active) employees — kept so the Employee Level tab
     # can surface them with a "<role> Att" suffix, indicating they are no
     # longer productively available. We only include people who had a POD
@@ -2364,6 +2412,8 @@ def _process_hc_report(file_bytes: bytes):
         'by_sr':          by_sr,
         'by_sr_norm':     by_sr_norm,
         'by_sr_email':    by_sr_email,
+        'by_am_email':    by_am_email,    # Assistant Managers (with DR count)
+        'by_ga_email':    by_ga_email,    # General Accountants (dr_total = 0)
         'total':          total,
         'acct_managers':  n_acct_mgr,
         'asst_managers':  n_asst_mgr,
@@ -2962,7 +3012,7 @@ def _apply_pro_formatting(xlsx_bytes: bytes) -> bytes:
             'util %': '0.0"%"', 'util': '0.0"%"',
             '% remaining': '0.0"%"', 'productivity': '0.0"%"',
         },
-        'Sr_Ratios': {'% remaining': '0.0"%"', '% remaining (mec)': '0.0"%"'},
+        'Client_Management_Hrs': {'% remaining': '0.0"%"', '% remaining (mec)': '0.0"%"'},
         'Client_MRR': {'ALL_MONTH_AS_DOLLAR': True, 'mrr (base)': '$#,##0'},
     }
 
@@ -2983,7 +3033,7 @@ def _apply_pro_formatting(xlsx_bytes: bytes) -> bytes:
         'General_Summary': 'B2', 'Summary_by_POD': 'C2',
         'POD_x_SrAccountant': 'D2', 'Client_Role_Detail': 'F2',
         'Baseline_Audit': 'E2', 'Employee_Level': 'C2',
-        'Sr_Ratios': 'C2', 'Client_FTEs_by_Month': 'E2',
+        'Client_Management_Hrs': 'D2', 'Client_FTEs_by_Month': 'E2',
         'Client_MRR': 'D2', 'Client_Mapping': 'B2',
     }
     TAB_MAP = {
@@ -2994,7 +3044,7 @@ def _apply_pro_formatting(xlsx_bytes: bytes) -> bytes:
         'Summary_by_POD': TAB_COLORS['pod'],
         'POD_x_SrAccountant': TAB_COLORS['pod'],
         'Sr_Accountant_Waterfalls': TAB_COLORS['sr'],
-        'Sr_Ratios': TAB_COLORS['sr'],
+        'Client_Management_Hrs': TAB_COLORS['sr'],
         'Client_Role_Detail': TAB_COLORS['client'],
         'Client_FTEs_by_Month': TAB_COLORS['client'],
         'Client_MRR': TAB_COLORS['client'],
@@ -3004,7 +3054,7 @@ def _apply_pro_formatting(xlsx_bytes: bytes) -> bytes:
     }
     TABULAR = {
         'Summary_by_POD', 'POD_x_SrAccountant', 'Client_Role_Detail',
-        'Baseline_Audit', 'Employee_Level', 'Sr_Ratios',
+        'Baseline_Audit', 'Employee_Level', 'Client_Management_Hrs',
         'Client_FTEs_by_Month', 'Client_MRR', 'Client_Mapping',
         'General_Summary', 'MRR_Forecast', 'MRR_Growth_Settings',
     }
@@ -6882,57 +6932,73 @@ if "calc_data" in st.session_state:
                     _piva = _cpa.groupby(['_sr', '_ty'])['_h'].sum().unstack(fill_value=0.0)
                     _sr_auto_mec   = _piva.get('MEC',   pd.Series(dtype=float)).to_dict()
                     _sr_auto_other = _piva.get('OTHER', pd.Series(dtype=float)).to_dict()
-            # Build rows
+            # "With clients" filter: AM/GA only included if their email appears in srs map
+            _srs_rid_map_a = st.session_state.get('_srs_rid_email_map', {}) or {}
+            _with_clients_emails_a = set(str(v).strip().lower() for v in _srs_rid_map_a.values() if '@' in str(v))
+            # Client count fallback for AM/GA emails not in cli_cnt_by_email
+            _all_role_cli_a = dict(_sr_auto_cli_cnt)
+            for _hid, _em in _srs_rid_map_a.items():
+                _ek = str(_em).strip().lower()
+                if _ek and '@' in _ek and _ek not in _all_role_cli_a:
+                    _all_role_cli_a[_ek] = sum(
+                        1 for _h2, _e2 in _srs_rid_map_a.items()
+                        if str(_e2).strip().lower() == _ek
+                    )
+            def _ast(p):
+                if p > _THRESHOLD_PCT_A:   return '🟢 Available'
+                if p >= -_THRESHOLD_PCT_A: return '✅ On Track'
+                return '🔴 Potential Burnout'
+            _role_sources_a = [
+                ('Sr. Accountant',     _sr_auto_hc.get('by_sr_email', {}) or {}, True),
+                ('Assistant Manager',  _sr_auto_hc.get('by_am_email', {}) or {}, True),
+                ('General Accountant', _sr_auto_hc.get('by_ga_email', {}) or {}, False),
+            ]
             _sr_auto_rows = []
-            for _sea, _sia in _sr_auto_hc.get('by_sr_email', {}).items():
-                _drc  = int(_sia.get('dr_total', 0))
-                _podv = str(_sia.get('pod', ''))
-                _sdt  = _sia.get('start_date', pd.NaT)
-                _clic = int(_sr_auto_cli_cnt.get(_sea, 0))
-                _prh  = float(_sr_auto_prod_hrs.get(_sea, 0.0))
-                _sc   = _sr_auto_net_days / _SR_OPS_BASE_DAYS_A
-                _oph  = (_SR_OPS_FIXED_MONTHLY_A + _SR_OPS_VAR_PER_DR_A * _drc) * _sc
-                _toh  = _SR_HRS_PER_DAY_A * _sr_auto_net_days
-                _cph  = max(_toh - _oph, 0.0)        # kept for display only
-                # Remaining = Total Work - Productive Hours - Ops Rhythm  (direct formula)
-                _rmh  = _toh - _prh - _oph
-                _pct  = (_rmh / _toh * 100) if _toh > 0 else 0.0
-                _clih = float(_sr_auto_mec.get(_sea, 0.0)) + float(_sr_auto_other.get(_sea, 0.0))
-                # Remaining (MEC) = Total Work - MEC&Other - Ops Rhythm
-                _rmmc = _toh - _clih - _oph
-                _pctm = (_rmmc / _toh * 100) if _toh > 0 else 0.0
-                def _ast(p):
-                    if p > _THRESHOLD_PCT_A:   return '🟢 Available'
-                    if p >= -_THRESHOLD_PCT_A: return '✅ On Track'
-                    return '🔴 Potential Burnout'
-                _drf  = '✅' if _DR_MIN_A  <= _drc  <= _DR_MAX_A  else ('⬇️' if _drc  < _DR_MIN_A  else '⬆️')
-                _clf  = '✅' if _CLI_MIN_A <= _clic <= _CLI_MAX_A else ('⬇️' if _clic < _CLI_MIN_A else '⬆️')
-                try:
-                    _ten = str(_sia.get('start_date', ''))[:10]
-                except Exception:
-                    _ten = '—'
-                _sr_auto_rows.append({
-                    'POD':                               _podv,
-                    'Sr. Accountant':                    _sea,
-                    'Hire Date':                         pd.Timestamp(_sdt).strftime('%Y-%m-%d') if pd.notna(_sdt) else '—',
-                    'Direct Reports':                    f"{_drc} {_drf}",
-                    'Clients Assigned':                  f"{_clic} {_clf}",
-                    'Productive Hrs':                    round(_prh, 1),
-                    'Total Work Hours':                  round(_toh, 1),
-                    'Ops Rhythm Hrs':                    round(_oph, 1),
-                    'Productive Capacity (After Ops R)': round(_cph, 1),
-                    'Remaining Hrs':                     round(_rmh, 1),
-                    '% Remaining':                       round(_pct, 1),
-                    'Status':                            _ast(_pct),
-                    'MEC & Other Client Hrs':            round(_clih, 1),
-                    'Remaining Hrs (MEC)':               round(_rmmc, 1),
-                    '% Remaining (MEC)':                 round(_pctm, 1),
-                    'Status (MEC)':                      _ast(_pctm),
-                })
+            for _role_lbl_a, _src_map_a, _apply_ops_a in _role_sources_a:
+                for _sea, _sia in _src_map_a.items():
+                    _eml_n = str(_sea).strip().lower()
+                    if _role_lbl_a != 'Sr. Accountant' and _eml_n not in _with_clients_emails_a:
+                        continue
+                    _drc  = int(_sia.get('dr_total', 0))
+                    _podv = str(_sia.get('pod', ''))
+                    _sdt  = _sia.get('start_date', pd.NaT)
+                    _clic = int(_all_role_cli_a.get(_eml_n, 0))
+                    _prh  = float(_sr_auto_prod_hrs.get(_eml_n, 0.0))
+                    _sc   = _sr_auto_net_days / _SR_OPS_BASE_DAYS_A
+                    _oph  = ((_SR_OPS_FIXED_MONTHLY_A + _SR_OPS_VAR_PER_DR_A * _drc) * _sc) if _apply_ops_a else 0.0
+                    _toh  = _SR_HRS_PER_DAY_A * _sr_auto_net_days
+                    _cph  = max(_toh - _oph, 0.0)
+                    _rmh  = _toh - _prh - _oph
+                    _pct  = (_rmh / _toh * 100) if _toh > 0 else 0.0
+                    _clih = float(_sr_auto_mec.get(_eml_n, 0.0)) + float(_sr_auto_other.get(_eml_n, 0.0))
+                    _rmmc = _toh - _clih - _oph
+                    _pctm = (_rmmc / _toh * 100) if _toh > 0 else 0.0
+                    _drf  = '✅' if _DR_MIN_A  <= _drc  <= _DR_MAX_A  else ('⬇️' if _drc  < _DR_MIN_A  else '⬆️')
+                    _clf  = '✅' if _CLI_MIN_A <= _clic <= _CLI_MAX_A else ('⬇️' if _clic < _CLI_MIN_A else '⬆️')
+                    _dr_display_a = '—' if not _apply_ops_a else f"{_drc} {_drf}"
+                    _sr_auto_rows.append({
+                        'POD':                               _podv,
+                        'Role':                              _role_lbl_a,
+                        'Email':                             _eml_n,
+                        'Hire Date':                         pd.Timestamp(_sdt).strftime('%Y-%m-%d') if pd.notna(_sdt) else '—',
+                        'Direct Reports':                    _dr_display_a,
+                        'Clients Assigned':                  f"{_clic} {_clf}",
+                        'Productive Hrs':                    round(_prh, 1),
+                        'Total Work Hours':                  round(_toh, 1),
+                        'Ops Rhythm Hrs':                    round(_oph, 1),
+                        'Productive Capacity (After Ops R)': round(_cph, 1),
+                        'Remaining Hrs':                     round(_rmh, 1),
+                        '% Remaining':                       round(_pct, 1),
+                        'Status':                            _ast(_pct),
+                        'MEC & Other Client Hrs':            round(_clih, 1),
+                        'Remaining Hrs (MEC)':               round(_rmmc, 1),
+                        '% Remaining (MEC)':                 round(_pctm, 1),
+                        'Status (MEC)':                      _ast(_pctm),
+                    })
             if _sr_auto_rows:
                 st.session_state['_s3_sr_ratios_df'] = (
                     pd.DataFrame(_sr_auto_rows)
-                    .sort_values(['POD', 'Sr. Accountant'])
+                    .sort_values(['POD', 'Role', 'Email'])
                     .reset_index(drop=True)
                 )
 
@@ -6990,7 +7056,7 @@ if "calc_data" in st.session_state:
             "💰 Client MRR by Month",
             "🔬 Baseline Audit",
             "👤 Employee Level",
-            "👩‍💼 Sr. Ratios",
+            "📊 Client Management Hrs",
         ]
         _s3_tab_prev = st.session_state.get('_s3_tab_jump_prev')
         _s3_tab_sel  = st.selectbox(
@@ -7026,7 +7092,7 @@ if "calc_data" in st.session_state:
             "💰 Client MRR by Month",
             "🔬 Baseline Audit",
             "👤 Employee Level",
-            "👩‍💼 Sr. Ratios",
+            "📊 Client Management Hrs",
         ])
 
         # Column configs for monetary/FTE columns in the general dashboard
@@ -9472,13 +9538,15 @@ if "calc_data" in st.session_state:
             _el_df_exp = st.session_state.get('_s3_emp_level_df', pd.DataFrame())
             if not _el_df_exp.empty:
                 _el_df_exp.to_excel(writer, index=False, sheet_name='Employee_Level')
-            # Tab 8: Sr. Ratios — computed inline so it's always fresh (no tab visit required)
+            # Tab 8: Client Management Hrs — computed inline so it's always fresh
+            # Covers 3 roles: Sr. Accountant, Assistant Manager, General Accountant
+            # (only those "with clients" = email appears in srs sheet)
             _sr_df_x = pd.DataFrame()
             _sr_hc_exp  = st.session_state.get('hc_data', None)
             _sr_wday_exp = st.session_state.get('calc_data', {}).get('dict_workable_days', {})
             if _sr_hc_exp and _sr_wday_exp:
                 _SR_OPS_FIXED_X = 35.0;  _SR_OPS_VAR_X = 1.5
-                _SR_HRS_DAY_X   = 7.5;   _SR_BASE_DAYS_X = 20;  _SR_THRESH_X = 7.0   # 7.5 = 8h shift − 30 min break
+                _SR_HRS_DAY_X   = 7.5;   _SR_BASE_DAYS_X = 20;  _SR_THRESH_X = 7.0
                 _DR_MIN_X, _DR_MAX_X   = 7, 9
                 _CLI_MIN_X, _CLI_MAX_X = 3, 5
                 _sr_mi_x     = st.session_state.get('_sr_ratios_month', None)
@@ -9487,7 +9555,9 @@ if "calc_data" in st.session_state:
                 _sr_ndays_x  = _sr_wday_exp.get(_sr_mi_idx_x, 20)
                 _df_cx    = st.session_state.get('df_clean', pd.DataFrame())
                 _srs_rd_x = st.session_state.get('_srs_ratios_data', {})
-                # ── Client count: srs sheet (authoritative) or df_clean FSD fallback ──
+                _srs_rid_map_x = st.session_state.get('_srs_rid_email_map', {}) or {}
+                _with_clients_emails = set(str(v).strip().lower() for v in _srs_rid_map_x.values() if '@' in str(v))
+                # ── Client count by email: srs sheet (authoritative) or df_clean FSD fallback ──
                 if _srs_rd_x.get('cli_cnt_by_email'):
                     _sr_cli_x = dict(_srs_rd_x['cli_cnt_by_email'])
                 else:
@@ -9503,6 +9573,15 @@ if "calc_data" in st.session_state:
                         _sr_col_x  = _active_cx['Sr. Accountant'].astype(str).str.lower().str.strip()
                         _norm_x    = _sr_col_x.apply(lambda v: _n2e_x.get(v, v) if '@' not in v else v)
                         _sr_cli_x  = _active_cx.groupby(_norm_x)['client_name'].nunique().to_dict()
+                # ── Client count for AMs & GAs: count assignments in srs map ──
+                _all_role_cli_cnt = dict(_sr_cli_x)
+                for _hid, _em in _srs_rid_map_x.items():
+                    _ek = str(_em).strip().lower()
+                    if _ek and '@' in _ek and _ek not in _all_role_cli_cnt:
+                        _all_role_cli_cnt[_ek] = sum(
+                            1 for _h2, _e2 in _srs_rid_map_x.items()
+                            if str(_e2).strip().lower() == _ek
+                        )
                 # ── Apply share weights to hours (shared-client math, zero-div safe) ──
                 _sw_rid_x  = _srs_rd_x.get('share_weight_rid',  {})
                 _sw_name_x = _srs_rd_x.get('share_weight_name', {})
@@ -9523,6 +9602,7 @@ if "calc_data" in st.session_state:
                                 pd.to_numeric(_df_cxw[_hcol_x], errors='coerce').fillna(0.0)
                                 * _df_cxw['_w']
                             )
+                # Productive hours per email (sum where they are processor + reviewer)
                 _sr_prh_x = {}
                 if ('processor' in _df_cxw.columns and 'Capacity Processing Hours' in _df_cxw.columns
                         and 'reviewer' in _df_cxw.columns and 'Capacity reviewing hours' in _df_cxw.columns):
@@ -9530,68 +9610,92 @@ if "calc_data" in st.session_state:
                     _rm_x = _df_cxw.groupby(_df_cxw['reviewer'].astype(str).str.lower().str.strip())['Capacity reviewing hours'].sum().to_dict()
                     for _ex in set(_pm_x) | set(_rm_x):
                         _sr_prh_x[_ex] = float(_pm_x.get(_ex, 0.0)) + float(_rm_x.get(_ex, 0.0))
-                _sr_mec_x, _sr_oth_x = {}, {}
-                _need_x = ['Ideal Proc', 'Ideal Rev', 'Capacity Processing Hours', 'Capacity reviewing hours', 'type', 'Sr. Accountant']
-                if not _df_cxw.empty and all(c in _df_cxw.columns for c in _need_x):
-                    _sk_x  = _df_cxw['Sr. Accountant'].astype(str).str.lower().str.strip()
-                    _ip_x  = _df_cxw['Ideal Proc'].astype(str).str.strip()
-                    _ir_x  = _df_cxw['Ideal Rev'].astype(str).str.strip()
-                    _ty_x  = _df_cxw['type'].astype(str).str.strip().str.upper()
-                    _ph_x  = pd.to_numeric(_df_cxw['Capacity Processing Hours'], errors='coerce').fillna(0.0)
-                    _rh_x  = pd.to_numeric(_df_cxw['Capacity reviewing hours'],  errors='coerce').fillna(0.0)
-                    _cp_x  = pd.concat([
-                        pd.DataFrame({'_sr': _sk_x[_ip_x=='Sr. Accountant'], '_ty': _ty_x[_ip_x=='Sr. Accountant'], '_h': _ph_x[_ip_x=='Sr. Accountant']}),
-                        pd.DataFrame({'_sr': _sk_x[_ir_x=='Sr. Accountant'], '_ty': _ty_x[_ir_x=='Sr. Accountant'], '_h': _rh_x[_ir_x=='Sr. Accountant']}),
+                # MEC & OTHER hours per email by IDEAL role (Sr/AM/GA)
+                # For each role, sum hours where Ideal Proc/Rev == role AND type in (MEC, OTHER)
+                def _mec_other_by_role(ideal_role):
+                    _mec, _oth = {}, {}
+                    _need = ['Ideal Proc', 'Ideal Rev', 'Capacity Processing Hours',
+                             'Capacity reviewing hours', 'type', ideal_role]
+                    if _df_cxw.empty or not all(c in _df_cxw.columns for c in _need):
+                        return _mec, _oth
+                    _sk = _df_cxw[ideal_role].astype(str).str.lower().str.strip()
+                    _ip = _df_cxw['Ideal Proc'].astype(str).str.strip()
+                    _ir = _df_cxw['Ideal Rev'].astype(str).str.strip()
+                    _ty = _df_cxw['type'].astype(str).str.strip().str.upper()
+                    _ph = pd.to_numeric(_df_cxw['Capacity Processing Hours'], errors='coerce').fillna(0.0)
+                    _rh = pd.to_numeric(_df_cxw['Capacity reviewing hours'],  errors='coerce').fillna(0.0)
+                    _cp = pd.concat([
+                        pd.DataFrame({'_p': _sk[_ip==ideal_role], '_ty': _ty[_ip==ideal_role], '_h': _ph[_ip==ideal_role]}),
+                        pd.DataFrame({'_p': _sk[_ir==ideal_role], '_ty': _ty[_ir==ideal_role], '_h': _rh[_ir==ideal_role]}),
                     ], ignore_index=True)
-                    if not _cp_x.empty:
-                        _piv_x = _cp_x.groupby(['_sr','_ty'])['_h'].sum().unstack(fill_value=0.0)
-                        _sr_mec_x = _piv_x.get('MEC',   pd.Series(dtype=float)).to_dict()
-                        _sr_oth_x = _piv_x.get('OTHER', pd.Series(dtype=float)).to_dict()
+                    if not _cp.empty:
+                        _piv = _cp.groupby(['_p','_ty'])['_h'].sum().unstack(fill_value=0.0)
+                        _mec = _piv.get('MEC',   pd.Series(dtype=float)).to_dict()
+                        _oth = _piv.get('OTHER', pd.Series(dtype=float)).to_dict()
+                    return _mec, _oth
+                _sr_mec_x,  _sr_oth_x  = _mec_other_by_role('Sr. Accountant')
+                # AM uses Sr's MEC concept since "Asst. Manager" may not appear as ideal role
+                # (the col 'Sr. Accountant' in df_clean holds the assigned email; for AMs/GAs same data path)
+                _am_mec_x,  _am_oth_x  = _sr_mec_x,  _sr_oth_x   # AMs share the same MEC pool by email
+                _ga_mec_x,  _ga_oth_x  = _sr_mec_x,  _sr_oth_x   # GAs idem (MEC pool keyed by email)
                 def _ast_x(p):
                     if p > _SR_THRESH_X:   return '🟢 Available'
                     if p >= -_SR_THRESH_X: return '✅ On Track'
                     return '🔴 Potential Burnout'
                 _sr_rows_x = []
-                for _sea_x, _sia_x in _sr_hc_exp.get('by_sr_email', {}).items():
-                    _drc_x = int(_sia_x.get('dr_total', 0))
-                    _sdt_x = _sia_x.get('start_date', pd.NaT)
-                    _sc_x  = _sr_ndays_x / _SR_BASE_DAYS_X
-                    _oph_x = (_SR_OPS_FIXED_X + _SR_OPS_VAR_X * _drc_x) * _sc_x
-                    _toh_x = _SR_HRS_DAY_X * _sr_ndays_x
-                    _cph_x = max(_toh_x - _oph_x, 0.0)   # kept for display only
-                    _prh_v = float(_sr_prh_x.get(_sea_x, 0.0))
-                    # Remaining = Total Work - Productive Hours - Ops Rhythm  (direct formula)
-                    _rmh_x = _toh_x - _prh_v - _oph_x
-                    _pct_x = (_rmh_x / _toh_x * 100) if _toh_x > 0 else 0.0
-                    _clh_x = float(_sr_mec_x.get(_sea_x, 0.0)) + float(_sr_oth_x.get(_sea_x, 0.0))
-                    # Remaining (MEC) = Total Work - MEC&Other - Ops Rhythm
-                    _rmm_x = _toh_x - _clh_x - _oph_x
-                    _ptm_x = (_rmm_x / _toh_x * 100) if _toh_x > 0 else 0.0
-                    _cli_c = int(_sr_cli_x.get(_sea_x, 0))
-                    _drf_x = '✅' if _DR_MIN_X  <= _drc_x  <= _DR_MAX_X  else ('⬇️' if _drc_x  < _DR_MIN_X  else '⬆️')
-                    _clf_x = '✅' if _CLI_MIN_X <= _cli_c <= _CLI_MAX_X else ('⬇️' if _cli_c < _CLI_MIN_X else '⬆️')
-                    _sr_rows_x.append({
-                        'POD':                               str(_sia_x.get('pod', '')),
-                        'Sr. Accountant':                    _sea_x,
-                        'Period':                            meses_proyeccion[_sr_mi_idx_x],
-                        'Hire Date':                         pd.Timestamp(_sdt_x).strftime('%Y-%m-%d') if pd.notna(_sdt_x) else '—',
-                        'Direct Reports':                    f"{_drc_x} {_drf_x}",
-                        'Clients Assigned':                  f"{_cli_c} {_clf_x}",
-                        'Productive Hrs':                    round(_prh_v, 1),
-                        'Total Work Hours':                  round(_toh_x, 1),
-                        'Ops Rhythm Hrs':                    round(_oph_x, 1),
-                        'Productive Capacity (After Ops R)': round(_cph_x, 1),
-                        'Remaining Hrs':                     round(_rmh_x, 1),
-                        '% Remaining':                       round(_pct_x, 1),
-                        'Status':                            _ast_x(_pct_x),
-                        'MEC & Other Client Hrs':            round(_clh_x, 1),
-                        'Remaining Hrs (MEC)':               round(_rmm_x, 1),
-                        '% Remaining (MEC)':                 round(_ptm_x, 1),
-                        'Status (MEC)':                      _ast_x(_ptm_x),
-                    })
+                # Build unified list: (role_label, email, info_dict, ops_formula_apply)
+                # ops_formula_apply=True → uses (35 + 1.5×DR); False → Ops = 0 (GA)
+                _role_sources = [
+                    ('Sr. Accountant',    _sr_hc_exp.get('by_sr_email', {}) or {}, True),
+                    ('Assistant Manager', _sr_hc_exp.get('by_am_email', {}) or {}, True),
+                    ('General Accountant', _sr_hc_exp.get('by_ga_email', {}) or {}, False),
+                ]
+                for _role_lbl, _src_map, _apply_ops in _role_sources:
+                    for _eml, _info in _src_map.items():
+                        _eml_n = str(_eml).strip().lower()
+                        # "with clients" filter (skip if not in srs map) — Srs are always included for back-compat
+                        if _role_lbl != 'Sr. Accountant' and _eml_n not in _with_clients_emails:
+                            continue
+                        _drc_x = int(_info.get('dr_total', 0))
+                        _sdt_x = _info.get('start_date', pd.NaT)
+                        _sc_x  = _sr_ndays_x / _SR_BASE_DAYS_X
+                        _oph_x = ((_SR_OPS_FIXED_X + _SR_OPS_VAR_X * _drc_x) * _sc_x) if _apply_ops else 0.0
+                        _toh_x = _SR_HRS_DAY_X * _sr_ndays_x
+                        _cph_x = max(_toh_x - _oph_x, 0.0)
+                        _prh_v = float(_sr_prh_x.get(_eml_n, 0.0))
+                        _rmh_x = _toh_x - _prh_v - _oph_x
+                        _pct_x = (_rmh_x / _toh_x * 100) if _toh_x > 0 else 0.0
+                        _clh_x = float(_sr_mec_x.get(_eml_n, 0.0)) + float(_sr_oth_x.get(_eml_n, 0.0))
+                        _rmm_x = _toh_x - _clh_x - _oph_x
+                        _ptm_x = (_rmm_x / _toh_x * 100) if _toh_x > 0 else 0.0
+                        _cli_c = int(_all_role_cli_cnt.get(_eml_n, 0))
+                        _drf_x = '✅' if _DR_MIN_X  <= _drc_x  <= _DR_MAX_X  else ('⬇️' if _drc_x  < _DR_MIN_X  else '⬆️')
+                        _clf_x = '✅' if _CLI_MIN_X <= _cli_c <= _CLI_MAX_X else ('⬇️' if _cli_c < _CLI_MIN_X else '⬆️')
+                        # GA has no DR by definition — show '—' instead of '⬇️ 0'
+                        _dr_display = '—' if not _apply_ops else f"{_drc_x} {_drf_x}"
+                        _sr_rows_x.append({
+                            'POD':                               str(_info.get('pod', '')),
+                            'Role':                              _role_lbl,
+                            'Email':                             _eml_n,
+                            'Period':                            meses_proyeccion[_sr_mi_idx_x],
+                            'Hire Date':                         pd.Timestamp(_sdt_x).strftime('%Y-%m-%d') if pd.notna(_sdt_x) else '—',
+                            'Direct Reports':                    _dr_display,
+                            'Clients Assigned':                  f"{_cli_c} {_clf_x}",
+                            'Productive Hrs':                    round(_prh_v, 1),
+                            'Total Work Hours':                  round(_toh_x, 1),
+                            'Ops Rhythm Hrs':                    round(_oph_x, 1),
+                            'Productive Capacity (After Ops R)': round(_cph_x, 1),
+                            'Remaining Hrs':                     round(_rmh_x, 1),
+                            '% Remaining':                       round(_pct_x, 1),
+                            'Status':                            _ast_x(_pct_x),
+                            'MEC & Other Client Hrs':            round(_clh_x, 1),
+                            'Remaining Hrs (MEC)':               round(_rmm_x, 1),
+                            '% Remaining (MEC)':                 round(_ptm_x, 1),
+                            'Status (MEC)':                      _ast_x(_ptm_x),
+                        })
                 if _sr_rows_x:
-                    _sr_df_x = pd.DataFrame(_sr_rows_x).sort_values(['POD', 'Sr. Accountant']).reset_index(drop=True)
-                    _sr_df_x.to_excel(writer, index=False, sheet_name='Sr_Ratios')
+                    _sr_df_x = pd.DataFrame(_sr_rows_x).sort_values(['POD', 'Role', 'Email']).reset_index(drop=True)
+                    _sr_df_x.to_excel(writer, index=False, sheet_name='Client_Management_Hrs')
                     st.session_state['_s3_sr_ratios_df'] = _sr_df_x.copy()
             # Tab 9: Client FTEs by Month — POD + Sr. + Client totals across all roles
             _cli_fte_df  = pd.DataFrame()
@@ -9768,8 +9872,8 @@ if "calc_data" in st.session_state:
                 f"sources [srs:{_cm_dbg['src_srs']} dc:{_cm_dbg['src_dc']} df_clean:{_cm_dbg['src_dfcl']} hs:{_cm_dbg['src_hs']}] · "
                 f"vol_bytes:{'yes' if _vol_bytes else 'NO'}"
             )
-            # Sr. Ratios Methodology — explanatory sheet (linked from every WF_POD)
-            _meth_ws = writer.book.add_worksheet('Sr_Ratios_Methodology')
+            # Client Management Hrs Methodology — explanatory sheet (linked from every WF_POD)
+            _meth_ws = writer.book.add_worksheet('Client_Mgmt_Methodology')
             _meth_book = writer.book
             _f_title = _meth_book.add_format({'bold': True, 'font_size': 16, 'font_color': '#1F3864', 'valign': 'vcenter'})
             _f_h1    = _meth_book.add_format({'bold': True, 'font_size': 13, 'font_color': '#FFFFFF', 'bg_color': '#1F3864',
@@ -9792,12 +9896,38 @@ if "calc_data" in st.session_state:
             _meth_ws.set_column('C:F', 18)
             _meth_ws.hide_gridlines(2)
             _rc = [0]   # mutable counter (nonlocal workaround for non-function scope)
-            _meth_ws.merge_range(_rc[0], 0, _rc[0], 5, '📊 How the Sr. Ratios Calculation Works', _f_title)
+            _meth_ws.merge_range(_rc[0], 0, _rc[0], 5, '📊 How the Client Management Hrs Calculation Works', _f_title)
             _meth_ws.set_row(_rc[0], 32); _rc[0] += 2
             _meth_ws.merge_range(_rc[0], 0, _rc[0], 5,
-                'The Sr. Ratios model answers a single question for every Sr. Accountant: '
-                '"Is this Sr. overloaded, balanced, or has free capacity this month?"', _f_body)
-            _meth_ws.set_row(_rc[0], 30); _rc[0] += 2
+                'The Client Management Hrs model answers a single question for any person with assigned clients '
+                '— Sr. Accountants, Assistant Managers, and General Accountants: '
+                '"Is this person overloaded, balanced, or has free capacity this month?"', _f_body)
+            _meth_ws.set_row(_rc[0], 45); _rc[0] += 2
+
+            # ── Roles covered ──
+            _write_section('Who is included — "with clients" filter')
+            _write_pair('Roles',
+                '• Sr. Accountants  (always included)\n'
+                '• Assistant Managers  (only if they appear as processor/reviewer in the srs sheet)\n'
+                '• General Accountants  (only if they appear as processor/reviewer in the srs sheet)', 60)
+            _write_pair('Source of "with clients"',
+                'The srs sheet inside the volume Excel file. Any email that appears there is treated as "with clients".', 28)
+            _rc[0] += 1
+
+            # ── Formula by role overview ──
+            _write_section('Formula by Role — Quick Reference')
+            _write_formula('Sr. Accountant & Assistant Manager',
+                'Total Work Hours = 7.5 × workable_days\n'
+                'Ops Rhythm       = (35 + 1.5 × Direct_Reports) × Day_Scale\n'
+                'Productive Hours = Σ Capacity Processing/Reviewing Hours (weighted, where person = processor/reviewer)\n'
+                'Remaining        = Total Work − Productive − Ops Rhythm', 70)
+            _write_formula('General Accountant',
+                'Total Work Hours = 7.5 × workable_days\n'
+                'Ops Rhythm       = 0   (GAs have no management overhead)\n'
+                'Productive Hours = Σ (Capacity Processing Hours where GA = processor)\n'
+                '                 + Σ (Capacity Reviewing  Hours where GA = reviewer)\n'
+                'Remaining        = Total Work − Productive', 75)
+            _rc[0] += 1
 
             def _write_section(title):
                 _meth_ws.merge_range(_rc[0], 0, _rc[0], 5, title, _f_h1)
@@ -9822,28 +9952,35 @@ if "calc_data" in st.session_state:
 
             # ── Layer 2 ──
             _write_section('Layer 2 — How much time is "burned" on management overhead?')
-            _write_pair('Why', 'A Sr. doesn\'t spend 100% of their time on client work. They lose time to meetings, '
-                               'admin, 1:1s, coaching, and reviewing their direct reports\' work.', 30)
-            _write_formula('Formula',
+            _write_pair('Why',
+                'Sr. Accountants and Assistant Managers don\'t spend 100% of their time on client work. '
+                'They lose time to meetings, admin, 1:1s, coaching, and reviewing their direct reports\' work. '
+                'General Accountants do NOT have this overhead — their Ops Rhythm = 0.', 75)
+            _write_formula('Sr / AM Formula',
                 'Ops Rhythm Hours = (35 + 1.5 × Direct_Reports) × Day_Scale\n'
                 'Day_Scale = workable_days / 20  (20 = reference month)', 42)
+            _write_formula('GA Formula', 'Ops Rhythm Hours = 0', 24)
             _write_pair('Constants',
                 '• 35 hrs/month fixed = baseline admin / standups / planning\n'
                 '• 1.5 hrs/month per direct report = 1:1s, reviews, coaching\n'
                 '• Day_Scale adjusts proportionally for shorter or longer months', 60)
-            _write_pair('Example', 'Sr. with 8 direct reports in a 22-day month → '
+            _write_pair('Example (Sr/AM)', 'Sr. with 8 direct reports in a 22-day month → '
                                    '(35 + 1.5×8) × (22/20) = 47 × 1.10 = 51.7 hrs Ops Rhythm', 30)
             _rc[0] += 1
 
             # ── Layer 3 ──
             _write_section('Layer 3 — What are they actually doing?')
             _write_pair('Source', 'The model looks at the volume file and sums:\n'
-                                  '• Capacity Processing Hours where Sr. = processor\n'
-                                  '• Capacity Reviewing Hours where Sr. = reviewer', 60)
-            _write_pair('Share weighting', 'If a client is shared between multiple Srs, hours are weighted (1 / n_srs) '
-                                           'to avoid double-counting.', 30)
-            _write_formula('Formula',
-                'Productive Hours = Σ (Hours where Sr. = processor OR reviewer, weighted by sharing)', 28)
+                                  '• Capacity Processing Hours where person = processor\n'
+                                  '• Capacity Reviewing  Hours where person = reviewer', 60)
+            _write_pair('Share weighting',
+                'If a client is shared between multiple people, hours are weighted (1 / n_assignments) to avoid '
+                'double-counting. Applied uniformly across Sr, AM, and GA.', 45)
+            _write_pair('Note — GA mapping',
+                'For GAs, "In Progress hours" maps to Capacity Processing Hours, and '
+                '"In QA hours" maps to Capacity Reviewing Hours.', 35)
+            _write_formula('Formula (all roles)',
+                'Productive Hours = Σ (Hours where person = processor OR reviewer, weighted by sharing)', 28)
             _rc[0] += 1
 
             # ── Final calc & Status ──
@@ -9885,49 +10022,78 @@ if "calc_data" in st.session_state:
             _rc[0] += 1
 
             # ── Examples ──
-            _write_section('🎯 Three Examples — 22 working days month')
+            _write_section('🎯 Five Examples — 22 working days month')
 
-            _meth_ws.write(_rc[0], 0, '🔴 María — Overloaded, burnout risk', _f_red); _rc[0] += 1
+            # 1) María — Sr Burnout
+            _meth_ws.write(_rc[0], 0, '🔴 María — Sr. Accountant — Overloaded, burnout risk', _f_red); _rc[0] += 1
             _meth_ws.merge_range(_rc[0], 0, _rc[0], 5,
-                'Direct Reports = 11   ·   Productive Hours = 145\n'
+                'Role = Sr. Accountant   ·   Direct Reports = 11   ·   Productive Hours = 145\n'
                 'Total Work = 7.5 × 22 = 165 · Day Scale = 1.10 · Ops = (35 + 1.5×11) × 1.10 = 56.7\n'
                 'Remaining = 165 − 145 − 56.7 = −36.7 · % = −36.7 / 165 = −22.2%\n'
                 '→ Status: 🔴 Potential Burnout · DRs: ⬆️ (>9)', _f_form)
             _meth_ws.set_row(_rc[0], 75); _rc[0] += 2
 
-            _meth_ws.write(_rc[0], 0, '✅ Juan — Well balanced, on track', _f_blu); _rc[0] += 1
+            # 2) Juan — Sr On Track
+            _meth_ws.write(_rc[0], 0, '✅ Juan — Sr. Accountant — Well balanced, on track', _f_blu); _rc[0] += 1
             _meth_ws.merge_range(_rc[0], 0, _rc[0], 5,
-                'Direct Reports = 8   ·   Productive Hours = 105\n'
+                'Role = Sr. Accountant   ·   Direct Reports = 8   ·   Productive Hours = 105\n'
                 'Total Work = 7.5 × 22 = 165 · Day Scale = 1.10 · Ops = (35 + 1.5×8) × 1.10 = 51.7\n'
                 'Remaining = 165 − 105 − 51.7 = 8.3 · % = 8.3 / 165 = +5.0%\n'
                 '→ Status: ✅ On Track · DRs: ✅ (7–9)', _f_form)
             _meth_ws.set_row(_rc[0], 75); _rc[0] += 2
 
-            _meth_ws.write(_rc[0], 0, '🟢 Carla — Available, room to grow', _f_grn); _rc[0] += 1
+            # 3) Carla — Sr Available
+            _meth_ws.write(_rc[0], 0, '🟢 Carla — Sr. Accountant — Available, room to grow', _f_grn); _rc[0] += 1
             _meth_ws.merge_range(_rc[0], 0, _rc[0], 5,
-                'Direct Reports = 6   ·   Productive Hours = 65\n'
+                'Role = Sr. Accountant   ·   Direct Reports = 6   ·   Productive Hours = 65\n'
                 'Total Work = 7.5 × 22 = 165 · Day Scale = 1.10 · Ops = (35 + 1.5×6) × 1.10 = 48.4\n'
                 'Remaining = 165 − 65 − 48.4 = 51.6 · % = 51.6 / 165 = +31.3%\n'
                 '→ Status: 🟢 Available · DRs: ⬇️ (<7)', _f_form)
             _meth_ws.set_row(_rc[0], 75); _rc[0] += 2
 
+            # 4) Patricia — Assistant Manager (same formula as Sr)
+            _meth_ws.write(_rc[0], 0, '🟢 Patricia — Assistant Manager — Light load, mostly oversight', _f_grn); _rc[0] += 1
+            _meth_ws.merge_range(_rc[0], 0, _rc[0], 5,
+                'Role = Assistant Manager   ·   Direct Reports = 10   ·   Productive Hours = 40\n'
+                'Total Work = 7.5 × 22 = 165 · Day Scale = 1.10 · Ops = (35 + 1.5×10) × 1.10 = 55.0\n'
+                'Remaining = 165 − 40 − 55.0 = 70.0 · % = 70.0 / 165 = +42.4%\n'
+                '→ Status: 🟢 Available · DRs: ⬆️ (>9)\n'
+                'Interpretation: typical AM profile — high DRs (manages a large team) but takes only a few clients '
+                'directly. Free capacity here is expected and healthy.', _f_form)
+            _meth_ws.set_row(_rc[0], 100); _rc[0] += 2
+
+            # 5) Diego — General Accountant (Ops = 0)
+            _meth_ws.write(_rc[0], 0, '✅ Diego — General Accountant — Pure execution, no overhead', _f_blu); _rc[0] += 1
+            _meth_ws.merge_range(_rc[0], 0, _rc[0], 5,
+                'Role = General Accountant   ·   Direct Reports = 0 (n/a)   ·   Productive Hours = 158\n'
+                'Total Work = 7.5 × 22 = 165 · Ops = 0 (GA has no management overhead)\n'
+                'Remaining = 165 − 158 − 0 = 7.0 · % = 7.0 / 165 = +4.2%\n'
+                '→ Status: ✅ On Track\n'
+                'Interpretation: GAs spend nearly all hours on client execution; ±7% margin = perfectly utilized.', _f_form)
+            _meth_ws.set_row(_rc[0], 95); _rc[0] += 2
+
             # ── Side-by-side ──
-            _write_section('Side-by-Side Comparison')
+            _write_section('Side-by-Side Comparison — All 5 Examples')
             _meth_ws.write(_rc[0], 0, 'Metric', _f_tbl_h)
-            _meth_ws.write(_rc[0], 1, '🔴 María', _f_tbl_h)
-            _meth_ws.write(_rc[0], 2, '✅ Juan', _f_tbl_h)
-            _meth_ws.write(_rc[0], 3, '🟢 Carla', _f_tbl_h); _rc[0] += 1
-            for vals in [('Direct Reports', '11 ⬆️', '8 ✅', '6 ⬇️'),
-                         ('Total Work Hours', '165.0', '165.0', '165.0'),
-                         ('Ops Rhythm Hours', '56.7', '51.7', '48.4'),
-                         ('Productive Hours (consumed)', '145.0', '105.0', '65.0'),
-                         ('Remaining (= Total − Prod − Ops)', '−36.7', '+8.3', '+51.6'),
-                         ('% Remaining (vs Total Work)', '−22.2%', '+5.0%', '+31.3%'),
-                         ('Status', '🔴 Burnout', '✅ On Track', '🟢 Available')]:
+            _meth_ws.write(_rc[0], 1, '🔴 María (Sr)', _f_tbl_h)
+            _meth_ws.write(_rc[0], 2, '✅ Juan (Sr)', _f_tbl_h)
+            _meth_ws.write(_rc[0], 3, '🟢 Carla (Sr)', _f_tbl_h)
+            _meth_ws.write(_rc[0], 4, '🟢 Patricia (AM)', _f_tbl_h)
+            _meth_ws.write(_rc[0], 5, '✅ Diego (GA)', _f_tbl_h); _rc[0] += 1
+            for vals in [('Role', 'Sr. Accountant', 'Sr. Accountant', 'Sr. Accountant', 'Assistant Mgr', 'General Acct'),
+                         ('Direct Reports', '11 ⬆️', '8 ✅', '6 ⬇️', '10 ⬆️', '— (n/a)'),
+                         ('Total Work Hours', '165.0', '165.0', '165.0', '165.0', '165.0'),
+                         ('Ops Rhythm Hours', '56.7', '51.7', '48.4', '55.0', '0.0'),
+                         ('Productive Hours', '145.0', '105.0', '65.0', '40.0', '158.0'),
+                         ('Remaining (Total−Prod−Ops)', '−36.7', '+8.3', '+51.6', '+70.0', '+7.0'),
+                         ('% Remaining (vs Total Work)', '−22.2%', '+5.0%', '+31.3%', '+42.4%', '+4.2%'),
+                         ('Status', '🔴 Burnout', '✅ On Track', '🟢 Available', '🟢 Available', '✅ On Track')]:
                 _meth_ws.write(_rc[0], 0, vals[0], _f_tbl_l)
                 _meth_ws.write(_rc[0], 1, vals[1], _f_tbl)
                 _meth_ws.write(_rc[0], 2, vals[2], _f_tbl)
                 _meth_ws.write(_rc[0], 3, vals[3], _f_tbl)
+                _meth_ws.write(_rc[0], 4, vals[4], _f_tbl)
+                _meth_ws.write(_rc[0], 5, vals[5], _f_tbl)
                 _rc[0] += 1
             _meth_ws.freeze_panes(2, 0)
             _meth_ws.set_tab_color('#FFC000')   # yellow (Sr. family)
@@ -9942,7 +10108,7 @@ if "calc_data" in st.session_state:
                 ('HC Detail',            _hc_detail_df),
                 ('Employee Level',       _emp_level_df),
                 ('Summary by POD',       _pod_summary_df),
-                ('Sr. Ratios',           _sr_df_x),
+                ('Client Management Hrs', _sr_df_x),
                 ('POD x Sr. Accountant', _cli_pod_sr),
                 ('Client Role Detail',   _cli_detail_rid_exp),
                 ('Client FTEs by Month', _cli_fte_df),
@@ -9961,10 +10127,10 @@ if "calc_data" in st.session_state:
                 _ws_exp = writer.sheets[_sn_exp]
                 # Methodology link at the top of every WF_POD
                 _ws_exp.merge_range(0, 0, 0, max(1, _df_pw_exp.shape[1]),
-                    "📖 How Sr. Ratios are calculated — click here to read methodology",
+                    "📖 How Client Management Hrs are calculated — click here to read methodology",
                     _link_fmt)
-                _ws_exp.write_url(0, 0, "internal:'Sr_Ratios_Methodology'!A1",
-                    string="📖 How Sr. Ratios are calculated — click here to read methodology",
+                _ws_exp.write_url(0, 0, "internal:'Client_Mgmt_Methodology'!A1",
+                    string="📖 How Client Management Hrs are calculated — click here to read methodology",
                     cell_format=_link_fmt)
                 _ws_exp.set_row(0, 26)
                 _row_exp = len(_df_pw_exp) + 5  # link row + blank + header + data + 1 blank
@@ -10091,9 +10257,9 @@ if "calc_data" in st.session_state:
                      "Upload this as the Master DB next time to skip the sync steps.",
             )
 
-        # ── SR. RATIOS ──────────────────────────────────────────────────────────
+        # ── CLIENT MANAGEMENT HRS ───────────────────────────────────────────────
         with t_sr_ratios:
-            st.markdown("### 👩‍💼 Sr. Accountant Ratios & Capacity")
+            st.markdown("### 📊 Client Management Hrs — Sr. Accountants · Assistant Managers · General Accountants")
 
             # ── Ops Rhythm constants (from Srs Ops Rhythm.xlsx) ────────────────
             # Fixed activities total: Daily AM + Daily PM + Weekly early/later +
@@ -10251,59 +10417,78 @@ if "calc_data" in st.session_state:
                     if pct >= -_THRESHOLD_PCT: return '✅ On Track'
                     return '🔴 Potential Burnout'
 
-                # Build table rows — keyed entirely by email
+                # "With clients" filter for AM/GA: must appear in srs sheet
+                _srs_rid_map_c = st.session_state.get('_srs_rid_email_map', {}) or {}
+                _with_clients_emails_c = set(str(v).strip().lower() for v in _srs_rid_map_c.values() if '@' in str(v))
+                # Client count fallback for AM/GA emails
+                _all_role_cli_c = dict(_sr_cli_count_by_email)
+                for _hid, _em in _srs_rid_map_c.items():
+                    _ek = str(_em).strip().lower()
+                    if _ek and '@' in _ek and _ek not in _all_role_cli_c:
+                        _all_role_cli_c[_ek] = sum(
+                            1 for _h2, _e2 in _srs_rid_map_c.items()
+                            if str(_e2).strip().lower() == _ek
+                        )
+                # Iterate over 3 roles: Sr, AM, GA (GA has Ops Rhythm = 0)
+                _role_sources_c = [
+                    ('Sr. Accountant',     _hc_sr.get('by_sr_email', {}) or {}, True),
+                    ('Assistant Manager',  _hc_sr.get('by_am_email', {}) or {}, True),
+                    ('General Accountant', _hc_sr.get('by_ga_email', {}) or {}, False),
+                ]
                 _sr_table_rows = []
-                for _sr_em, _sr_inf in _hc_sr.get('by_sr_email', {}).items():
-                    _dr_cnt   = int(_sr_inf.get('dr_total', 0))
-                    _pod_v    = str(_sr_inf.get('pod', ''))
-                    _start_dt = _sr_inf.get('start_date', pd.NaT)
-                    _cli_cnt  = int(_sr_cli_count_by_email.get(_sr_em, 0))
-                    _prod_hrs = float(_sr_prod_hrs_by_email.get(_sr_em, 0.0))
+                for _role_lbl_c, _src_map_c, _apply_ops_c in _role_sources_c:
+                    for _sr_em, _sr_inf in _src_map_c.items():
+                        _eml_n = str(_sr_em).strip().lower()
+                        if _role_lbl_c != 'Sr. Accountant' and _eml_n not in _with_clients_emails_c:
+                            continue
+                        _dr_cnt   = int(_sr_inf.get('dr_total', 0))
+                        _pod_v    = str(_sr_inf.get('pod', ''))
+                        _start_dt = _sr_inf.get('start_date', pd.NaT)
+                        _cli_cnt  = int(_all_role_cli_c.get(_eml_n, 0))
+                        _prod_hrs = float(_sr_prod_hrs_by_email.get(_eml_n, 0.0))
 
-                    # Capacity math
-                    _scale    = _sr_net_days / _SR_OPS_BASE_DAYS
-                    _ops_hrs  = (_SR_OPS_FIXED_MONTHLY + _SR_OPS_VAR_PER_DR * _dr_cnt) * _scale
-                    _tot_hrs  = _SR_HRS_PER_DAY * _sr_net_days
-                    _cap_hrs  = max(_tot_hrs - _ops_hrs, 0.0)   # kept for display only
-                    # Remaining = Total Work - Productive Hours - Ops Rhythm  (direct formula)
-                    _rem_hrs  = _tot_hrs - _prod_hrs - _ops_hrs
-                    _pct_rem  = (_rem_hrs / _tot_hrs * 100) if _tot_hrs > 0 else 0.0
+                        # Capacity math (GA: Ops = 0)
+                        _scale    = _sr_net_days / _SR_OPS_BASE_DAYS
+                        _ops_hrs  = ((_SR_OPS_FIXED_MONTHLY + _SR_OPS_VAR_PER_DR * _dr_cnt) * _scale) if _apply_ops_c else 0.0
+                        _tot_hrs  = _SR_HRS_PER_DAY * _sr_net_days
+                        _cap_hrs  = max(_tot_hrs - _ops_hrs, 0.0)
+                        _rem_hrs  = _tot_hrs - _prod_hrs - _ops_hrs
+                        _pct_rem  = (_rem_hrs / _tot_hrs * 100) if _tot_hrs > 0 else 0.0
 
-                    # MEC & Other client hrs combined (proc if Ideal Proc=Sr, rev if Ideal Rev=Sr)
-                    _cli_hrs   = (float(_mec_rev_by_email.get(_sr_em, 0.0))
-                                  + float(_other_rev_by_email.get(_sr_em, 0.0)))
-                    # Remaining (MEC) = Total Work - MEC&Other - Ops Rhythm
-                    _rem_mec   = _tot_hrs - _cli_hrs - _ops_hrs
-                    _pct_mec   = (_rem_mec / _tot_hrs * 100) if _tot_hrs > 0 else 0.0
+                        _cli_hrs  = (float(_mec_rev_by_email.get(_eml_n, 0.0))
+                                     + float(_other_rev_by_email.get(_eml_n, 0.0)))
+                        _rem_mec  = _tot_hrs - _cli_hrs - _ops_hrs
+                        _pct_mec  = (_rem_mec / _tot_hrs * 100) if _tot_hrs > 0 else 0.0
 
-                    # Ratio flags
-                    _dr_flag  = '✅' if _DR_MIN  <= _dr_cnt  <= _DR_MAX  else ('⬇️' if _dr_cnt  < _DR_MIN  else '⬆️')
-                    _cli_flag = '✅' if _CLI_MIN <= _cli_cnt <= _CLI_MAX else ('⬇️' if _cli_cnt < _CLI_MIN else '⬆️')
+                        _dr_flag  = '✅' if _DR_MIN  <= _dr_cnt  <= _DR_MAX  else ('⬇️' if _dr_cnt  < _DR_MIN  else '⬆️')
+                        _cli_flag = '✅' if _CLI_MIN <= _cli_cnt <= _CLI_MAX else ('⬇️' if _cli_cnt < _CLI_MIN else '⬆️')
+                        _dr_display_c = '—' if not _apply_ops_c else f"{_dr_cnt} {_dr_flag}"
 
-                    _sr_table_rows.append({
-                        'POD':                               _pod_v,
-                        'Sr. Accountant':                    _sr_em,
-                        'Hire Date':                         pd.Timestamp(_start_dt).strftime('%Y-%m-%d') if pd.notna(_start_dt) else '—',
-                        'Tenure':                            _sr_tenure(_start_dt),
-                        'Direct Reports':                    f"{_dr_cnt} {_dr_flag}",
-                        'Clients Assigned':                  f"{_cli_cnt} {_cli_flag}",
-                        'Productive Hrs':                    round(_prod_hrs, 1),
-                        'Total Work Hours':                  round(_tot_hrs, 1),
-                        'Ops Rhythm Hrs':                    round(_ops_hrs, 1),
-                        'Productive Capacity (After Ops R)': round(_cap_hrs, 1),
-                        'Remaining Hrs':                     round(_rem_hrs, 1),
-                        '% Remaining':                       round(_pct_rem, 1),
-                        'Status':                            _sr_status(_pct_rem),
-                        'MEC & Other Client Hrs':            round(_cli_hrs, 1),
-                        'Remaining Hrs (MEC)':               round(_rem_mec, 1),
-                        '% Remaining (MEC)':                 round(_pct_mec, 1),
-                        'Status (MEC)':                      _sr_status(_pct_mec),
-                    })
+                        _sr_table_rows.append({
+                            'POD':                               _pod_v,
+                            'Role':                              _role_lbl_c,
+                            'Email':                             _eml_n,
+                            'Hire Date':                         pd.Timestamp(_start_dt).strftime('%Y-%m-%d') if pd.notna(_start_dt) else '—',
+                            'Tenure':                            _sr_tenure(_start_dt),
+                            'Direct Reports':                    _dr_display_c,
+                            'Clients Assigned':                  f"{_cli_cnt} {_cli_flag}",
+                            'Productive Hrs':                    round(_prod_hrs, 1),
+                            'Total Work Hours':                  round(_tot_hrs, 1),
+                            'Ops Rhythm Hrs':                    round(_ops_hrs, 1),
+                            'Productive Capacity (After Ops R)': round(_cap_hrs, 1),
+                            'Remaining Hrs':                     round(_rem_hrs, 1),
+                            '% Remaining':                       round(_pct_rem, 1),
+                            'Status':                            _sr_status(_pct_rem),
+                            'MEC & Other Client Hrs':            round(_cli_hrs, 1),
+                            'Remaining Hrs (MEC)':               round(_rem_mec, 1),
+                            '% Remaining (MEC)':                 round(_pct_mec, 1),
+                            'Status (MEC)':                      _sr_status(_pct_mec),
+                        })
 
                 if _sr_table_rows:
                     _sr_df = (
                         pd.DataFrame(_sr_table_rows)
-                        .sort_values(['POD', 'Sr. Accountant'])
+                        .sort_values(['POD', 'Role', 'Email'])
                         .reset_index(drop=True)
                     )
                     # Persist so download buttons can include it
