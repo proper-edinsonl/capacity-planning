@@ -12,7 +12,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 
 # --- APP VERSION ---
-APP_VERSION = "v6.5.2026.4.18PM"
+APP_VERSION = "v6.5.2026.5.23PM"
 
 def _lc_short_m0(gl_series):
     """Bool array: True if Go Live month has < 15 working days remaining (< 3 weeks)."""
@@ -2954,6 +2954,120 @@ def _build_proj_export_df(pdata):
             'Δ Tasks HC (Over/Under)':        _t_delta,
         })
     return pd.DataFrame(_rows)
+
+
+def _get_srs_emails_with_clients():
+    """Return the set of emails that have assigned clients (from srs sheet).
+    Tries 4 fallback sources so we work even if session_state cache is stale:
+      1. _srs_rid_email_map dict
+      2. _srs_sheet_raw cached DataFrame
+      3. _vol_file_bytes (cached vol file)
+      4. main_data_upload widget (live uploaded file)
+    """
+    # Source 1: session_state map
+    srs_map = st.session_state.get('_srs_rid_email_map', {}) or {}
+    if srs_map:
+        return set(str(v).strip().lower() for v in srs_map.values() if '@' in str(v))
+    # Source 2: cached srs sheet
+    srs_df = st.session_state.get('_srs_sheet_raw', pd.DataFrame())
+    if hasattr(srs_df, 'empty') and not srs_df.empty:
+        _scol = {str(c).lower().strip(): c for c in srs_df.columns}
+        _e_c = _scol.get('email')
+        if _e_c:
+            emails = {str(e).strip().lower() for e in srs_df[_e_c] if '@' in str(e)}
+            if emails:
+                return emails
+    # Source 3/4: vol bytes (cached) or live uploader widget
+    vol_bytes = st.session_state.get('_vol_file_bytes', None)
+    if not vol_bytes:
+        live_up = st.session_state.get('main_data_upload', None)
+        if live_up is not None:
+            try:
+                live_up.seek(0)
+                vol_bytes = live_up.read()
+                live_up.seek(0)
+                st.session_state['_vol_file_bytes'] = vol_bytes
+            except Exception:
+                pass
+    if vol_bytes:
+        try:
+            from io import BytesIO as _BIO_l
+            _xln = pd.ExcelFile(_BIO_l(vol_bytes))
+            if 'srs' in _xln.sheet_names:
+                _srs_now = pd.read_excel(_BIO_l(vol_bytes), sheet_name='srs')
+                _srs_now.columns = _srs_now.columns.astype(str).str.strip()
+                _scol = {str(c).lower().strip(): c for c in _srs_now.columns}
+                _e_c = _scol.get('email')
+                if _e_c:
+                    return {str(e).strip().lower() for e in _srs_now[_e_c] if '@' in str(e)}
+        except Exception:
+            pass
+    return set()
+
+
+def _ensure_am_ga_maps(hc_data):
+    """Backfill by_am_email / by_ga_email if HC cache is stale or empty.
+    Uses detail DataFrame as primary source (job titles direct from HC file),
+    employees list as DR-count source.
+    ALWAYS rebuilds — does NOT skip if keys exist but are empty."""
+    if not hc_data:
+        return hc_data
+    # Skip ONLY if both maps are present AND non-empty (truly populated)
+    if hc_data.get('by_am_email') and hc_data.get('by_ga_email'):
+        return hc_data
+    by_am = {}
+    by_ga = {}
+    # ── Direct Report counts from employees list ──
+    employees = hc_data.get('employees', []) or []
+    _prod_roles = {'Accountant I', 'Accountant II', 'General Accountant', 'Sr. Accountant'}
+    dr_counts = {}
+    for emp in employees:
+        mgr = str(emp.get('manager_email', '') or '').strip().lower()
+        if mgr and emp.get('role') in _prod_roles:
+            dr_counts[mgr] = dr_counts.get(mgr, 0) + 1
+    # ── Primary: detail DataFrame (always has Job title for active POD employees) ──
+    detail = hc_data.get('detail', pd.DataFrame())
+    if not detail.empty and 'Job title' in detail.columns and 'Work Email' in detail.columns:
+        for _, row in detail.iterrows():
+            jt = str(row.get('Job title', '')).lower().strip()
+            em = str(row.get('Work Email', '')).strip().lower()
+            if not em or em in ('nan', 'none'):
+                continue
+            base = {
+                'name':       str(row.get('Full name', '')),
+                'email':      em,
+                'start_date': pd.to_datetime(row.get('Start Date', pd.NaT), errors='coerce')
+                              if 'Start Date' in detail.columns else pd.NaT,
+                'pod':        str(row.get('POD', '')),
+            }
+            if 'assistant manager' in jt:
+                base['dr_total'] = dr_counts.get(em, 0)
+                by_am[em] = base
+            elif 'general accountant' in jt:
+                base['dr_total'] = 0
+                by_ga[em] = base
+    # ── Fallback: employees list (if detail was empty) ──
+    if not by_am and not by_ga:
+        for emp in employees:
+            em = str(emp.get('email', '') or '').strip().lower()
+            if not em or em in ('nan', 'none'):
+                continue
+            role = emp.get('role', '')
+            base = {
+                'name':       emp.get('name', ''),
+                'email':      em,
+                'start_date': emp.get('start_date', pd.NaT),
+                'pod':        emp.get('pod', ''),
+            }
+            if role == 'Asst. Manager':
+                base['dr_total'] = dr_counts.get(em, 0)
+                by_am[em] = base
+            elif role == 'General Accountant':
+                base['dr_total'] = 0
+                by_ga[em] = base
+    hc_data['by_am_email'] = by_am
+    hc_data['by_ga_email'] = by_ga
+    return hc_data
 
 
 # ============================================================
@@ -6852,7 +6966,7 @@ if "calc_data" in st.session_state:
         }
 
         # ── Auto-compute Sr. Ratios so export always has data (no tab visit needed) ──
-        _sr_auto_hc   = st.session_state.get('hc_data', None)
+        _sr_auto_hc   = _ensure_am_ga_maps(st.session_state.get('hc_data', None))
         _sr_auto_cd   = st.session_state.get('calc_data', {})
         _sr_auto_wday = _sr_auto_cd.get('dict_workable_days', {})
         if _sr_auto_hc and _sr_auto_wday:
@@ -6934,7 +7048,7 @@ if "calc_data" in st.session_state:
                     _sr_auto_other = _piva.get('OTHER', pd.Series(dtype=float)).to_dict()
             # "With clients" filter: AM/GA only included if their email appears in srs map
             _srs_rid_map_a = st.session_state.get('_srs_rid_email_map', {}) or {}
-            _with_clients_emails_a = set(str(v).strip().lower() for v in _srs_rid_map_a.values() if '@' in str(v))
+            _with_clients_emails_a = _get_srs_emails_with_clients()
             # Client count fallback for AM/GA emails not in cli_cnt_by_email
             _all_role_cli_a = dict(_sr_auto_cli_cnt)
             for _hid, _em in _srs_rid_map_a.items():
@@ -9542,7 +9656,7 @@ if "calc_data" in st.session_state:
             # Covers 3 roles: Sr. Accountant, Assistant Manager, General Accountant
             # (only those "with clients" = email appears in srs sheet)
             _sr_df_x = pd.DataFrame()
-            _sr_hc_exp  = st.session_state.get('hc_data', None)
+            _sr_hc_exp  = _ensure_am_ga_maps(st.session_state.get('hc_data', None))
             _sr_wday_exp = st.session_state.get('calc_data', {}).get('dict_workable_days', {})
             if _sr_hc_exp and _sr_wday_exp:
                 _SR_OPS_FIXED_X = 35.0;  _SR_OPS_VAR_X = 1.5
@@ -9556,7 +9670,7 @@ if "calc_data" in st.session_state:
                 _df_cx    = st.session_state.get('df_clean', pd.DataFrame())
                 _srs_rd_x = st.session_state.get('_srs_ratios_data', {})
                 _srs_rid_map_x = st.session_state.get('_srs_rid_email_map', {}) or {}
-                _with_clients_emails = set(str(v).strip().lower() for v in _srs_rid_map_x.values() if '@' in str(v))
+                _with_clients_emails = _get_srs_emails_with_clients()
                 # ── Client count by email: srs sheet (authoritative) or df_clean FSD fallback ──
                 if _srs_rd_x.get('cli_cnt_by_email'):
                     _sr_cli_x = dict(_srs_rd_x['cli_cnt_by_email'])
@@ -9697,6 +9811,17 @@ if "calc_data" in st.session_state:
                     _sr_df_x = pd.DataFrame(_sr_rows_x).sort_values(['POD', 'Role', 'Email']).reset_index(drop=True)
                     _sr_df_x.to_excel(writer, index=False, sheet_name='Client_Management_Hrs')
                     st.session_state['_s3_sr_ratios_df'] = _sr_df_x.copy()
+                # Diagnostic: counts per role in the final table
+                _cmh_counts = {'Sr': len(_sr_hc_exp.get('by_sr_email', {}) or {}),
+                               'AM': len(_sr_hc_exp.get('by_am_email', {}) or {}),
+                               'GA': len(_sr_hc_exp.get('by_ga_email', {}) or {})}
+                _cmh_with_clients = len(_with_clients_emails)
+                _cmh_rows = len(_sr_rows_x)
+                st.session_state['_cmh_diag'] = (
+                    f"Client_Management_Hrs: {_cmh_rows} rows total · "
+                    f"HC maps [Sr:{_cmh_counts['Sr']} AM:{_cmh_counts['AM']} GA:{_cmh_counts['GA']}] · "
+                    f"emails with clients (srs map): {_cmh_with_clients}"
+                )
             # Tab 9: Client FTEs by Month — POD + Sr. + Client totals across all roles
             _cli_fte_df  = pd.DataFrame()
             _cli_fte_src = st.session_state.final_dashboards.get('cliente', pd.DataFrame())
@@ -9896,6 +10021,20 @@ if "calc_data" in st.session_state:
             _meth_ws.set_column('C:F', 18)
             _meth_ws.hide_gridlines(2)
             _rc = [0]   # mutable counter (nonlocal workaround for non-function scope)
+
+            def _write_section(title):
+                _meth_ws.merge_range(_rc[0], 0, _rc[0], 5, title, _f_h1)
+                _meth_ws.set_row(_rc[0], 24); _rc[0] += 1
+            def _write_pair(label, content, height=None):
+                _meth_ws.write(_rc[0], 0, label, _f_h2)
+                _meth_ws.merge_range(_rc[0], 1, _rc[0], 5, content, _f_body)
+                if height: _meth_ws.set_row(_rc[0], height)
+                _rc[0] += 1
+            def _write_formula(label, formula, height=28):
+                _meth_ws.write(_rc[0], 0, label, _f_h2)
+                _meth_ws.merge_range(_rc[0], 1, _rc[0], 5, formula, _f_form)
+                _meth_ws.set_row(_rc[0], height); _rc[0] += 1
+
             _meth_ws.merge_range(_rc[0], 0, _rc[0], 5, '📊 How the Client Management Hrs Calculation Works', _f_title)
             _meth_ws.set_row(_rc[0], 32); _rc[0] += 2
             _meth_ws.merge_range(_rc[0], 0, _rc[0], 5,
@@ -9928,19 +10067,6 @@ if "calc_data" in st.session_state:
                 '                 + Σ (Capacity Reviewing  Hours where GA = reviewer)\n'
                 'Remaining        = Total Work − Productive', 75)
             _rc[0] += 1
-
-            def _write_section(title):
-                _meth_ws.merge_range(_rc[0], 0, _rc[0], 5, title, _f_h1)
-                _meth_ws.set_row(_rc[0], 24); _rc[0] += 1
-            def _write_pair(label, content, height=None):
-                _meth_ws.write(_rc[0], 0, label, _f_h2)
-                _meth_ws.merge_range(_rc[0], 1, _rc[0], 5, content, _f_body)
-                if height: _meth_ws.set_row(_rc[0], height)
-                _rc[0] += 1
-            def _write_formula(label, formula, height=28):
-                _meth_ws.write(_rc[0], 0, label, _f_h2)
-                _meth_ws.merge_range(_rc[0], 1, _rc[0], 5, formula, _f_form)
-                _meth_ws.set_row(_rc[0], height); _rc[0] += 1
 
             # ── Layer 1 ──
             _write_section('Layer 1 — How much can the Sr. work this month?')
@@ -10167,6 +10293,9 @@ if "calc_data" in st.session_state:
         _cm_diag_msg = st.session_state.get('_cm_diag', '')
         if _cm_diag_msg:
             st.info(f"🗺️ {_cm_diag_msg}")
+        _cmh_diag_msg = st.session_state.get('_cmh_diag', '')
+        if _cmh_diag_msg:
+            st.info(f"📊 {_cmh_diag_msg}")
 
         # ── Mode-mismatch warning ─────────────────────────────────────────────────
         # Check if the user has changed the radio since the last cascade run
@@ -10275,7 +10404,7 @@ if "calc_data" in st.session_state:
             _CLI_MIN, _CLI_MAX = 3, 5
             _THRESHOLD_PCT     = 7.0       # ±7% boundary
 
-            _hc_sr    = st.session_state.get('hc_data')
+            _hc_sr    = _ensure_am_ga_maps(st.session_state.get('hc_data'))
             _cd_sr    = st.session_state.get('calc_data', {})
             _wdays_sr = _cd_sr.get('dict_workable_days', {})
             _meses_sr = meses_proyeccion   # global — always defined
@@ -10419,7 +10548,7 @@ if "calc_data" in st.session_state:
 
                 # "With clients" filter for AM/GA: must appear in srs sheet
                 _srs_rid_map_c = st.session_state.get('_srs_rid_email_map', {}) or {}
-                _with_clients_emails_c = set(str(v).strip().lower() for v in _srs_rid_map_c.values() if '@' in str(v))
+                _with_clients_emails_c = _get_srs_emails_with_clients()
                 # Client count fallback for AM/GA emails
                 _all_role_cli_c = dict(_sr_cli_count_by_email)
                 for _hid, _em in _srs_rid_map_c.items():
