@@ -12,7 +12,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 
 # --- APP VERSION ---
-APP_VERSION = "v6.5.2026.5.23PM"
+APP_VERSION = "v6.10.2026.9.28AM"
 
 def _lc_short_m0(gl_series):
     """Bool array: True if Go Live month has < 15 working days remaining (< 3 weeks)."""
@@ -3070,6 +3070,407 @@ def _ensure_am_ga_maps(hc_data):
     return hc_data
 
 
+def _build_org_chart_data(hc_raw_df):
+    """Build role-level org chart from raw HC DataFrame (active employees only).
+    Returns: (root_role, role_metrics, role_children) where:
+      role_metrics[role] = {'count': N, 'adr': float, 'idr_avg': float, 'is_single': bool}
+      role_children[role] = list of child roles (placed under most-frequent parent role)
+    """
+    if hc_raw_df is None or hc_raw_df.empty:
+        return None, {}, {}
+    df = hc_raw_df[hc_raw_df['Worker Status'].astype(str).str.lower() == 'active'].copy()
+    if df.empty:
+        return None, {}, {}
+    # Normalize
+    df['_email']     = df['Work Email'].astype(str).str.strip().str.lower()
+    df['_mgr_email'] = df['Manager email'].astype(str).str.strip().str.lower()
+    df['_role']      = df['Job title'].astype(str).str.strip()
+    df = df[df['_email'].ne('') & df['_email'].ne('nan')]
+
+    # Build direct reports map: manager_email → [report_emails]
+    reports_map = {}
+    for _, r in df.iterrows():
+        mgr = r['_mgr_email']
+        if mgr and mgr not in ('nan', 'none', ''):
+            reports_map.setdefault(mgr, []).append(r['_email'])
+
+    # Compute DR + IDR per person (full cascade for IDR)
+    email_to_role = dict(zip(df['_email'], df['_role']))
+    dr_per_person = {em: len(reports_map.get(em, [])) for em in df['_email']}
+    idr_per_person = {}
+    def _idr_cascade(em, visited):
+        if em in visited: return 0
+        visited.add(em)
+        total = 0
+        for sub in reports_map.get(em, []):
+            total += 1 + _idr_cascade(sub, visited)
+        # IDR = total descendants - direct reports
+        return total
+    for em in df['_email']:
+        total_desc = _idr_cascade(em, set())
+        idr_per_person[em] = max(0, total_desc - dr_per_person[em])
+
+    # Aggregate metrics per role
+    role_metrics = {}
+    role_people  = {}
+    for _, r in df.iterrows():
+        role = r['_role']
+        if role in ('', 'nan'): continue
+        role_people.setdefault(role, []).append(r['_email'])
+    for role, people in role_people.items():
+        drs  = [dr_per_person.get(p, 0) for p in people]
+        idrs = [idr_per_person.get(p, 0) for p in people]
+        role_metrics[role] = {
+            'count':    len(people),
+            'adr':      sum(drs) / len(drs) if drs else 0.0,
+            'idr_avg':  sum(idrs) / len(idrs) if idrs else 0.0,
+            'is_single': len(people) == 1,
+            'dr_sum':   sum(drs),
+            'idr_sum':  sum(idrs),
+        }
+
+    # Determine root: role whose people have no manager
+    no_mgr_emails = df[df['_mgr_email'].isin(['', 'nan', 'none'])]['_email'].tolist()
+    if not no_mgr_emails:
+        # fallback: pick role with highest IDR
+        root_role = max(role_metrics.items(), key=lambda kv: kv[1]['idr_sum'])[0] if role_metrics else None
+    else:
+        root_role = email_to_role.get(no_mgr_emails[0])
+
+    # Build parent_role → child_roles (each child placed under its MOST FREQUENT parent role)
+    # For each role A, find which role most of its members report to. That's A's parent.
+    parent_of_role = {}
+    for role, people in role_people.items():
+        if role == root_role: continue
+        parent_role_counts = {}
+        for em in people:
+            # Find this person's manager's role
+            mgr_email = df[df['_email'] == em]['_mgr_email'].iloc[0]
+            if mgr_email and mgr_email in email_to_role:
+                parent_r = email_to_role[mgr_email]
+                if parent_r and parent_r != role:
+                    parent_role_counts[parent_r] = parent_role_counts.get(parent_r, 0) + 1
+        if parent_role_counts:
+            parent_of_role[role] = max(parent_role_counts.items(), key=lambda kv: kv[1])[0]
+
+    # Invert: parent → [children]
+    role_children = {}
+    for child, parent in parent_of_role.items():
+        role_children.setdefault(parent, []).append(child)
+    # Sort children by IDR descending (biggest subtrees first)
+    for parent in role_children:
+        role_children[parent].sort(
+            key=lambda r: role_metrics.get(r, {}).get('idr_sum', 0), reverse=True
+        )
+    return root_role, role_metrics, role_children
+
+
+def _write_org_chart_sheet(writer, hc_raw_df):
+    """Write the 'Org Chart' sheet — indented role-level tree with ADR/IDR per node."""
+    root_role, metrics, children = _build_org_chart_data(hc_raw_df)
+    book = writer.book
+    ws   = book.add_worksheet('Org Chart')
+    ws.hide_gridlines(2)
+    ws.set_column('A:A', 90)
+
+    f_title = book.add_format({'bold': True, 'font_size': 16, 'font_color': '#1F3864'})
+    f_lvl   = [
+        book.add_format({'bold': True, 'font_size': 14, 'font_color': '#FFFFFF', 'bg_color': '#1F3864', 'indent': 0}),
+        book.add_format({'bold': True, 'font_size': 12, 'font_color': '#FFFFFF', 'bg_color': '#2E75B6', 'indent': 1}),
+        book.add_format({'bold': True, 'font_size': 11, 'font_color': '#FFFFFF', 'bg_color': '#5B9BD5', 'indent': 2}),
+        book.add_format({'bold': True, 'font_size': 11, 'font_color': '#1F3864', 'bg_color': '#BDD7EE', 'indent': 3}),
+        book.add_format({'bold': True, 'font_size': 11, 'font_color': '#1F3864', 'bg_color': '#DDEBF7', 'indent': 4}),
+        book.add_format({'bold': False, 'font_size': 11, 'font_color': '#000000', 'bg_color': '#F2F2F2', 'indent': 5}),
+        book.add_format({'bold': False, 'font_size': 11, 'font_color': '#404040', 'indent': 6}),
+        book.add_format({'bold': False, 'font_size': 11, 'font_color': '#404040', 'indent': 7}),
+    ]
+    f_leaf = book.add_format({'italic': True, 'font_size': 10, 'font_color': '#7F7F7F'})
+
+    r = 0
+    ws.write(r, 0, '🏢 Organizational Chart — Role Hierarchy', f_title); ws.set_row(r, 32); r += 2
+    ws.write(r, 0, 'Built from HC Weekly Report — Active employees only. '
+                   'Each node shows DR (Direct Reports) and IDR (Indirect Reports — full cascade). '
+                   'When a role has multiple people, ADR (Average DR) is shown.',
+             book.add_format({'text_wrap': True, 'valign': 'top', 'font_size': 11}))
+    ws.set_row(r, 45); r += 2
+
+    if not root_role:
+        ws.write(r, 0, '⚠️ No HC data available — upload the HC Weekly Report.', f_leaf)
+        return
+
+    def _fmt_node(role, depth):
+        m = metrics.get(role, {})
+        if m.get('is_single'):
+            return f"{role} (DR: {int(m.get('dr_sum', 0))}, IDR: {int(m.get('idr_sum', 0))})"
+        return f"{role} (ADR: {m.get('adr', 0):.1f}, IDR: {m.get('idr_avg', 0):.1f})"
+
+    def _walk(role, depth, prefix='', visited=None):
+        nonlocal r
+        if visited is None: visited = set()
+        if role in visited: return
+        visited.add(role)
+        fmt = f_lvl[min(depth, len(f_lvl) - 1)]
+        bullet = ''
+        if depth == 0:
+            line = _fmt_node(role, depth)
+        else:
+            line = f"{prefix}{_fmt_node(role, depth)}"
+        ws.write(r, 0, line, fmt)
+        r += 1
+        kids = children.get(role, [])
+        for i, child in enumerate(kids):
+            is_last = (i == len(kids) - 1)
+            branch = '└── ' if is_last else '├── '
+            next_prefix = prefix.replace('├── ', '│   ').replace('└── ', '    ')
+            child_prefix = next_prefix + branch
+            _walk(child, depth + 1, child_prefix, visited)
+
+    _walk(root_role, 0)
+    ws.set_tab_color('#7030A0')
+
+
+_NON_DELIVERY_DEPT_MAP = {
+    'Customer Success Manager':          'Customer Success',
+    'Lead Customer Success Manager':     'Customer Success',
+    'HR Operations Analyst':             'HR - Performance',
+    'Performance Management Lead':       'HR - Performance',
+    'IT Specialist':                     'IT',
+    'IT Support Manager':                'IT',
+    'Payroll Specialist':                'Payroll',
+    'Senior Manager of People Operations': 'POPs',
+    'Lead Technical Recruiter':          'TA',
+    'Talent Acquisition Specialist':     'TA',
+}
+
+_NON_DELIVERY_BENCHMARKS = {
+    'Payroll':          {'min': 200, 'max': 350},
+    'IT':               {'min': 100, 'max': 150},
+    'HR - Performance': {'min': 200, 'max': 300},
+    'POPs':             {'min': 150, 'max': 200},
+    # TA: monthly hires per recruiter — flat benchmark of 8 hires/mo per TA staff
+    'TA':               {'max_hires_monthly': 8},
+    'Customer Success': {'min_clients': 15, 'max_clients': 30},
+}
+
+_NON_DELIVERY_RECS = {
+    'Payroll': {
+        '🟢': 'Payroll staffing is within industry benchmarks. Monitor as company scales.',
+        '🟡': 'Payroll specialist is approaching capacity limits. Consider cross-training or partial automation for multi-country payroll processing.',
+        '🔴': 'Payroll is severely understaffed. Risk of errors and compliance issues with multi-country (MX+COL) payroll. Recommend hiring 1 additional Payroll Specialist or implementing payroll automation software.',
+    },
+    'IT': {
+        '🟢': 'IT support staffing is adequate for current employee count.',
+        '🟡': 'IT support ratio is stretched. Consider adding 1 IT Specialist to prevent bottlenecks, especially for a tech-dependent BPO operation.',
+        '🔴': 'IT is critically understaffed. Response times and system reliability are at risk. Immediate hire recommended. Target ratio: 1:150.',
+    },
+    'HR - Performance': {
+        '🟢': 'HR Performance staffing is within benchmarks.',
+        '🟡': 'Performance management may become strained as company grows. Consider adding capacity when headcount exceeds 500.',
+        '🔴': 'HR Performance function is understaffed. Risk of inadequate performance reviews, employee development, and retention issues. Recommend adding 1 HR specialist.',
+    },
+    'POPs': {
+        '🟢': 'People Operations leadership ratio is appropriate.',
+        '🟡': 'Senior Manager is spread thin across the workforce. Consider adding a People Operations Manager to handle day-to-day operations.',
+        '🔴': 'People Operations is critically under-resourced. One senior leader cannot effectively support 450+ employees. Recommend adding at least 1-2 People Ops professionals.',
+    },
+    'TA': {
+        '🟢': 'Talent Acquisition team can handle current hiring volume based on attrition rate.',
+        '🟡': 'TA team is approaching capacity. If attrition increases, hiring targets may not be met. Consider building a recruitment coordinator bench.',
+        '🔴': 'TA team is overwhelmed by hiring volume. Recruiters are handling more hires than industry standard. Recommend adding 1 recruiter.',
+    },
+    'Customer Success': {
+        '🟢': 'CS team ratio is within benchmarks for accounting outsourcing BPO.',
+        '🟡': 'CS managers are handling too many clients for effective relationship management in a service business. Consider adding 1 CSM.',
+        '🔴': 'CS is critically understaffed. Client retention and satisfaction are at risk in a relationship-driven business. Recommend immediate hire.',
+    },
+}
+
+
+def _compute_non_delivery_ratios(hc_raw_df, attrition_monthly, active_clients):
+    """Compute department-level ratios + health status.
+    Returns: (summary_dict, rows_list) where rows = list of dicts per dept."""
+    summary = {
+        'total_active_employees': 0,
+        'attrition_monthly':      attrition_monthly,
+        'attrition_annual':       None,
+        'active_clients':         active_clients,
+        'health_score':           '',
+    }
+    if hc_raw_df is None or hc_raw_df.empty:
+        return summary, []
+    df = hc_raw_df[hc_raw_df['Worker Status'].astype(str).str.lower() == 'active'].copy()
+    total_emp = len(df)
+    summary['total_active_employees'] = total_emp
+    if attrition_monthly is not None and attrition_monthly >= 0:
+        summary['attrition_annual'] = 1 - (1 - attrition_monthly) ** 12
+        annual_hires = total_emp * summary['attrition_annual']
+        monthly_hires = annual_hires / 12
+    else:
+        annual_hires = None
+        monthly_hires = None
+
+    # Group by department
+    dept_roles = {}
+    for jt, dept in _NON_DELIVERY_DEPT_MAP.items():
+        dept_roles.setdefault(dept, []).append(jt)
+
+    rows = []
+    healthy_count = 0
+    total_depts   = 0
+    for dept in ['Payroll', 'IT', 'HR - Performance', 'POPs', 'TA', 'Customer Success']:
+        roles = dept_roles.get(dept, [])
+        staff = df[df['Job title'].isin(roles)]
+        staff_n = len(staff)
+        bench = _NON_DELIVERY_BENCHMARKS.get(dept, {})
+        if dept == 'TA':
+            if monthly_hires is None or staff_n == 0:
+                ratio_val   = None
+                ratio_disp  = 'N/A — Set attrition rate in Global Parameters' if monthly_hires is None else 'N/A — No TA staff'
+                denom_disp  = 'N/A'
+                bench_disp  = f"1 TA to ≤ {bench['max_hires_monthly']:.0f} hires/mo"
+                status      = '⚪'
+            else:
+                hires_per_ta_monthly = monthly_hires / staff_n
+                ratio_val   = hires_per_ta_monthly
+                ratio_disp  = f"1 TA to {hires_per_ta_monthly:.1f} hires/mo"
+                denom_disp  = f"{monthly_hires:.1f} hires/mo"
+                bench_disp  = f"1 TA to ≤ {bench['max_hires_monthly']:.0f} hires/mo"
+                bench_max   = bench['max_hires_monthly']
+                if hires_per_ta_monthly <= bench_max:               status = '🟢'
+                elif hires_per_ta_monthly <= bench_max * 1.25:      status = '🟡'
+                else:                                                status = '🔴'
+        elif dept == 'Customer Success':
+            if active_clients is None or staff_n == 0:
+                ratio_val   = None
+                ratio_disp  = 'N/A — Upload volume or HubSpot file' if active_clients is None else 'N/A — No CS staff'
+                denom_disp  = 'N/A' if active_clients is None else f"{active_clients} clients"
+                bench_disp  = f"1 CS to {bench['min_clients']}–{bench['max_clients']} clients"
+                status      = '⚪'
+            else:
+                clients_per_cs = active_clients / staff_n
+                ratio_val   = clients_per_cs
+                ratio_disp  = f"1 CS to {int(round(clients_per_cs))} clients"
+                denom_disp  = f"{active_clients} clients"
+                bench_disp  = f"1 CS to {bench['min_clients']}–{bench['max_clients']} clients"
+                bench_max   = bench['max_clients']
+                if clients_per_cs <= bench_max:                     status = '🟢'
+                elif clients_per_cs <= bench_max * 1.25:            status = '🟡'
+                else:                                                status = '🔴'
+        else:
+            if staff_n == 0:
+                ratio_val   = None
+                ratio_disp  = 'N/A — No staff in this role'
+                denom_disp  = f"{total_emp}"
+                bench_disp  = f"1 to {bench['min']}–{bench['max']}"
+                status      = '⚪'
+            else:
+                r_val = total_emp / staff_n
+                ratio_val  = r_val
+                ratio_disp = f"1 to {int(round(r_val))}"
+                denom_disp = f"{total_emp}"
+                bench_disp = f"1 to {bench['min']}–{bench['max']}"
+                bench_max  = bench['max']
+                if r_val <= bench_max:                               status = '🟢'
+                elif r_val <= bench_max * 1.25:                      status = '🟡'
+                else:                                                status = '🔴'
+        rec = _NON_DELIVERY_RECS.get(dept, {}).get(status, '')
+        if status == '🟢':
+            healthy_count += 1
+        if status in ('🟢', '🟡', '🔴'):
+            total_depts += 1
+        rows.append({
+            'Department':            dept,
+            'Roles Included':        ' · '.join(roles),
+            'Staff Count':           staff_n,
+            'Denominator':           denom_disp,
+            'Current Ratio':         ratio_disp,
+            'Benchmark Range':       bench_disp,
+            'Health Status':         status + (' Healthy' if status == '🟢' else ' At Risk' if status == '🟡' else ' Critical' if status == '🔴' else ' N/A'),
+            'Recommendation':        rec,
+        })
+    summary['health_score'] = f"{healthy_count}/{total_depts} departments Healthy" if total_depts else 'N/A'
+    return summary, rows
+
+
+def _write_non_delivery_sheet(writer, hc_raw_df, attrition_monthly, active_clients):
+    """Write the 'Non-Delivery Department Ratios and Health' sheet."""
+    summary, rows = _compute_non_delivery_ratios(hc_raw_df, attrition_monthly, active_clients)
+    book = writer.book
+    ws   = book.add_worksheet('Non-Delivery Dept Ratios')
+    ws.hide_gridlines(2)
+    ws.set_column('A:A', 22)
+    ws.set_column('B:B', 60)
+    ws.set_column('C:C', 13)
+    ws.set_column('D:D', 22)
+    ws.set_column('E:E', 32)
+    ws.set_column('F:F', 32)
+    ws.set_column('G:G', 18)
+    ws.set_column('H:H', 70)
+
+    f_title = book.add_format({'bold': True, 'font_size': 16, 'font_color': '#1F3864'})
+    f_kpi_l = book.add_format({'bold': True, 'font_size': 11, 'font_color': '#1F3864', 'align': 'right'})
+    f_kpi_v = book.add_format({'bold': True, 'font_size': 12, 'font_color': '#000000', 'align': 'left'})
+    f_hdr   = book.add_format({'bold': True, 'font_color': 'white', 'bg_color': '#1F3864',
+                                'align': 'center', 'valign': 'vcenter', 'text_wrap': True, 'font_size': 11})
+    f_body  = book.add_format({'text_wrap': True, 'valign': 'top', 'font_size': 10})
+    f_body_c = book.add_format({'text_wrap': True, 'valign': 'vcenter', 'align': 'center', 'font_size': 10})
+    f_green = book.add_format({'bg_color': '#C6EFCE', 'font_color': '#006100', 'bold': True, 'align': 'center', 'valign': 'vcenter'})
+    f_yel   = book.add_format({'bg_color': '#FFEB9C', 'font_color': '#9C5700', 'bold': True, 'align': 'center', 'valign': 'vcenter'})
+    f_red   = book.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006', 'bold': True, 'align': 'center', 'valign': 'vcenter'})
+    f_gray  = book.add_format({'bg_color': '#D9D9D9', 'font_color': '#595959', 'italic': True, 'align': 'center', 'valign': 'vcenter'})
+
+    r = 0
+    ws.merge_range(r, 0, r, 7, '📊 Non-Delivery Department Ratios and Health',
+                   book.add_format({'bold': True, 'font_size': 16, 'font_color': '#1F3864'}))
+    ws.set_row(r, 32); r += 2
+
+    # Summary dashboard
+    ws.write(r, 0, 'Total Active Employees:', f_kpi_l)
+    ws.write(r, 1, summary['total_active_employees'], f_kpi_v); r += 1
+    if summary['attrition_monthly'] is not None:
+        ws.write(r, 0, 'Attrition (Monthly):', f_kpi_l)
+        ws.write(r, 1, f"{summary['attrition_monthly']*100:.2f}%", f_kpi_v); r += 1
+        ws.write(r, 0, 'Attrition (Annual):', f_kpi_l)
+        ws.write(r, 1, f"{summary['attrition_annual']*100:.2f}%", f_kpi_v); r += 1
+    else:
+        ws.write(r, 0, 'Attrition:', f_kpi_l)
+        ws.write(r, 1, 'N/A — Set in Global Parameters', f_kpi_v); r += 1
+    if summary['active_clients'] is not None:
+        ws.write(r, 0, 'Active Clients:', f_kpi_l)
+        ws.write(r, 1, summary['active_clients'], f_kpi_v); r += 1
+    else:
+        ws.write(r, 0, 'Active Clients:', f_kpi_l)
+        ws.write(r, 1, 'N/A — Upload volume or HubSpot file', f_kpi_v); r += 1
+    ws.write(r, 0, 'Overall Health Score:', f_kpi_l)
+    ws.write(r, 1, summary['health_score'], f_kpi_v); r += 2
+
+    # Header row
+    headers = ['Department', 'Roles Included', 'Staff Count', 'Total Employees / Clients',
+               'Current Ratio', 'Benchmark Range', 'Health Status', 'Recommendation']
+    for c, h in enumerate(headers):
+        ws.write(r, c, h, f_hdr)
+    ws.set_row(r, 32); r += 1
+
+    for row_d in rows:
+        ws.write(r, 0, row_d['Department'],       f_body)
+        ws.write(r, 1, row_d['Roles Included'],   f_body)
+        ws.write(r, 2, row_d['Staff Count'],      f_body_c)
+        ws.write(r, 3, row_d['Denominator'],      f_body_c)
+        ws.write(r, 4, row_d['Current Ratio'],    f_body_c)
+        ws.write(r, 5, row_d['Benchmark Range'],  f_body)
+        status = row_d['Health Status']
+        if status.startswith('🟢'):   fmt_s = f_green
+        elif status.startswith('🟡'): fmt_s = f_yel
+        elif status.startswith('🔴'): fmt_s = f_red
+        else:                          fmt_s = f_gray
+        ws.write(r, 6, status, fmt_s)
+        ws.write(r, 7, row_d['Recommendation'], f_body)
+        ws.set_row(r, 60)
+        r += 1
+    ws.freeze_panes(0, 0)
+    ws.set_tab_color('#7030A0')
+
+
 # ============================================================
 #  EXCEL EXPORT — PROFESSIONAL FORMATTING (POST-PROCESS)
 # ============================================================
@@ -4079,7 +4480,13 @@ with tab1:
             )
             if _hc_upload:
                 try:
-                    st.session_state.hc_data = _process_hc_report(_hc_upload.read())
+                    _hc_bytes = _hc_upload.read()
+                    st.session_state['_hc_file_bytes'] = _hc_bytes   # cache raw bytes for Org Chart
+                    try:
+                        st.session_state['_hc_raw_df'] = pd.read_excel(BytesIO(_hc_bytes), sheet_name='Weekly Report')
+                    except Exception:
+                        st.session_state['_hc_raw_df'] = pd.DataFrame()
+                    st.session_state.hc_data = _process_hc_report(_hc_bytes)
                     st.session_state['_hc_version'] = st.session_state.get('_hc_version', 0) + 1
                     _hc_loaded = st.session_state.hc_data
                     _n_mgrs = _hc_loaded.get('acct_managers', 0) + _hc_loaded.get('asst_managers', 0)
@@ -9997,6 +10404,28 @@ if "calc_data" in st.session_state:
                 f"sources [srs:{_cm_dbg['src_srs']} dc:{_cm_dbg['src_dc']} df_clean:{_cm_dbg['src_dfcl']} hs:{_cm_dbg['src_hs']}] · "
                 f"vol_bytes:{'yes' if _vol_bytes else 'NO'}"
             )
+            # Tabs 12 + 13: Org Chart + Non-Delivery Department Ratios
+            _hc_raw_for_org = st.session_state.get('_hc_raw_df', pd.DataFrame())
+            if (_hc_raw_for_org is None or _hc_raw_for_org.empty) and st.session_state.get('_hc_file_bytes'):
+                try:
+                    _hc_raw_for_org = pd.read_excel(BytesIO(st.session_state['_hc_file_bytes']),
+                                                    sheet_name='Weekly Report')
+                except Exception:
+                    _hc_raw_for_org = pd.DataFrame()
+            try:
+                _write_org_chart_sheet(writer, _hc_raw_for_org)
+            except Exception as _e_org:
+                st.warning(f"⚠️ Org Chart sheet failed: {_e_org}")
+            # Resolve attrition (monthly, decimal) + active clients (use Client_Mapping size)
+            try:
+                _attr_monthly = float(st.session_state.get('gp_att', 3.0)) / 100.0
+            except Exception:
+                _attr_monthly = None
+            _active_clients_n = len(_cm_df) if not _cm_df.empty else None
+            try:
+                _write_non_delivery_sheet(writer, _hc_raw_for_org, _attr_monthly, _active_clients_n)
+            except Exception as _e_nd:
+                st.warning(f"⚠️ Non-Delivery Dept Ratios sheet failed: {_e_nd}")
             # Client Management Hrs Methodology — explanatory sheet (linked from every WF_POD)
             _meth_ws = writer.book.add_worksheet('Client_Mgmt_Methodology')
             _meth_book = writer.book
