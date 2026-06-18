@@ -12,7 +12,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 
 # --- APP VERSION ---
-APP_VERSION = "v6.10.2026.9.28AM"
+APP_VERSION = "v6.17.2026.8.20PM"
 
 def _lc_short_m0(gl_series):
     """Bool array: True if Go Live month has < 15 working days remaining (< 3 weeks)."""
@@ -342,6 +342,11 @@ def _make_ai_prediction_fragment(pfx, add_to_scenario, add_to_baseline=False):
                 key=f"{pfx}_ai_manual_editor"
             )
 
+        st.caption(
+            "💡 Cost auto-adjusted to stay within **45–55% of MRR**: "
+            "if cost falls outside the band, AHT is scaled to the nearest edge "
+            "(up to 45% when too low, down to 55% when too high)."
+        )
         if st.button("🤖 Run AI Prediction", type="primary", use_container_width=True, key=f"{pfx}_ai_run"):
             _use_manual = (_ai_input == "✏️ Manual Entry")
             _use_queued = not _use_manual and _has_queued and _ai_nc_file is None
@@ -595,7 +600,7 @@ def _make_ai_prediction_fragment(pfx, add_to_scenario, add_to_baseline=False):
 
                         df_pred = pd.DataFrame(rows)
 
-                        # ── 5. APPLY 35–50% MARGIN RULE ───────────────────────────
+                        # ── 5. APPLY 45–55% MARGIN BAND (AHT scaled to nearest band edge) ──
                         client_costs = df_pred.groupby('_client').agg(
                             total_full_cost=('_full_cost_p', 'sum'),
                             total_full_cost_r=('_full_cost_r', 'sum'),
@@ -607,10 +612,11 @@ def _make_ai_prediction_fragment(pfx, add_to_scenario, add_to_baseline=False):
                             c_mrr, m_cost = cdata['mrr'], cdata['total_cost']
                             if c_mrr <= 0 or m_cost <= 0:
                                 continue
-                            max_t, min_t = c_mrr * 0.50, c_mrr * 0.35   # cost capped at 35–50% of MRR
+                            # Band: 45–55% del MRR. Si cost cae fuera, escala AHT al borde más cercano del band.
+                            max_t, min_t = c_mrr * 0.55, c_mrr * 0.45   # cost capped at 45–55% of MRR
                             adj = 1.0
-                            if m_cost > max_t: adj = max_t / m_cost
-                            elif m_cost < min_t: adj = min_t / m_cost
+                            if m_cost > max_t: adj = max_t / m_cost      # scale DOWN if > 55%
+                            elif m_cost < min_t: adj = min_t / m_cost    # scale UP   if < 45%
                             if adj != 1.0:
                                 mask = df_pred['_client'] == c_name
                                 for col in ['_proc_aht', '_rev_aht']:
@@ -1453,16 +1459,21 @@ def _run_pipeline(files_by_type, log):
     hs_file  = files_by_type.get('hubspot')
 
     if vol_file is None:
+        _log_event('error', "Pipeline aborted: no Volume & AHT file uploaded")
         raise ValueError("No Volume & AHT file detected. Please upload it.")
 
     log("── Step 1/4: Loading Volume & AHT ──────────────────")
-    df_vol = _load_volume_aht(vol_file, log)
+    with _LogTimer(f"Pipeline 1/4 — Volume & AHT ({getattr(vol_file, 'name', 'file')})"):
+        df_vol = _load_volume_aht(vol_file, log)
+    _log_event('info', f"Volume loaded: {len(df_vol):,} rows · {df_vol['client_name'].nunique() if 'client_name' in df_vol.columns else '?'} clients")
 
     if ip_file:
         log("── Step 2/4: Applying Ideal Pairs ──────────────────")
-        df_vol = _apply_ideal_pairs(df_vol, ip_file, log)
+        with _LogTimer("Pipeline 2/4 — Ideal Pairs"):
+            df_vol = _apply_ideal_pairs(df_vol, ip_file, log)
     else:
         log("── Step 2/4: No Ideal Pairs file — using real roles ─")
+        _log_event('info', "Pipeline 2/4 — No Ideal Pairs file, using real roles fallback")
         # Use Proc/Rev Role columns as Ideal Proc/Rev
         df_vol['Ideal Proc'] = df_vol.get('Proc Role', 'Accountant I')
         df_vol['Ideal Rev']  = df_vol.get('Rev Role',  'Sr. Accountant')
@@ -3720,6 +3731,419 @@ def _apply_pro_formatting(xlsx_bytes: bytes) -> bytes:
     return out.getvalue()
 
 
+# ============================================================
+#  EVENT LOG — runtime tracing for debugging and audit
+# ============================================================
+_EVENT_LOG_MAX = 500   # cap to prevent unbounded growth
+
+def _log_event(level: str, msg: str, duration_ms: float = None):
+    """Append a timestamped event to st.session_state['_event_log'].
+    level: 'info' | 'success' | 'warn' | 'error' | 'step' | 'start' | 'end'
+    """
+    try:
+        if '_event_log' not in st.session_state:
+            st.session_state['_event_log'] = []
+        ts = pd.Timestamp.now().strftime('%H:%M:%S')
+        entry = {'ts': ts, 'level': str(level).lower(), 'msg': str(msg)}
+        if duration_ms is not None:
+            entry['duration_ms'] = round(float(duration_ms), 1)
+        st.session_state['_event_log'].append(entry)
+        # Trim to keep the most recent N events
+        if len(st.session_state['_event_log']) > _EVENT_LOG_MAX:
+            st.session_state['_event_log'] = st.session_state['_event_log'][-_EVENT_LOG_MAX:]
+    except Exception:
+        pass   # logging must never break the app
+
+
+def _clear_event_log():
+    st.session_state['_event_log'] = []
+
+
+def _render_event_log(container=None):
+    """Render the event log inside a Streamlit expander.
+    container: optional container (e.g. st.sidebar). Defaults to st."""
+    if container is None:
+        container = st
+    log = st.session_state.get('_event_log', []) or []
+    with container.expander(f"📜 Event Log ({len(log)} entries)", expanded=False):
+        if not log:
+            st.caption("Log is empty. Actions will appear here as you work.")
+            return
+        col_a, col_b = st.columns([3, 1])
+        with col_a:
+            _filter = st.selectbox(
+                "Filter:", ['All', 'Errors only', 'Warnings + Errors', 'Steps only'],
+                key='_event_log_filter', label_visibility='collapsed'
+            )
+        with col_b:
+            if st.button("🗑️ Clear", key='_event_log_clear_btn', use_container_width=True):
+                _clear_event_log()
+                st.rerun()
+        # Filter
+        if _filter == 'Errors only':
+            shown = [e for e in log if e['level'] == 'error']
+        elif _filter == 'Warnings + Errors':
+            shown = [e for e in log if e['level'] in ('warn', 'error')]
+        elif _filter == 'Steps only':
+            shown = [e for e in log if e['level'] in ('step', 'start', 'end')]
+        else:
+            shown = log
+        # Render most recent first, in a compact monospace block
+        ICON = {
+            'info':    'ℹ️',  'success': '✅',  'warn':  '⚠️',  'error': '❌',
+            'step':    '⚙️',  'start':   '⏳',  'end':   '🏁',
+        }
+        _lines = []
+        for e in reversed(shown[-200:]):   # cap render at 200 to keep UI snappy
+            icon = ICON.get(e['level'], '•')
+            dur  = f" ({e['duration_ms']:.0f} ms)" if 'duration_ms' in e else ''
+            _lines.append(f"[{e['ts']}] {icon} {e['msg']}{dur}")
+        st.code('\n'.join(_lines) if _lines else '(no entries match filter)', language=None)
+
+
+# ============================================================
+#  AIO (All-in-One) INPUT — Phase 2
+# ============================================================
+# A single Excel file that bundles every input the cascade needs so the
+# user can rerun the full pipeline with one upload instead of stepping
+# through Step 0 each time. Selective: user picks which sheets to apply.
+
+_AIO_VERSION = "1.0"
+
+_AIO_SHEETS = [
+    # (sheet_name, description, required_columns_for_validation)
+    ('_README',           'Instructions and sheet reference.', []),
+    ('Global_Parameters', 'Cascade parameters (Parameter | Value).',
+        ['Parameter', 'Value']),
+    ('Volume',            'Main volume & AHT data — replaces the vol sheet of the volume Excel.',
+        ['client_name', 'record_id', 'type', 'subtype',
+         'processor', 'reviewer',
+         'Closed tickets with Proc time', 'Closed tickets with rev time',
+         '>>> FINAL Capacity Proc AHT', '>>> FINAL Capacity Rev AHT',
+         'POD', 'Sr. Accountant', 'MRR', 'Go Live', 'Final Service Date']),
+    ('SRS',               'Sr / AM / GA client assignments (Email + Hubspot ID).',
+        ['Email', 'Hubspot ID']),
+    ('DC',                'Door count + HubSpot backup (Record ID, Company name, Lifecycle Stage at column T onward).',
+        ['Record ID', 'Company name', 'Lifecycle Stage']),
+    ('Ideal_Pairs',       '(Optional) Processor / QA ideal role mapping.',
+        ['Process', 'Sub-process', 'Processor', 'QA']),
+    ('HC_Weekly',         'HC Weekly Report (same schema as the standalone HC file).',
+        ['Full name', 'Work Email', 'Job title', 'Worker Status',
+         'Department unit', 'Manager email', 'Start Date']),
+    ('HubSpot',           '(Optional) HubSpot export.',
+        ['Record ID']),
+]
+
+_AIO_GLOBAL_PARAM_MAP = {
+    # AIO parameter name → session_state key
+    'attrition_monthly_pct': 'gp_att',
+    'absenteeism_pct':       'gp_abs',
+    'util_acc1_pct':         'gp_util_acc1',
+    'util_gen_pct':          'gp_util_gen',
+    'util_sr_pct':           'gp_util_sr',
+    'fixed_days':            'gp_fixed_days',
+}
+
+_AIO_DEFAULT_PARAMS = {
+    'attrition_monthly_pct': 3.0,
+    'absenteeism_pct':       10.0,
+    'util_acc1_pct':         85.0,
+    'util_gen_pct':          80.0,
+    'util_sr_pct':           50.0,
+    'fixed_days':            21,
+}
+
+
+def _build_aio_template_bytes() -> bytes:
+    """Generate a clean, empty AIO Input template. Light/compact xlsx."""
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine='xlsxwriter') as wr:
+        book = wr.book
+        f_hdr  = book.add_format({'bold': True, 'bg_color': '#1F3864',
+                                  'font_color': 'white', 'align': 'center',
+                                  'valign': 'vcenter', 'text_wrap': True, 'font_size': 11})
+        f_title = book.add_format({'bold': True, 'font_size': 16, 'font_color': '#1F3864'})
+        f_h2    = book.add_format({'bold': True, 'font_size': 12, 'font_color': '#1F3864'})
+        f_body  = book.add_format({'text_wrap': True, 'valign': 'top', 'font_size': 11})
+
+        # README
+        ws = book.add_worksheet('_README')
+        ws.hide_gridlines(2)
+        ws.set_column('A:A', 28); ws.set_column('B:B', 80)
+        ws.write(0, 0, f'📦 AIO Input Template — v{_AIO_VERSION}', f_title)
+        ws.set_row(0, 28)
+        ws.merge_range(1, 0, 1, 1,
+            'Single file that bundles every input the Capacity cascade needs. '
+            'Fill in only the sheets you want to use — leave others empty or delete them. '
+            'When uploaded via "📦 Load AIO Input" the loader will auto-detect populated sheets '
+            'and apply only the ones you check.', f_body)
+        ws.set_row(1, 60)
+        r = 3
+        ws.write(r, 0, 'Sheet', f_hdr); ws.write(r, 1, 'Purpose', f_hdr); r += 1
+        for sn, desc, _ in _AIO_SHEETS:
+            if sn == '_README': continue
+            ws.write(r, 0, sn, f_h2)
+            ws.write(r, 1, desc, f_body)
+            ws.set_row(r, 32); r += 1
+        ws.write(r + 1, 0, 'Global_Parameters reference', f_h2); r += 2
+        ws.write(r, 0, 'Parameter', f_hdr); ws.write(r, 1, 'Meaning / unit', f_hdr); r += 1
+        for p, key in _AIO_GLOBAL_PARAM_MAP.items():
+            ws.write(r, 0, p)
+            ws.write(r, 1, f'Maps to session_state key "{key}".')
+            r += 1
+        ws.set_tab_color('#4472C4')
+
+        # Global_Parameters — pre-filled with defaults
+        gp_ws = book.add_worksheet('Global_Parameters')
+        gp_ws.set_column('A:A', 30); gp_ws.set_column('B:B', 18)
+        gp_ws.write(0, 0, 'Parameter', f_hdr); gp_ws.write(0, 1, 'Value', f_hdr)
+        gp_r = 1
+        for p_name, default_val in _AIO_DEFAULT_PARAMS.items():
+            gp_ws.write(gp_r, 0, p_name)
+            gp_ws.write(gp_r, 1, default_val)
+            gp_r += 1
+        gp_ws.set_tab_color('#70AD47')
+
+        # All other data sheets — header row only
+        for sn, _, cols in _AIO_SHEETS:
+            if sn in ('_README', 'Global_Parameters'): continue
+            sws = book.add_worksheet(sn)
+            for ci, col in enumerate(cols):
+                sws.write(0, ci, col, f_hdr)
+            sws.set_column(0, max(0, len(cols) - 1), 18)
+            sws.set_tab_color('#5B9BD5')
+    return out.getvalue()
+
+
+def _parse_aio_file(uploaded_file):
+    """Read AIO file. Returns dict {sheet_name: {'df': DataFrame, 'rows': int, 'has_data': bool, 'missing_cols': [..]}}"""
+    if uploaded_file is None:
+        return {}
+    try:
+        uploaded_file.seek(0)
+        data = uploaded_file.read()
+    except Exception:
+        return {}
+    try:
+        xl = pd.ExcelFile(BytesIO(data))
+    except Exception as _e:
+        _log_event('error', f"AIO file unreadable: {_e}")
+        return {}
+    parsed = {'_raw_bytes': data, '_sheet_names': xl.sheet_names}
+    for sn, _, required_cols in _AIO_SHEETS:
+        if sn not in xl.sheet_names:
+            continue
+        try:
+            df = pd.read_excel(BytesIO(data), sheet_name=sn)
+            df.columns = df.columns.astype(str).str.strip()
+        except Exception as _e:
+            _log_event('warn', f"AIO sheet '{sn}' failed to parse: {_e}")
+            continue
+        non_empty = df.dropna(how='all')
+        missing = []
+        if required_cols and not non_empty.empty:
+            present = set(c.lower().strip() for c in df.columns)
+            missing = [c for c in required_cols if c.lower().strip() not in present]
+        parsed[sn] = {
+            'df':           df,
+            'rows':         len(non_empty),
+            'has_data':     not non_empty.empty,
+            'missing_cols': missing,
+        }
+    return parsed
+
+
+def _synthesize_vol_file(vol_df, srs_df=None, dc_df=None, ip_df=None) -> bytes:
+    """Build a synthetic Volume Excel (Query result + srs + dc + Ideal sheets) for downstream parsing."""
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine='xlsxwriter') as wr:
+        if vol_df is not None and not vol_df.empty:
+            vol_df.to_excel(wr, sheet_name='Query result', index=False)
+        if srs_df is not None and not srs_df.empty:
+            srs_df.to_excel(wr, sheet_name='srs', index=False)
+        if dc_df is not None and not dc_df.empty:
+            dc_df.to_excel(wr, sheet_name='dc', index=False)
+        if ip_df is not None and not ip_df.empty:
+            ip_df.to_excel(wr, sheet_name='Ideal', index=False)
+    return out.getvalue()
+
+
+def _synthesize_hc_file(hc_df) -> bytes:
+    """Build a synthetic HC Excel with a single 'Weekly Report' sheet."""
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine='xlsxwriter') as wr:
+        hc_df.to_excel(wr, sheet_name='Weekly Report', index=False)
+    return out.getvalue()
+
+
+class _BytesUploadedFile:
+    """Wraps bytes as a file-like object compatible with _load_volume_aht / _process_hc_report."""
+    def __init__(self, name: str, data: bytes):
+        self.name  = name
+        self.size  = len(data)
+        self._data = data
+        self._buf  = BytesIO(data)
+    def read(self, *a, **kw):
+        return self._buf.read(*a, **kw)
+    def seek(self, pos, *a, **kw):
+        return self._buf.seek(pos, *a, **kw)
+    def getbuffer(self):
+        return self._buf.getbuffer()
+
+
+def _apply_aio_selections(parsed, selections):
+    """Apply selected AIO sheets to session_state.
+    selections: dict {sheet_name: bool}
+    Returns: dict with status info per sheet."""
+    results = {}
+    # ── 1. Global_Parameters ──
+    if selections.get('Global_Parameters') and 'Global_Parameters' in parsed:
+        try:
+            with _LogTimer("AIO — Global Parameters"):
+                gp_df = parsed['Global_Parameters']['df']
+                applied = []
+                for _, row in gp_df.iterrows():
+                    p_name = str(row.get('Parameter', '')).strip()
+                    if not p_name or p_name.lower() == 'nan': continue
+                    val = row.get('Value', None)
+                    if pd.isna(val): continue
+                    sess_key = _AIO_GLOBAL_PARAM_MAP.get(p_name)
+                    if sess_key:
+                        try:
+                            st.session_state[sess_key] = float(val) if sess_key != 'gp_fixed_days' else int(val)
+                            applied.append(p_name)
+                        except Exception:
+                            pass
+                _log_event('success', f"Global Parameters applied: {applied}")
+                results['Global_Parameters'] = {'ok': True, 'detail': f"{len(applied)} params"}
+        except Exception as _e:
+            _log_event('error', f"Global Parameters failed: {_e}")
+            results['Global_Parameters'] = {'ok': False, 'detail': str(_e)}
+
+    # ── 2. Volume + SRS + DC + Ideal_Pairs ──> synthesize a single vol file ──
+    use_vol = selections.get('Volume') and 'Volume' in parsed and parsed['Volume']['has_data']
+    if use_vol:
+        try:
+            with _LogTimer("AIO — Volume + SRS + DC synthesis"):
+                vol_df = parsed['Volume']['df']
+                srs_df = parsed.get('SRS', {}).get('df') if selections.get('SRS') else None
+                dc_df  = parsed.get('DC',  {}).get('df') if selections.get('DC')  else None
+                ip_df  = parsed.get('Ideal_Pairs', {}).get('df') if selections.get('Ideal_Pairs') else None
+                synth_bytes = _synthesize_vol_file(vol_df, srs_df, dc_df, ip_df)
+                synth_file  = _BytesUploadedFile('AIO_synth_volume.xlsx', synth_bytes)
+                st.session_state['_aio_synth_vol_file']  = synth_file
+                st.session_state['_aio_synth_vol_bytes'] = synth_bytes
+                # Pre-populate _vol_file_bytes so downstream readers find srs/dc immediately
+                st.session_state['_vol_file_bytes'] = synth_bytes
+                # Run the actual loader to populate df_clean
+                _aio_log = lambda m: _log_event('info', m)
+                df_vol = _load_volume_aht(synth_file, _aio_log)
+                # If Ideal_Pairs was provided as a separate sheet but no ideal mapping yet, apply
+                if ip_df is not None and not ip_df.empty and 'Ideal Proc' not in df_vol.columns:
+                    try:
+                        ip_file = _BytesUploadedFile('AIO_ideal.xlsx',
+                            _synthesize_vol_file(None, None, None, ip_df))
+                        df_vol = _apply_ideal_pairs(df_vol, ip_file, _aio_log)
+                    except Exception as _e_ip:
+                        _log_event('warn', f"Ideal Pairs apply failed (will fall back to Proc/Rev Role): {_e_ip}")
+                # If no ideal pairs at all, mirror real roles
+                if 'Ideal Proc' not in df_vol.columns:
+                    df_vol['Ideal Proc'] = df_vol.get('Proc Role', 'Accountant I')
+                    df_vol['Ideal Rev']  = df_vol.get('Rev Role',  'Sr. Accountant')
+                # Clean dates / numerics (mirrors Step 1 pre-processing)
+                for _dc_col in ['Go Live', 'Final Service Date']:
+                    if _dc_col in df_vol.columns:
+                        df_vol[_dc_col] = pd.to_datetime(df_vol[_dc_col], errors='coerce')
+                if 'MRR' in df_vol.columns:
+                    df_vol['MRR'] = (df_vol['MRR'].astype(str)
+                                     .str.replace(r'[$, ]', '', regex=True))
+                    df_vol['MRR'] = pd.to_numeric(df_vol['MRR'], errors='coerce').fillna(0.0)
+                for _nc in ['Capacity Processing Hours', 'Capacity reviewing hours',
+                            'Closed tickets with Proc time', 'Closed tickets with rev time',
+                            '>>> FINAL Capacity Proc AHT', '>>> FINAL Capacity Rev AHT']:
+                    if _nc in df_vol.columns:
+                        df_vol[_nc] = pd.to_numeric(df_vol[_nc], errors='coerce').fillna(0.0)
+                    else:
+                        df_vol[_nc] = 0.0
+                # Build df_clients_unique
+                _duc_agg = {'MRR': 'max',
+                            'Go Live':            lambda x: x.dropna().iloc[0] if not x.dropna().empty else pd.NaT,
+                            'Final Service Date': lambda x: x.dropna().iloc[0] if not x.dropna().empty else pd.NaT}
+                if 'record_id' in df_vol.columns:
+                    _duc_agg['record_id'] = lambda x: next((v for v in x if str(v).strip()), '')
+                df_unique = df_vol.groupby('client_name', as_index=False).agg(_duc_agg)
+                st.session_state.df_clean          = df_vol.copy()
+                st.session_state.df_clients_unique = df_unique.copy()
+                try:
+                    _build_client_master_map()
+                except Exception as _e_map:
+                    _log_event('warn', f"client_master_map rebuild skipped: {_e_map}")
+                results['Volume'] = {'ok': True, 'detail': f"{len(df_vol):,} rows"}
+        except Exception as _e:
+            _log_event('error', f"Volume processing failed: {_e}")
+            results['Volume'] = {'ok': False, 'detail': str(_e)}
+
+    # ── 3. HC_Weekly ──
+    if selections.get('HC_Weekly') and 'HC_Weekly' in parsed and parsed['HC_Weekly']['has_data']:
+        try:
+            with _LogTimer("AIO — HC Weekly Report"):
+                hc_df = parsed['HC_Weekly']['df']
+                hc_bytes = _synthesize_hc_file(hc_df)
+                st.session_state['_hc_file_bytes'] = hc_bytes
+                st.session_state['_hc_raw_df']     = hc_df
+                st.session_state.hc_data = _process_hc_report(hc_bytes)
+                _hcl = st.session_state.hc_data
+                _log_event('success',
+                    f"HC parsed via AIO: total={_hcl.get('total',0)} "
+                    f"AMs={len(_hcl.get('by_am_email', {}) or {})} "
+                    f"GAs={len(_hcl.get('by_ga_email', {}) or {})}")
+                results['HC_Weekly'] = {'ok': True, 'detail': f"{len(hc_df):,} rows"}
+        except Exception as _e:
+            _log_event('error', f"HC processing failed: {_e}")
+            results['HC_Weekly'] = {'ok': False, 'detail': str(_e)}
+
+    # ── 4. HubSpot (optional) ──
+    if selections.get('HubSpot') and 'HubSpot' in parsed and parsed['HubSpot']['has_data']:
+        try:
+            with _LogTimer("AIO — HubSpot"):
+                hs_df = parsed['HubSpot']['df']
+                # Save raw bytes so _parse_hubspot_file can run via file path
+                out = BytesIO()
+                with pd.ExcelWriter(out, engine='xlsxwriter') as wr:
+                    hs_df.to_excel(wr, index=False)
+                hs_file = _BytesUploadedFile('AIO_hubspot.xlsx', out.getvalue())
+                st.session_state['hs_parsed'] = _parse_hubspot_file(hs_file)
+                results['HubSpot'] = {'ok': True, 'detail': f"{len(hs_df):,} rows"}
+        except Exception as _e:
+            _log_event('error', f"HubSpot processing failed: {_e}")
+            results['HubSpot'] = {'ok': False, 'detail': str(_e)}
+
+    return results
+
+
+class _LogTimer:
+    """Context manager: logs a 'start' event on enter, 'end' on exit with duration.
+    Usage:  with _LogTimer('Loading volume file'): ... do work ...
+    """
+    def __init__(self, msg: str, level_end: str = 'success'):
+        self.msg = msg
+        self.level_end = level_end
+        self._t0 = None
+    def __enter__(self):
+        import time
+        self._t0 = time.time()
+        _log_event('start', self.msg)
+        return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        import time
+        dur_ms = (time.time() - self._t0) * 1000
+        if exc_type is not None:
+            _log_event('error', f"{self.msg} — FAILED: {exc_val}", duration_ms=dur_ms)
+        else:
+            _log_event(self.level_end, f"{self.msg} — done", duration_ms=dur_ms)
+        return False   # never swallow exceptions
+
+
 AFFECTS_OPTIONS = [
     "Vol Proc",
     "Vol Rev",
@@ -3892,6 +4316,8 @@ calc_mode  = "Fixed days per month"; fixed_days = 22
 holidays_per_month = {mes: 0 for mes in meses_proyeccion}
 
 # ── START OVER ───────────────────────────────────────────────────────────────
+_render_event_log(st.sidebar)
+st.sidebar.divider()
 if st.sidebar.button("🔄 Start Over", use_container_width=True, key="start_over_btn"):
     st.session_state.clear()
     st.rerun()
@@ -4464,6 +4890,78 @@ with tab1:
                 "You can also upload a different Excel file below to override."
             )
 
+        # ── 📦 AIO Loader (Phase 2): single-file ingest ────────────────────────
+        with st.expander("📦 All-in-One Input (load every input from a single file)", expanded=False):
+            st.caption(
+                "Upload a pre-filled AIO Input file to populate Volume, HC, HubSpot and Global "
+                "Parameters at once — no need to upload each file separately. "
+                "Pick which sheets to apply; the cascade will run automatically."
+            )
+            _aio_dl_col, _aio_up_col = st.columns([1, 2])
+            with _aio_dl_col:
+                try:
+                    _aio_tpl_bytes = _build_aio_template_bytes()
+                    st.download_button(
+                        "📥 Download AIO Template",
+                        data=_aio_tpl_bytes,
+                        file_name=f"Capacity_AIO_Input_template_v{_AIO_VERSION}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+                except Exception as _e_tpl:
+                    st.warning(f"Template generator failed: {_e_tpl}")
+            with _aio_up_col:
+                _aio_file = st.file_uploader(
+                    "Upload AIO Input file",
+                    type=["xlsx"],
+                    key="aio_input_upload",
+                )
+            if _aio_file is not None:
+                _aio_parsed = _parse_aio_file(_aio_file)
+                _detected = [(sn, info) for sn, info in _aio_parsed.items()
+                             if isinstance(info, dict) and 'rows' in info]
+                if not _detected:
+                    st.warning("⚠️ No recognized sheets detected in the AIO file.")
+                else:
+                    st.markdown("**Detected sheets — pick which to apply:**")
+                    _aio_selections = {}
+                    for sn, info in _detected:
+                        rows  = info.get('rows', 0)
+                        miss  = info.get('missing_cols', [])
+                        has   = info.get('has_data', False)
+                        _disp = f"**{sn}** — {rows:,} non-empty rows"
+                        if miss:
+                            _disp += f" · ⚠️ missing: {', '.join(miss)}"
+                        elif not has:
+                            _disp += " · (empty — will be skipped)"
+                        _aio_selections[sn] = st.checkbox(
+                            _disp,
+                            value=has and not miss,
+                            key=f"_aio_sel_{sn}",
+                            disabled=(not has),
+                        )
+                    if st.button("🚀 Apply Selected & Auto-Run Cascade",
+                                 type="primary", use_container_width=True,
+                                 key="_aio_apply_btn"):
+                        _log_event('step', f"AIO Apply clicked — selections: "
+                                   f"{[k for k,v in _aio_selections.items() if v]}")
+                        with _LogTimer("AIO — apply selections"):
+                            _aio_results = _apply_aio_selections(_aio_parsed, _aio_selections)
+                        # Summary
+                        _ok_n = sum(1 for r in _aio_results.values() if r.get('ok'))
+                        _fail = [k for k, r in _aio_results.items() if not r.get('ok')]
+                        if _fail:
+                            st.warning(f"⚠️ Applied {_ok_n} sheet(s). Skipped/failed: {', '.join(_fail)}")
+                        else:
+                            st.success(f"✅ Applied {_ok_n} sheet(s) successfully. Triggering cascade…")
+                        # Auto-run chain: Step 1 baseline → Step 3 cascade
+                        # Step 1's exit also sets _auto_run_cascade so Step 3 fires.
+                        st.session_state['_show_step1']         = True
+                        st.session_state['_auto_run_baseline']  = True
+                        st.session_state['_auto_run_cascade']   = True
+                        st.rerun()
+        st.divider()
+
         _tab1_left, _tab1_right = st.columns(2)
         with _tab1_left:
             uploaded_file = st.file_uploader(
@@ -4480,13 +4978,21 @@ with tab1:
             )
             if _hc_upload:
                 try:
+                    _log_event('start', f"HC upload: {_hc_upload.name} ({_hc_upload.size:,} bytes)")
                     _hc_bytes = _hc_upload.read()
                     st.session_state['_hc_file_bytes'] = _hc_bytes   # cache raw bytes for Org Chart
                     try:
                         st.session_state['_hc_raw_df'] = pd.read_excel(BytesIO(_hc_bytes), sheet_name='Weekly Report')
-                    except Exception:
+                    except Exception as _e_raw:
                         st.session_state['_hc_raw_df'] = pd.DataFrame()
+                        _log_event('warn', f"HC raw DataFrame parse failed: {_e_raw}")
                     st.session_state.hc_data = _process_hc_report(_hc_bytes)
+                    _hc_l = st.session_state.hc_data
+                    _log_event('success',
+                        f"HC parsed: total={_hc_l.get('total',0)} · "
+                        f"by_role={_hc_l.get('by_role', {})} · "
+                        f"AMs={len(_hc_l.get('by_am_email', {}) or {})} · "
+                        f"GAs={len(_hc_l.get('by_ga_email', {}) or {})}")
                     st.session_state['_hc_version'] = st.session_state.get('_hc_version', 0) + 1
                     _hc_loaded = st.session_state.hc_data
                     _n_mgrs = _hc_loaded.get('acct_managers', 0) + _hc_loaded.get('asst_managers', 0)
@@ -6385,6 +6891,9 @@ if "calc_data" in st.session_state:
         _s3_ov = st.empty()
         if st.button("🔄 Apply Cascade & Generate Dashboards", type="primary", use_container_width=True) or _auto_cascade:
             _loading_overlay(_s3_ov, "Step 3 · Generating Dashboards", "🔄", 0, 5, "Initializing cascade…")
+            _log_event('start', "Step 3 cascade — Apply Cascade clicked")
+            import time as _time_casc
+            _t_casc = _time_casc.time()
 
             df               = st.session_state.df_clean.copy()
             df_clients_unique = st.session_state.df_clients_unique.copy()
@@ -7532,6 +8041,11 @@ if "calc_data" in st.session_state:
         ], sort_keys=True)
         st.session_state['_dash_env_prev'] = _dash_env_now
 
+        try:
+            _log_event('end', "Step 3 cascade — dashboards generated",
+                       duration_ms=(_time_casc.time() - _t_casc) * 1000)
+        except Exception:
+            pass
         st.success("✅ Dashboards and Final Reports Generated Successfully!")
 
         # ── View mode selector ────────────────────────────────────────────────────
@@ -9829,6 +10343,9 @@ if "calc_data" in st.session_state:
 
         from io import BytesIO
         output = BytesIO()
+        _log_event('start', "Export builder — generating Excel buffer")
+        import time as _time_exp
+        _t_exp = _time_exp.time()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             # Tab 1: Capacity Overview — Waterfall (transposed: metrics as rows, months as columns)
             _wf_exp = st.session_state.get('_wf_overall_export', pd.DataFrame())
@@ -10707,12 +11224,17 @@ if "calc_data" in st.session_state:
             st.session_state.final_dashboards.get('cliente', pd.DataFrame())
             ['Sr. Accountant'].dropna().astype(str).replace('', pd.NA).dropna().unique()
         ) if 'cliente' in st.session_state.get('final_dashboards', {}) else 0
+        _log_event('end',
+            f"Export builder — Excel buffer ready ({output.getbuffer().nbytes / 1024:.0f} KB)",
+            duration_ms=(_time_exp.time() - _t_exp) * 1000)
         # ── Apply professional formatting (post-process) ──────────────────────────
         try:
             with st.spinner("🎨 Applying professional formatting…"):
-                _formatted_bytes = _apply_pro_formatting(output.getvalue())
+                with _LogTimer("Pro formatting pass"):
+                    _formatted_bytes = _apply_pro_formatting(output.getvalue())
         except Exception as _e_fmt:
             st.warning(f"⚠️ Format pass failed — using unformatted buffer ({_e_fmt})")
+            _log_event('warn', f"Format pass failed: {_e_fmt}")
             _formatted_bytes = output.getvalue()
         # ── Cache the export buffer keyed by role mode ───────────────────────────
         _mode_tag_exp   = st.session_state.get('_cascade_role_mode', 'ideal')
