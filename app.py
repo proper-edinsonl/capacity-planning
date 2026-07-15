@@ -12,7 +12,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 
 # --- APP VERSION ---
-APP_VERSION = "v6.17.2026.8.20PM"
+APP_VERSION = "v7.4.2026.8.02PM"
 
 def _lc_short_m0(gl_series):
     """Bool array: True if Go Live month has < 15 working days remaining (< 3 weeks)."""
@@ -2189,13 +2189,14 @@ def _load_params_config(path: str) -> dict:
 # ── HC REPORT PROCESSING ─────────────────────────────────────────────────────
 
 _HC_ROLE_MAP = {
-    'accountant i':       'Accountant I',
-    'accountant ii':      'Accountant II',
-    'general accountant': 'General Accountant',
-    'sr. accountant':     'Sr. Accountant',
-    'sr accountant':      'Sr. Accountant',
-    'accounting manager': 'Acct. Manager',
-    'assistant manager':  'Asst. Manager',
+    'accountant i':           'Accountant I',
+    'accountant ii':          'Accountant II',
+    'general accountant':     'General Accountant',
+    'sr. accountant':         'Sr. Accountant',
+    'sr accountant':          'Sr. Accountant',
+    'principal accountant':   'Sr. Accountant',
+    'accounting manager':     'Acct. Manager',
+    'assistant manager':      'Asst. Manager',
 }
 
 @st.cache_data(show_spinner=False)
@@ -2482,7 +2483,8 @@ def _inject_scroll_reset():
     """Inject JS to smoothly scroll the Streamlit main panel to the top."""
     st.markdown("""<script>
 setTimeout(function(){
-    var m = window.parent.document.querySelector('section.main');
+    var d = window.parent.document;
+    var m = d.querySelector('section[data-testid="stMain"]') || d.querySelector('section.main');
     if(m) m.scrollTo({top:0, behavior:'smooth'});
 }, 350);
 </script>""", unsafe_allow_html=True)
@@ -3079,6 +3081,36 @@ def _ensure_am_ga_maps(hc_data):
     hc_data['by_am_email'] = by_am
     hc_data['by_ga_email'] = by_ga
     return hc_data
+
+
+def _mrr_sum_with_dc(duc_df, mask, month_idx):
+    """Sum MRR for masked clients in df_clients_unique, applying door count
+    variation multiplier per (client_lower, month_idx). The multiplier dict is
+    published by the Step 3 cascade in st.session_state['_dc_mrr_mult'].
+
+    Returns a plain MRR sum when no multiplier is active or client has no entry.
+    Module-level so every scope (cascade, dashboard rendering, export builder) can use it."""
+    if duc_df is None or len(duc_df) == 0 or 'MRR' not in duc_df.columns:
+        return 0.0
+    if mask is None:
+        return 0.0
+    try:
+        rows = duc_df.loc[mask]
+    except Exception:
+        return 0.0
+    if rows.empty:
+        return 0.0
+    mrr_series = pd.to_numeric(rows['MRR'], errors='coerce').fillna(0.0)
+    dc_mult = st.session_state.get('_dc_mrr_mult', {}) or {}
+    if not dc_mult:
+        return float(mrr_series.sum())
+    name_col = 'client_name' if 'client_name' in rows.columns else None
+    if not name_col:
+        return float(mrr_series.sum())
+    keys = rows[name_col].astype(str).str.strip().str.lower()
+    mult = keys.map(lambda k: dc_mult.get((k, month_idx), 1.0))
+    return float((mrr_series.values * mult.values).sum())
+
 
 
 def _build_org_chart_data(hc_raw_df):
@@ -4427,7 +4459,12 @@ st.markdown("""<script>
     /* ── 1. Scroll preservation via MutationObserver ── */
     var _scrollKey = 'cov_scroll_pos';
     var _scrollLocked = false;
-    function getMain(){ return doc.querySelector('section.main'); }
+    /* stMain is the real scroll container in current Streamlit; section.main
+       is the legacy fallback for older versions. */
+    function getMain(){
+        return doc.querySelector('section[data-testid="stMain"]')
+            || doc.querySelector('section.main');
+    }
 
     function saveScroll(){
         var m = getMain();
@@ -4541,10 +4578,13 @@ _stc_main_scroll.html("""
     }
 
     function pageScroller(){
-        // Streamlit app main scroll container — try a few selectors
-        return doc.querySelector('section.main')
-            || doc.querySelector('[data-testid="stAppViewContainer"] section')
-            || doc.querySelector('[data-testid="stAppViewContainer"]')
+        // Streamlit app main scroll container.
+        // stMain first (current Streamlit), then legacy section.main.
+        // NEVER fall back to '[data-testid="stAppViewContainer"] section' —
+        // that matches the SIDEBAR (first <section> in the container) and
+        // forwarding wheel deltas to it silently kills page scrolling.
+        return doc.querySelector('section[data-testid="stMain"]')
+            || doc.querySelector('section.main')
             || doc.scrollingElement
             || doc.documentElement;
     }
@@ -4583,8 +4623,10 @@ _stc_main_scroll.html("""
         if (p) { var t = p.scrollTop; p.scrollTop = t + 1; p.scrollTop = t; }
     }
     var _capObserver = new MutationObserver(function(){ refreshScroll(); });
-    var _capTarget = doc.querySelector('[data-testid="stAppViewBlockContainer"]')
+    var _capTarget = doc.querySelector('[data-testid="stMainBlockContainer"]')
+                  || doc.querySelector('[data-testid="stAppViewBlockContainer"]')
                   || doc.querySelector('.main .block-container')
+                  || doc.querySelector('section[data-testid="stMain"]')
                   || doc.querySelector('section.main');
     if (_capTarget) _capObserver.observe(_capTarget, { childList: true, subtree: false });
 
@@ -5383,6 +5425,15 @@ with tab1:
                         df = st.session_state.pipeline_vol_merged.copy()
                         df.columns = df.columns.str.strip()
 
+                    # ── Capture Record ID (PK) — same extraction as _load_volume_aht() ──
+                    # This direct-read path bypasses _load_volume_aht(), so record_id
+                    # must be normalized here too or HubSpot/Client Reconciliation
+                    # matching (which keys on record_id) silently breaks.
+                    if 'record_id' not in df.columns:
+                        _s1_rid_candidates = [c for c in df.columns
+                                              if 'record' in str(c).lower() and 'id' in str(c).lower()]
+                        df['record_id'] = _clean_record_id(df[_s1_rid_candidates[0]]) if _s1_rid_candidates else ''
+
                     # ── Apply active filters to df ────────────────────────────────
                     # Priority: client list > Sr. Accountant > POD.
                     # All three are applied so that selecting only a POD (without
@@ -5833,10 +5884,65 @@ if "calc_data" in st.session_state:
         def _norm_name(n):
             return ' '.join(str(n).lower().split())
 
+        # Record ID normalizer — everything compares as clean integer-strings
+        # (kills int64 vs "123.0" vs " 123 " mismatches between sources)
+        def _rid_int(v):
+            try:
+                _s = str(v).strip().replace(',', '')
+                if not _s or _s.lower() in ('nan', 'none'):
+                    return ''
+                return str(int(float(_s)))
+            except Exception:
+                return ''
+
         _baseline_clients_raw = st.session_state.calc_data.get('clientes_validos', [])
-        # Build normalized → original name map for volume clients
+        # Build normalized → original name map for volume clients (used as fallback only)
         _vol_norm_map = {_norm_name(c): c for c in _baseline_clients_raw}
-        _baseline_clients = set(_vol_norm_map.keys())   # normalized keys
+        _baseline_clients = set(_vol_norm_map.keys())   # normalized name keys (fallback)
+
+        # ── Record ID indexes — record_id is the PRIMARY key for reconciliation ──
+        # Name is only used as a fallback when a side is missing a rid.
+        # Source of truth for the volume side: df_clean (always carries record_id
+        # from _load_volume_aht); df_clients_unique used for current values.
+        _df_curr  = st.session_state.get('df_clients_unique', pd.DataFrame())
+        _df_clean_r = st.session_state.get('df_clean', pd.DataFrame())
+        _vol_rid_set     = set()      # normalized rids present in the volume side
+        _vol_rid_to_name = {}         # rid → volume client name (for display)
+        _vol_name_to_rid = {}         # normalized volume name → rid
+        if not _df_clean_r.empty and 'record_id' in _df_clean_r.columns and 'client_name' in _df_clean_r.columns:
+            _rid_pairs = _df_clean_r[['record_id', 'client_name']].drop_duplicates()
+            for _, _rp in _rid_pairs.iterrows():
+                _rid = _rid_int(_rp['record_id'])
+                if _rid:
+                    _vol_rid_set.add(_rid)
+                    _vol_rid_to_name[_rid] = str(_rp['client_name']).strip()
+                    _vol_name_to_rid[_norm_name(_rp['client_name'])] = _rid
+
+        # Current client data by name (df_clients_unique row: MRR / Go Live / FSD / POD)
+        _curr_map = {}
+        if not _df_curr.empty and 'client_name' in _df_curr.columns:
+            for _, _cr in _df_curr.iterrows():
+                _curr_map[_norm_name(_cr['client_name'])] = _cr
+        # rid → current row (resolved through the volume name so it works even if
+        # df_clients_unique lacks a record_id column)
+        _curr_by_rid = {}
+        for _rid, _vnm in _vol_rid_to_name.items():
+            _cr = _curr_map.get(_norm_name(_vnm))
+            if _cr is not None:
+                _curr_by_rid[_rid] = _cr
+
+        # ── FULL HubSpot lookup by rid (including churned rows) ──────────────
+        # Used to resolve the true lifecycle of volume clients that no longer
+        # pass the "active" filter (churn / no POD).
+        _hs_all_by_rid = {}
+        if 'record_id' in _df_hs.columns:
+            for _, _hall in _df_hs.iterrows():
+                _hr_rid = _rid_int(_hall.get('record_id'))
+                if _hr_rid and _hr_rid not in _hs_all_by_rid:
+                    _hs_all_by_rid[_hr_rid] = {
+                        'name':      str(_hall.get('client_name', '')).strip(),
+                        'lifecycle': str(_hall.get('_lifecycle', '') or '').strip(),
+                    }
 
         # Filter HubSpot to active clients only:
         # - lifecycle must not start with 'churn'
@@ -5852,38 +5958,69 @@ if "calc_data" in st.session_state:
         _df_hs_active = _df_hs[_hs_active_mask].copy()
         _df_hs_active['_name_norm'] = _df_hs_active['client_name'].apply(_norm_name)
 
-        # Build normalized name set for active HubSpot clients
+        # Build normalized name set for active HubSpot clients (fallback only)
         _hs_norm_set = set(_df_hs_active['_name_norm'].values)
 
-        # Get current client data from session state
-        _df_curr = st.session_state.get('df_clients_unique', pd.DataFrame())
-        _curr_map = {}
-        if not _df_curr.empty and 'client_name' in _df_curr.columns:
-            for _, _cr in _df_curr.iterrows():
-                _curr_map[_norm_name(_cr['client_name'])] = _cr
-
         # Build reconciliation rows
+        # Statuses (record_id is the match key):
+        #   In Both        — rid in Volume + active in HubSpot. Apply pre-checked only when
+        #                    name / POD / MRR / lifecycle(terminating) actually changed.
+        #   Name Changed   — same rid on both sides, different name. Apply pre-checked.
+        #   Churn          — rid in Volume but HubSpot lifecycle is churn*. Info only, unchecked.
+        #   Not in HubSpot — rid in Volume, absent from the HubSpot file entirely. Pre-checked.
+        #   New Client     — rid active in HubSpot but not in Volume → goes to AI projection.
         if st.session_state.get('hs_recon_df') is None:
             _recon_rows = []
-            _recon_seen = set()   # track normalized names already added
+            _recon_seen_rids  = set()   # rids already emitted (primary de-dup key)
+            _recon_seen_names = set()   # names already emitted (fallback de-dup when no rid)
 
-            # ── Pass 1: all active HubSpot clients ───────────────────────
+            # ── Pass 1: all active HubSpot clients — keyed by record_id ─
             for _, _hr in _df_hs_active.iterrows():
+                _rid_now    = _rid_int(_hr.get('record_id'))
                 _hname_norm = _hr['_name_norm']
-                _recon_seen.add(_hname_norm)
-                _in_vol = _hname_norm in _baseline_clients
-                _status = 'In Both' if _in_vol else 'Only in HubSpot'
 
-                _cur     = _curr_map.get(_hname_norm, {})
+                # Match Volume ↔ HubSpot on record_id first (stable), fall back to
+                # name only when the HubSpot side has no record_id.
+                if _rid_now:
+                    _in_vol = _rid_now in _vol_rid_set
+                    _recon_seen_rids.add(_rid_now)
+                    if _hname_norm:
+                        _recon_seen_names.add(_hname_norm)
+                    # Current values looked up by rid → survives name changes
+                    _vol_name_for_rid = _vol_rid_to_name.get(_rid_now)
+                    _cur = _curr_by_rid.get(_rid_now, _curr_map.get(_hname_norm, {}))
+                    _name_changed = bool(_in_vol and _vol_name_for_rid and
+                                         _norm_name(_vol_name_for_rid) != _hname_norm)
+                    # Guard the volume-side name so Pass 2 doesn't re-add it
+                    if _vol_name_for_rid:
+                        _recon_seen_names.add(_norm_name(_vol_name_for_rid))
+                else:
+                    _in_vol = _hname_norm in _baseline_clients
+                    _cur = _curr_map.get(_hname_norm, {})
+                    if _hname_norm:
+                        _recon_seen_names.add(_hname_norm)
+                    _name_changed = False
+
+                _status = 'In Both' if _in_vol else 'New Client'
+                if _name_changed:
+                    _status = 'Name Changed'
+
                 _cur_mrr = float(_cur.get('MRR', 0)) if hasattr(_cur, 'get') else 0.0
                 _cur_gl  = _cur.get('Go Live', pd.NaT) if hasattr(_cur, 'get') else pd.NaT
                 _cur_fsd = _cur.get('Final Service Date', pd.NaT) if hasattr(_cur, 'get') else pd.NaT
 
+                # Resolve current POD — prefer master map keyed by rid, then by name
                 _cmap_now = st.session_state.get('client_master_map', pd.DataFrame())
                 _cur_pod  = ''
                 if not _cmap_now.empty:
-                    _pm = _cmap_now[_cmap_now['client_key'] == _hname_norm]
-                    _cur_pod = str(_pm['pod'].iloc[0]).strip() if not _pm.empty else ''
+                    if _rid_now and 'record_id' in _cmap_now.columns:
+                        _cm_rids = _cmap_now['record_id'].astype(str).map(_rid_int)
+                        _pm_rid  = _cmap_now[_cm_rids == _rid_now]
+                        if not _pm_rid.empty:
+                            _cur_pod = str(_pm_rid['pod'].iloc[0]).strip()
+                    if not _cur_pod:
+                        _pm_name = _cmap_now[_cmap_now['client_key'] == _hname_norm]
+                        _cur_pod = str(_pm_name['pod'].iloc[0]).strip() if not _pm_name.empty else ''
                 if not _cur_pod or _cur_pod.lower() in ('nan', 'none', ''):
                     _cur_pod = str(_cur.get('POD', '') or '').strip() if hasattr(_cur, 'get') else ''
 
@@ -5892,28 +6029,18 @@ if "calc_data" in st.session_state:
                 _new_gl  = _hr['_start_date'].strftime('%Y-%m-%d') if pd.notna(_hr['_start_date']) else (
                                _cur_gl.strftime('%Y-%m-%d') if pd.notna(_cur_gl) else '')
                 _new_fsd = _hr['_fsd'].strftime('%Y-%m-%d') if pd.notna(_hr['_fsd']) else ''
-                _cur_fsd_str = str(_cur_fsd.date()) if pd.notna(_cur_fsd) else ''
-                _pod_diff = bool(_hs_pod) and _hs_pod.lower() != _cur_pod.lower()
+                # Apply pre-checked ONLY on real changes: name, POD, MRR,
+                # lifecycle turning terminating — or when the client is new.
+                _pod_diff = bool(_hs_pod) and bool(_cur_pod) and _hs_pod.lower() != _cur_pod.lower()
                 _mrr_diff = abs(_new_mrr - _cur_mrr) > 0.01
-                _gl_diff  = (pd.notna(_hr['_start_date']) and pd.notna(_cur_gl) and
-                             _hr['_start_date'].date() != pd.Timestamp(_cur_gl).date())
-                _fsd_diff = bool(_new_fsd) and _new_fsd != _cur_fsd_str  # only diff if FSD actually changed
-                _has_diff = (_status != 'In Both') or _mrr_diff or _gl_diff or _fsd_diff or _pod_diff
-
-                # Name-changed detection: IDs match but names differ
-                _in_vol_by_rid = False
-                _rid_now = str(_hr.get('record_id', '') or '').strip()
-                if _rid_now:
-                    _rid_map_now = st.session_state.get('_rid_map', {})
-                    _in_vol_by_rid = _rid_now in _rid_map_now
-                if _in_vol_by_rid and not _in_vol:
-                    _status = 'Name Changed'
+                _lc_diff  = bool(_hr['_is_terminating'])
+                _has_diff = (_status in ('New Client', 'Name Changed')) or _mrr_diff or _pod_diff or _lc_diff
 
                 _recon_rows.append({
                     'Apply':              _has_diff,
                     'Record ID':          _rid_now,
                     'HS Name':            _hr['client_name'],
-                    'Client':             _hr['client_name'],
+                    'Client':             _vol_rid_to_name.get(_rid_now, _hr['client_name']) if _rid_now else _hr['client_name'],
                     'Current POD':        _cur_pod or '—',
                     'New POD':            _hs_pod or _cur_pod or '',
                     'Status':             _status,
@@ -5926,44 +6053,87 @@ if "calc_data" in st.session_state:
                     'Final Svc Date':     _new_fsd,
                 })
 
-            # ── Pass 2: volume clients not in active HubSpot ─────────────
+            # ── Pass 2: volume clients not matched in Pass 1 ─────────────
+            # For each, look the rid up in the FULL HubSpot file:
+            #   found + lifecycle churn* → 'Churn' (info only, rid + lifecycle shown)
+            #   found + other lifecycle  → 'In Both' (was filtered out of Pass 1 by POD rule)
+            #   not found at all         → 'Not in HubSpot' (pre-checked for review)
             for _bc in _baseline_clients_raw:
                 _bc_norm = _norm_name(_bc)
-                if _bc_norm not in _recon_seen:
-                    _bc_cur = _curr_map.get(_bc_norm, {})
-                    _bc_pod = str(_bc_cur.get('POD', '') or '').strip() if hasattr(_bc_cur, 'get') else ''
-                    _bc_mrr = float(_bc_cur.get('MRR', 0)) if hasattr(_bc_cur, 'get') else 0.0
-                    _bc_gl  = _bc_cur.get('Go Live', pd.NaT) if hasattr(_bc_cur, 'get') else pd.NaT
-                    _bc_fsd = _bc_cur.get('Final Service Date', pd.NaT) if hasattr(_bc_cur, 'get') else pd.NaT
-                    _recon_rows.append({
-                        'Apply':              False,
-                        'Client':             _bc,
-                        'Current POD':        _bc_pod or '—',
-                        'New POD':            _bc_pod or '',
-                        'Status':             'Only in Volume',
-                        'Lifecycle':          '—',
-                        'Terminating':        False,
-                        'Current MRR ($)':    _bc_mrr,
-                        'New MRR ($)':        _bc_mrr,
-                        'Current Start Date': str(_bc_gl.date()) if pd.notna(_bc_gl) else '',
-                        'New Start Date':     '',
-                        'Final Svc Date':     str(_bc_fsd.date()) if pd.notna(_bc_fsd) else '',
-                    })
+                _bc_rid  = _vol_name_to_rid.get(_bc_norm, '')
+                if _bc_rid and _bc_rid in _recon_seen_rids:
+                    continue
+                if _bc_norm in _recon_seen_names:
+                    continue
+                _bc_cur = _curr_map.get(_bc_norm, {})
+                _bc_pod = str(_bc_cur.get('POD', '') or '').strip() if hasattr(_bc_cur, 'get') else ''
+                _bc_mrr = float(_bc_cur.get('MRR', 0)) if hasattr(_bc_cur, 'get') else 0.0
+                _bc_gl  = _bc_cur.get('Go Live', pd.NaT) if hasattr(_bc_cur, 'get') else pd.NaT
+                _bc_fsd = _bc_cur.get('Final Service Date', pd.NaT) if hasattr(_bc_cur, 'get') else pd.NaT
 
+                _hs_info = _hs_all_by_rid.get(_bc_rid) if _bc_rid else None
+                if _hs_info is not None:
+                    _bc_lc = _hs_info.get('lifecycle', '') or '—'
+                    if _bc_lc.lower().startswith('churn'):
+                        _bc_status = 'Churn'
+                    else:
+                        _bc_status = 'In Both'
+                else:
+                    _bc_lc     = '—'
+                    _bc_status = 'Not in HubSpot'
+
+                _recon_rows.append({
+                    'Apply':              _bc_status == 'Not in HubSpot',
+                    'Record ID':          _bc_rid,
+                    'HS Name':            _hs_info.get('name', _bc) if _hs_info else _bc,
+                    'Client':             _bc,
+                    'Current POD':        _bc_pod or '—',
+                    'New POD':            _bc_pod or '',
+                    'Status':             _bc_status,
+                    'Lifecycle':          _bc_lc,
+                    'Terminating':        False,
+                    'Current MRR ($)':    _bc_mrr,
+                    'New MRR ($)':        _bc_mrr,
+                    'Current Start Date': str(_bc_gl.date()) if pd.notna(_bc_gl) else '',
+                    'New Start Date':     '',
+                    'Final Svc Date':     str(_bc_fsd.date()) if pd.notna(_bc_fsd) else '',
+                })
+
+            # Only surface rows that need a human decision: hide clean 'In Both'
+            # matches (no name/POD/MRR/lifecycle diff) and 'Churn' rows — those
+            # need no action, churn is already reflected via HubSpot's own status.
+            _recon_rows = [
+                r for r in _recon_rows
+                if not (r['Status'] == 'In Both' and not r['Apply'])
+                and r['Status'] != 'Churn'
+            ]
             st.session_state.hs_recon_df = pd.DataFrame(_recon_rows) if _recon_rows else pd.DataFrame()
 
         with st.expander("📋 Client Reconciliation", expanded=True):
             _recon_df_now = st.session_state.get('hs_recon_df')
             if _recon_df_now is None or _recon_df_now.empty:
-                st.info("No matched clients to reconcile.")
+                st.success("✅ All clients matched cleanly between Volume and HubSpot — nothing to reconcile.")
             else:
+                st.caption(
+                    f"Showing **{len(_recon_df_now)}** client(s) with a discrepancy (new, name/POD/MRR change, "
+                    "churned in HubSpot, or missing from HubSpot). Clients matching cleanly are hidden."
+                )
                 st.caption(
                     "☑️ Check **Apply** to apply the proposed change. "
                     "Edit **New MRR**, **New Start Date**, or **Final Svc Date** cells manually if needed. "
                     "Rows marked **Not in HubSpot** may indicate churned clients."
                 )
-                # Rebuild recon table if columns changed
-                if 'Current POD' not in _recon_df_now.columns or 'New POD' not in _recon_df_now.columns or 'Record ID' not in _recon_df_now.columns:
+                # Rebuild recon table if columns changed, it carries legacy statuses,
+                # or every single row is "New Client" (signature of the old record_id
+                # bug where df_clean lacked record_id and nothing matched by rid).
+                _legacy_statuses = {'Only in HubSpot', 'Only in Volume'}
+                _status_col_now  = _recon_df_now.get('Status', pd.Series(dtype=str))
+                _all_new_client  = len(_recon_df_now) > 3 and (_status_col_now == 'New Client').all()
+                if ('Current POD' not in _recon_df_now.columns
+                        or 'New POD' not in _recon_df_now.columns
+                        or 'Record ID' not in _recon_df_now.columns
+                        or _status_col_now.isin(_legacy_statuses).any()
+                        or _all_new_client):
                     st.session_state['hs_recon_df'] = None
                     st.rerun(scope="fragment")
                 _recon_pod_opts = [''] + sorted(set(lista_pods) | set(
@@ -6001,6 +6171,69 @@ if "calc_data" in st.session_state:
                     type="primary", key="hs_apply_btn",
                     disabled=len(_apply_rows) == 0
                 ):
+                    # ── Split into two flows ─────────────────────────────────
+                    #  1. Existing clients (in Volume, Go Live > 1 month ago):
+                    #     field updates only (POD / MRR / lifecycle / dates).
+                    #  2. New Clients OR young clients (Go Live < 1 month —
+                    #     volume not yet stable): queue for AI re-projection.
+                    _one_month_ago = pd.Timestamp.today().normalize() - relativedelta(months=1)
+                    _upd_idx, _proj_idx = [], []
+                    for _ix, _ar in _apply_rows.iterrows():
+                        _row_status = str(_ar.get('Status', '') or '')
+                        if _row_status == 'New Client':
+                            _proj_idx.append(_ix)
+                            continue
+                        _gl_ts = pd.to_datetime(str(_ar.get('Current Start Date', '') or ''), errors='coerce')
+                        if pd.notna(_gl_ts) and _gl_ts >= _one_month_ago:
+                            _proj_idx.append(_ix)   # young client → re-project
+                        else:
+                            _upd_idx.append(_ix)
+                    _proj_rows_df = _apply_rows.loc[_proj_idx] if _proj_idx else pd.DataFrame()
+                    _apply_rows   = _apply_rows.loc[_upd_idx]  if _upd_idx  else _apply_rows.iloc[0:0]
+
+                    # ── Flow 2: queue projection candidates to AI Prediction ─
+                    if not _proj_rows_df.empty:
+                        _proj_ai_rows = []
+                        for _, _pr in _proj_rows_df.iterrows():
+                            _proj_ai_rows.append({
+                                'Company Name':    str(_pr.get('HS Name', '') or _pr.get('Client', '')).strip(),
+                                'POD':             str(_pr.get('New POD', '') or '').strip(),
+                                'Go Live Date':    str(_pr.get('New Start Date', '') or '').strip(),
+                                'MRR ($)':         float(_pr.get('New MRR ($)', 0) or 0),
+                                'PMS':             '',
+                                'Res Doors':       0,
+                                'Res Properties':  0,
+                                'Comm Doors':      0,
+                                'Comm Properties': 0,
+                                'SQFT Commercial': 0,
+                                'Corp Books':      '',
+                            })
+                        _proj_ai_df = pd.DataFrame(_proj_ai_rows)
+                        _proj_ai_df = _enrich_ai_from_hs(_proj_ai_df, st.session_state.get('hs_parsed'))
+                        # Upsert into the AI manual queue (match on Company Name)
+                        _ai_q = st.session_state.get('ai_manual_clients', pd.DataFrame())
+                        if not _ai_q.empty and 'Company Name' in _ai_q.columns:
+                            _q_keys = _ai_q['Company Name'].astype(str).str.lower().str.strip()
+                            _fresh = _proj_ai_df[~_proj_ai_df['Company Name'].astype(str).str.lower().str.strip().isin(set(_q_keys))]
+                            st.session_state.ai_manual_clients = pd.concat([_ai_q, _fresh], ignore_index=True)
+                        else:
+                            st.session_state.ai_manual_clients = _proj_ai_df.copy()
+                        # Keep the early-access AI panel in sync
+                        _pre_q = st.session_state.get('hs_pre_ai_manual_clients', pd.DataFrame())
+                        if _pre_q.empty:
+                            st.session_state['hs_pre_ai_manual_clients'] = _proj_ai_df.copy()
+                        else:
+                            _pre_keys = _pre_q['Company Name'].astype(str).str.lower().str.strip()
+                            _fresh_p  = _proj_ai_df[~_proj_ai_df['Company Name'].astype(str).str.lower().str.strip().isin(set(_pre_keys))]
+                            if not _fresh_p.empty:
+                                st.session_state['hs_pre_ai_manual_clients'] = pd.concat([_pre_q, _fresh_p], ignore_index=True)
+                        st.info(
+                            f"🤖 {len(_proj_ai_df)} client(s) queued for AI Prediction "
+                            "(new clients or Go Live under 1 month — volume not stable yet). "
+                            "Run the AI Prediction panel and Add to Baseline to project them."
+                        )
+
+                    # ── Flow 1: field updates for stable existing clients ────
                     _overrides = {}
                     for _, _ar in _apply_rows.iterrows():
                         _new_pod_val = str(_ar.get('New POD', '') or '').strip()
@@ -6089,11 +6322,18 @@ if "calc_data" in st.session_state:
                             )
 
         # ── D. Onboarding New Clients ─────────────────────────────────────
-        # Any HubSpot client not in baseline — exclude Churn and blank lifecycle
+        # Any HubSpot client not in baseline — matched by record_id (name as
+        # fallback when the row has no rid). Excludes Churn and blank lifecycle.
         _ob_lc_blank = {'—', '', 'none', 'nan'}
         _ob_lc_norm  = _df_hs_view['_lifecycle'].astype(str).str.lower().str.strip()
+        if 'record_id' in _df_hs_view.columns:
+            _ob_rids = _df_hs_view['record_id'].map(_rid_int)
+        else:
+            _ob_rids = pd.Series('', index=_df_hs_view.index)
+        _ob_name_in_vol = _df_hs_view['client_name'].astype(str).apply(_norm_name).isin(_baseline_clients)
+        _ob_in_vol = _ob_rids.isin(_vol_rid_set) | ((_ob_rids == '') & _ob_name_in_vol)
         _df_onboard = _df_hs_view[
-            ~_df_hs_view['client_name'].str.lower().str.strip().isin(_baseline_clients) &
+            ~_ob_in_vol &
             ~_ob_lc_norm.str.startswith('churn') &
             ~_ob_lc_norm.isin(_ob_lc_blank) &
             _df_hs_view['_lifecycle'].astype(str).str.strip().ne('')
@@ -7297,9 +7537,11 @@ if "calc_data" in st.session_state:
 
             # 3b. APPLY DOOR COUNT VARIATION
             # Each confirmed row specifies a % change per month for a client.
-            # The percentage scales that client's Post-Auto Hours for the chosen months.
-            # Positive = more doors (more hours), negative = fewer doors (fewer hours).
+            # The percentage scales that client's Post-Auto Hours for the chosen months,
+            # AND scales that client's MRR by the same % (more doors = more billing).
+            # Positive = more doors (more hours + more MRR), negative = fewer doors (less hours + less MRR).
             _dc_raw = st.session_state.get('doorcount_df', pd.DataFrame())
+            _dc_mrr_mult = {}  # {(client_name_lower, month_idx): multiplier}  → also used by MRR aggregations downstream
             if not _dc_raw.empty:
                 _dc_conf = _dc_raw[_dc_raw.get('Confirmed', pd.Series(True, index=_dc_raw.index)) == True]
                 for _, _dcr in _dc_conf.iterrows():
@@ -7307,6 +7549,7 @@ if "calc_data" in st.session_state:
                     if not _dc_cli or _dc_cli.lower() in ('nan', 'none', ''):
                         continue
                     _dc_mask = df_resumen['Client'] == _dc_cli
+                    _dc_cli_key = _dc_cli.lower()
                     for _dci, _dcms in enumerate(meses_proyeccion):
                         _dc_pct = pd.to_numeric(_dcr.get(f"M{_dci+1} (%)", 0), errors='coerce') or 0.0
                         if _dc_pct == 0.0:
@@ -7320,6 +7563,12 @@ if "calc_data" in st.session_state:
                         if _dc_post_col in df_resumen.columns and _dc_mask.any():
                             _dc_delta = df_resumen.loc[_dc_mask, _dc_post_col] * (abs(_dc_pct) / 100.0)
                             df_resumen.loc[_dc_mask, _dc_adj_col] += _dc_delta.values
+                        # Store MRR multiplier for this (client, month) — applied to MRR aggregations later
+                        _dc_mrr_mult[(_dc_cli_key, _dci)] = 1.0 + (_dc_pct / 100.0)
+            # Publish the multiplier map for use by MRR aggregation points (waterfall, df_client_mrr, etc.)
+            st.session_state['_dc_mrr_mult'] = _dc_mrr_mult
+            # _mrr_sum_with_dc() is defined at module level so all scopes (cascade,
+            # dashboard rendering, export builders) can read the multiplier from session_state.
 
             # 4. APPLY (-) REDUCTION ADJUSTMENTS  (POD-hierarchy)
             _red_raw = st.session_state.reductions_df
@@ -7630,11 +7879,12 @@ if "calc_data" in st.session_state:
                 ) & (
                     (df_clients_unique['Final Service Date'] >= start_m) | df_clients_unique['Final Service Date'].isna()
                 )
-                total_mrr = df_clients_unique.loc[mask_active_mrr, 'MRR'].sum()
+                # Apply door count variation MRR multiplier (positive % => more MRR, negative % => less MRR)
+                total_mrr = _mrr_sum_with_dc(df_clients_unique, mask_active_mrr, i)
 
                 mask_churn  = (df_clients_unique['Final Service Date'] >= start_m) & (df_clients_unique['Final Service Date'] <= end_m)
                 churn_count = mask_churn.sum()
-                churn_mrr   = df_clients_unique.loc[mask_churn, 'MRR'].sum()
+                churn_mrr   = _mrr_sum_with_dc(df_clients_unique, mask_churn, i)
 
                 # Hours from churning clients (base hours for clients leaving this month)
                 _churn_names = set(
@@ -7667,7 +7917,7 @@ if "calc_data" in st.session_state:
 
                 mask_new     = (df_clients_unique['Go Live'] >= start_m) & (df_clients_unique['Go Live'] <= end_m)
                 new_count    = mask_new.sum()
-                new_mrr      = df_clients_unique.loc[mask_new, 'MRR'].sum()
+                new_mrr      = _mrr_sum_with_dc(df_clients_unique, mask_new, i)
 
                 # Hours from new clients going live this month
                 # Use c_final (not c_base) so AI-predicted clients are included.
@@ -7701,17 +7951,17 @@ if "calc_data" in st.session_state:
                     ) if c_post in df_resumen.columns else 0.0
                     _pn_new_cli   = {k for k, v in _cli_pod_map.items() if v == _pn} & _new_names
                     _pn_churn_cli = {k for k, v in _cli_pod_map.items() if v == _pn} & _churn_names
-                    _pod_new_mrr_mes[_pn] = float(
-                        df_clients_unique.loc[
-                            mask_new & df_clients_unique['client_name']
-                            .astype(str).str.strip().str.lower().isin(_pn_new_cli), 'MRR'
-                        ].sum()
+                    _pod_new_mrr_mes[_pn] = _mrr_sum_with_dc(
+                        df_clients_unique,
+                        mask_new & df_clients_unique['client_name']
+                            .astype(str).str.strip().str.lower().isin(_pn_new_cli),
+                        i,
                     )
-                    _pod_churn_mrr_mes[_pn] = float(
-                        df_clients_unique.loc[
-                            mask_churn & df_clients_unique['client_name']
-                            .astype(str).str.strip().str.lower().isin(_pn_churn_cli), 'MRR'
-                        ].sum()
+                    _pod_churn_mrr_mes[_pn] = _mrr_sum_with_dc(
+                        df_clients_unique,
+                        mask_churn & df_clients_unique['client_name']
+                            .astype(str).str.strip().str.lower().isin(_pn_churn_cli),
+                        i,
                     )
                 _pod_new_hrs_store[mes_str]      = _pod_new_mes
                 _pod_new_prod_hrs_store[mes_str] = _pod_new_prod_mes
@@ -7797,6 +8047,7 @@ if "calc_data" in st.session_state:
                     _cm_gl   = pd.to_datetime(_crow.get('Go Live'), errors='coerce')
                     _cm_fsd  = pd.to_datetime(_crow.get('Final Service Date'), errors='coerce')
                     _cm_pod  = str(_crow.get('POD', '')).strip()
+                    _cm_key  = _cm_name.lower()
                     _mrr_row = {'Client': _cm_name, 'POD': _cm_pod, 'MRR (Base)': _cm_mrr}
                     for _moi, _msi in enumerate(meses_proyeccion):
                         _mdi  = today + relativedelta(months=_month_offsets[_moi])
@@ -7806,7 +8057,9 @@ if "calc_data" in st.session_state:
                             (pd.isna(_cm_gl)  or _cm_gl  <= _emi) and
                             (pd.isna(_cm_fsd) or _cm_fsd >= _smi)
                         )
-                        _mrr_row[_msi] = round(_cm_mrr, 2) if _active else 0.0
+                        # Apply door count variation multiplier to MRR per month (defaults to 1.0)
+                        _cm_mult = _dc_mrr_mult.get((_cm_key, _moi), 1.0) if _dc_mrr_mult else 1.0
+                        _mrr_row[_msi] = round(_cm_mrr * _cm_mult, 2) if _active else 0.0
                     _cli_mrr_rows.append(_mrr_row)
                 df_client_mrr = pd.DataFrame(_cli_mrr_rows)
                 _cmrr_sort = [c for c in ['POD', 'Client'] if c in df_client_mrr.columns]
@@ -8969,7 +9222,7 @@ if "calc_data" in st.session_state:
                                     d_p_gen   = round(hc_p_gen  - _prole_fte('General Accountant'), 2) if hc_p_gen  is not None else None
                                     d_p_sr    = round(hc_p_sr   - _prole_fte('Sr. Accountant'),     2) if hc_p_sr   is not None else None
 
-                                    # POD MRR: sum active clients belonging to this POD
+                                    # POD MRR: sum active clients belonging to this POD (with door count variation applied)
                                     _pod_mrr = 0.0
                                     if not _duc.empty and _pod_clients_lower and 'MRR' in _duc.columns:
                                         mes_date = today + relativedelta(months=_month_offsets[i])
@@ -8980,7 +9233,7 @@ if "calc_data" in st.session_state:
                                             (_duc['Final Service Date'].isna() | (_duc['Final Service Date'] >= _start_m)) &
                                             (_duc['client_name'].astype(str).str.strip().str.lower().isin(_pod_clients_lower))
                                         )
-                                        _pod_mrr = float(_duc.loc[_m_pod_mrr, 'MRR'].sum())
+                                        _pod_mrr = _mrr_sum_with_dc(_duc, _m_pod_mrr, i)
 
                                     _rev_per_hc = _pod_mrr / hc_p_tot if (hc_p_tot and hc_p_tot > 0) else None
 
@@ -9371,7 +9624,7 @@ if "calc_data" in st.session_state:
                                         (_duc['Final Service Date'].isna() | (_duc['Final Service Date'] >= _s_m)) &
                                         (_duc['client_name'].isin(_sr_clients_set))
                                     )
-                                    _sr_mrr = float(_duc.loc[_mask_active, 'MRR'].sum())
+                                    _sr_mrr = _mrr_sum_with_dc(_duc, _mask_active, i)
                                     # New clients going live this month
                                     _mask_new = (
                                         (_duc['Go Live'] >= _s_m) & (_duc['Go Live'] <= _e_m) &
@@ -9380,7 +9633,7 @@ if "calc_data" in st.session_state:
                                     _new_cli_names = set(_duc.loc[_mask_new, 'client_name'].astype(str).str.strip().str.lower())
                                     _new_rows = _sr_sel_df[_sr_sel_df['Client'].astype(str).str.strip().str.lower().isin(_new_cli_names)]
                                     _sr_new_hrs = 0.0  # reassigned below from c_base_col
-                                    _sr_new_mrr = float(_duc.loc[_mask_new, 'MRR'].sum())
+                                    _sr_new_mrr = _mrr_sum_with_dc(_duc, _mask_new, i)
                                     # Churning clients this month
                                     _mask_churn = (
                                         (_duc['Final Service Date'] >= _s_m) & (_duc['Final Service Date'] <= _e_m) &
@@ -9389,7 +9642,7 @@ if "calc_data" in st.session_state:
                                     _churn_cli_names = set(_duc.loc[_mask_churn, 'client_name'].astype(str).str.strip().str.lower())
                                     _churn_rows = _sr_sel_df[_sr_sel_df['Client'].astype(str).str.strip().str.lower().isin(_churn_cli_names)]
                                     _sr_churn_hrs = 0.0  # reassigned below from c_base_col
-                                    _sr_churn_mrr = float(_duc.loc[_mask_churn, 'MRR'].sum())
+                                    _sr_churn_mrr = _mrr_sum_with_dc(_duc, _mask_churn, i)
 
                                 # Dynamic HC for this Sr. this month
                                 _sr_mes_d   = today + relativedelta(months=_month_offsets[i])
@@ -9755,7 +10008,7 @@ if "calc_data" in st.session_state:
                                                 (_duc_psr['Final Service Date'].isna() | (_duc_psr['Final Service Date'] >= _pm_s)) &
                                                 (_duc_psr['client_name'].isin(_psr_clients))
                                             )
-                                            _psr_mrr = float(_duc_psr.loc[_mm, 'MRR'].sum())
+                                            _psr_mrr = _mrr_sum_with_dc(_duc_psr, _mm, i)
 
                                         col = mes_str
                                         _psr_rows.setdefault("Base Hours",              {})[col] = _fmt(_psrv(c_base_col), 'n')
@@ -10368,6 +10621,21 @@ if "calc_data" in st.session_state:
             _raw_xp    = st.session_state.get('df_clean', pd.DataFrame())
             _rb_xp     = st.session_state.get('calc_data', {}).get('df_resumen_base', pd.DataFrame())
             _wdx       = st.session_state.get('calc_data', {}).get('dict_workable_days', {})
+            # Door count variation multiplier (per client per month) — published by Step 3 cascade
+            _dc_mult_xp = st.session_state.get('_dc_mrr_mult', {}) or {}
+            def _mrr_sum_dc_xp(_df, _mask, _month_idx):
+                """Sum MRR for masked rows applying door count multiplier (or 1.0 default)."""
+                if _df is None or _df.empty or 'MRR' not in _df.columns:
+                    return 0.0
+                rows = _df.loc[_mask] if hasattr(_mask, 'any') else _df.loc[_mask]
+                if rows.empty:
+                    return 0.0
+                _mrr = pd.to_numeric(rows['MRR'], errors='coerce').fillna(0.0)
+                if not _dc_mult_xp:
+                    return float(_mrr.sum())
+                _keys = rows.get('client_name', pd.Series('', index=rows.index)).astype(str).str.strip().str.lower()
+                _mult = _keys.map(lambda k: _dc_mult_xp.get((k, _month_idx), 1.0))
+                return float((_mrr.values * _mult.values).sum())
             if not _cli_exp.empty and 'Sr. Accountant' in _cli_exp.columns:
                 _all_srs_exp = sorted(
                     _cli_exp['Sr. Accountant'].dropna().astype(str)
@@ -10444,17 +10712,17 @@ if "calc_data" in st.session_state:
                                 _gl_d  = pd.to_datetime(_duc_xp.get('Go Live',            pd.Series(dtype='datetime64[ns]')), errors='coerce')
                                 _fsd_d = pd.to_datetime(_duc_xp.get('Final Service Date', pd.Series(dtype='datetime64[ns]')), errors='coerce')
                                 _mask_act = ((_gl_d.isna() | (_gl_d <= _e_m)) & (_fsd_d.isna() | (_fsd_d >= _s_m)) & _duc_xp['client_name'].isin(_sr_cli_set))
-                                _sr_mrr = float(_duc_xp.loc[_mask_act, 'MRR'].sum()) if 'MRR' in _duc_xp.columns else 0.0
+                                _sr_mrr = _mrr_sum_dc_xp(_duc_xp, _mask_act, _ii)
                                 _mask_new = (_gl_d >= _s_m) & (_gl_d <= _e_m) & _duc_xp['client_name'].isin(_sr_cli_set)
                                 _new_cn  = set(_duc_xp.loc[_mask_new, 'client_name'].astype(str).str.strip().str.lower())
                                 _new_r   = _sr_df[_sr_df['Client'].astype(str).str.strip().str.lower().isin(_new_cn)]
                                 _sr_new_h   = float(_new_r[_c_base].sum()) if _c_base in _new_r.columns else 0.0
-                                _sr_new_mrr = float(_duc_xp.loc[_mask_new, 'MRR'].sum()) if 'MRR' in _duc_xp.columns else 0.0
+                                _sr_new_mrr = _mrr_sum_dc_xp(_duc_xp, _mask_new, _ii)
                                 _mask_churn = (_fsd_d >= _s_m) & (_fsd_d <= _e_m) & _duc_xp['client_name'].isin(_sr_cli_set)
                                 _churn_cn   = set(_duc_xp.loc[_mask_churn, 'client_name'].astype(str).str.strip().str.lower())
                                 _churn_r    = _sr_df[_sr_df['Client'].astype(str).str.strip().str.lower().isin(_churn_cn)]
                                 _sr_churn_h   = float(_churn_r[_c_base].sum()) if _c_base in _churn_r.columns else 0.0
-                                _sr_churn_mrr = float(_duc_xp.loc[_mask_churn, 'MRR'].sum()) if 'MRR' in _duc_xp.columns else 0.0
+                                _sr_churn_mrr = _mrr_sum_dc_xp(_duc_xp, _mask_churn, _ii)
                             except Exception:
                                 pass
                         # HC delta
