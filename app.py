@@ -12,7 +12,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 
 # --- APP VERSION ---
-APP_VERSION = "v7.4.2026.8.02PM"
+APP_VERSION = "v7.6.2026.8.4.1.41PM"
 
 def _lc_short_m0(gl_series):
     """Bool array: True if Go Live month has < 15 working days remaining (< 3 weeks)."""
@@ -41,6 +41,29 @@ ROLE_HIERARCHY = {
     'General Accountant': 'Sr. Accountant',
     'Sr. Accountant':     'Sr. Accountant',
 }
+
+# Dynamic role classification: any title that isn't one of the 4 base
+# executor roles counts as 'Manager' (Acct. Manager, Sr. Manager, Director,
+# Partner, etc. all collapse into this single bucket without needing to be
+# enumerated). Used to keep Manager+ roles from silently being counted as
+# Sr. Accountant in the Ideal Proc/Rev pipeline.
+_BASE_ROLE_ALIASES = {
+    'accountant i':         'Accountant I',
+    'accountant ii':        'Accountant II',
+    'general accountant':   'General Accountant',
+    'sr. accountant':       'Sr. Accountant',
+    'sr accountant':        'Sr. Accountant',
+    'principal accountant': 'Sr. Accountant',
+}
+
+def _classify_role(raw) -> str:
+    """Normalize a role/title string to one of the 4 base roles, 'Manager'
+    for anything else, or '' for blank/NaN (left for callers' own defaults)."""
+    s = str(raw).strip().lower()
+    if s in ('nan', 'none', ''):
+        return ''
+    return _BASE_ROLE_ALIASES.get(s, 'Manager')
+
 BASELINE_NETWORK_DAYS = 21.0
 
 COLS_T0_NUM = ['mrr']
@@ -77,6 +100,50 @@ def _get_pms_opts(include_all=False, include_unknown=True):
     if include_all:
         return ['', 'All'] + opts
     return opts
+
+def _build_historical_role_mode_maps(df):
+    """
+    For each (type, subtype) task, find which base executor role (Accountant
+    I/II, General Accountant, Sr. Accountant) most frequently processed /
+    reviewed it, based on the real 'Proc Role'/'Rev Role' columns of the
+    currently loaded volume snapshot. Used to reassign hours away from
+    'Manager' when a task has no defined owner in Ideal_Pairs.
+    Manager+ entries are excluded from the mode candidates (we need an
+    executor role, not another Manager) so a task processed only by Managers
+    yields no entry here and falls back to the caller's default.
+    """
+    _base_roles = {'Accountant I', 'Accountant II', 'General Accountant', 'Sr. Accountant'}
+    if df is None or df.empty or 'type' not in df.columns or 'subtype' not in df.columns:
+        return {}, {}
+
+    df = df.copy()
+    df['_type_s']    = df['type'].astype(str).str.strip()
+    df['_subtype_s'] = df['subtype'].astype(str).str.strip()
+    _gb = df.groupby(['_type_s', '_subtype_s'])
+
+    def _mode_base(s):
+        v = s[s.isin(_base_roles)]
+        return v.mode().iloc[0] if len(v) > 0 else None
+
+    proc_map = _gb['Proc Role'].agg(_mode_base).dropna().to_dict() if 'Proc Role' in df.columns else {}
+    rev_map  = _gb['Rev Role' ].agg(_mode_base).dropna().to_dict() if 'Rev Role'  in df.columns else {}
+    return proc_map, rev_map
+
+
+def _finalize_required_role(role, hist_map, task_key, default='Sr. Accountant'):
+    """If `role` classified as 'Manager', reassign it to the historically
+    most-frequent executor role for that task, or `default` if no history."""
+    if role != 'Manager':
+        return role
+    return hist_map.get(task_key, default)
+
+
+def _reassign_manager_role(role, hist_map, task_key):
+    """Classify `role`; if it resolves to Manager, reassign via
+    `_finalize_required_role`, otherwise return the original value unchanged
+    (avoids re-normalizing casing/formatting of already-valid base roles)."""
+    return _finalize_required_role('Manager', hist_map, task_key) if _classify_role(role) == 'Manager' else role
+
 
 def _build_vol_aht_task_df(pms_filter=None):
     """
@@ -1229,9 +1296,11 @@ def _apply_ideal_pairs(df_vol, uploaded_file, log):
         qa_r   = str(row.get('QA', '')).strip()
         if proc_r.lower() in ('nan', 'none', ''): continue
         if qa_r.lower()   in ('nan', 'none', ''): qa_r = ROLE_HIERARCHY.get(proc_r, 'Sr. Accountant')
-        # Normalize roles not in hierarchy → Sr. Accountant
-        if proc_r not in _KNOWN_ROLES: proc_r = 'Sr. Accountant'
-        if qa_r   not in _KNOWN_ROLES: qa_r   = 'Sr. Accountant'
+        # Anything above Sr. Accountant is dynamically classified as 'Manager'
+        # instead of being collapsed into Sr. Accountant — hours get
+        # reassigned later (in the Ideal cascade) based on Ideal_Pairs/history.
+        if proc_r not in _KNOWN_ROLES: proc_r = _classify_role(proc_r) or 'Sr. Accountant'
+        if qa_r   not in _KNOWN_ROLES: qa_r   = _classify_role(qa_r) or 'Sr. Accountant'
         key = (str(row['Process']).strip().lower(), str(row['Sub-process']).strip().lower())
         ideal_lookup[key] = (proc_r, qa_r)
 
@@ -1248,8 +1317,8 @@ def _apply_ideal_pairs(df_vol, uploaded_file, log):
         # Fallback: use real Proc/Rev Role, normalize to hierarchy
         proc_r = str(row.get('Proc Role', 'Accountant I')).strip()
         rev_r  = str(row.get('Rev Role',  'Sr. Accountant')).strip()
-        if proc_r not in _KNOWN_ROLES: proc_r = 'Sr. Accountant'
-        if rev_r  not in _KNOWN_ROLES: rev_r  = 'Sr. Accountant'
+        if proc_r not in _KNOWN_ROLES: proc_r = _classify_role(proc_r) or 'Sr. Accountant'
+        if rev_r  not in _KNOWN_ROLES: rev_r  = _classify_role(rev_r) or 'Sr. Accountant'
         fallback += 1
         return (proc_r, rev_r)
 
@@ -2189,14 +2258,17 @@ def _load_params_config(path: str) -> dict:
 # ── HC REPORT PROCESSING ─────────────────────────────────────────────────────
 
 _HC_ROLE_MAP = {
-    'accountant i':           'Accountant I',
-    'accountant ii':          'Accountant II',
-    'general accountant':     'General Accountant',
-    'sr. accountant':         'Sr. Accountant',
-    'sr accountant':          'Sr. Accountant',
-    'principal accountant':   'Sr. Accountant',
-    'accounting manager':     'Acct. Manager',
-    'assistant manager':      'Asst. Manager',
+    'accountant i':            'Accountant I',
+    'accountant ii':           'Accountant II',
+    'general accountant':      'General Accountant',
+    'general accountant ii':   'General Accountant',    # alias — only 1 person today
+    'sr. accountant':          'Sr. Accountant',
+    'sr accountant':           'Sr. Accountant',
+    'accounting manager':      'Acct. Manager',
+    'assistant manager':       'Principal Accountant',  # merged — same role as Principal Accountant
+    'principal accountant':    'Principal Accountant',
+    'sr. accounting manager':  'Sr. Acct. Manager',
+    'sr accounting manager':   'Sr. Acct. Manager',
 }
 
 @st.cache_data(show_spinner=False)
@@ -2219,7 +2291,8 @@ def _process_hc_report(file_bytes: bytes):
     # starting or leaving mid-month are counted proportionally (via Start Date
     # + 14-day ramp and Last Working Day). Static totals above stay unchanged.
     _cap_roles_dyn = {'Accountant I', 'Accountant II', 'General Accountant',
-                      'Sr. Accountant', 'Acct. Manager', 'Asst. Manager'}
+                      'Sr. Accountant', 'Acct. Manager', 'Principal Accountant',
+                      'Sr. Acct. Manager'}
     _all_pod_mask = df['Department unit'].astype(str).str.strip().str.lower().str.startswith('pod')
     _all_pod_df   = df[_all_pod_mask].copy()
     _all_pod_df['Capacity Role'] = (
@@ -2256,15 +2329,14 @@ def _process_hc_report(file_bytes: bytes):
     active_pods['POD'] = active_pods['Department unit'].astype(str).str.strip().str.title()
 
     _jt_lower = active_pods['Job title'].astype(str).str.lower().str.strip()
-    _mgr_mask   = (
-        _jt_lower.str.contains('accounting manager', na=False) |
-        _jt_lower.str.contains('assistant manager',  na=False)
-    )
-    n_acct_mgr  = int((_jt_lower.str.contains('accounting manager',  na=False)).sum())
-    n_asst_mgr  = int((_jt_lower.str.contains('assistant manager',   na=False)).sum())
+    _mgr_roles_set = {'Principal Accountant', 'Acct. Manager', 'Sr. Acct. Manager'}
+    _mgr_mask   = active_pods['Capacity Role'].isin(_mgr_roles_set)
+    n_principal_acct = int((active_pods['Capacity Role'] == 'Principal Accountant').sum())
+    n_acct_mgr       = int((active_pods['Capacity Role'] == 'Acct. Manager').sum())
+    n_sr_acct_mgr    = int((active_pods['Capacity Role'] == 'Sr. Acct. Manager').sum())
     n_mgr_total = int(_mgr_mask.sum())
 
-    # Managers per POD (Accounting + Assistant Managers combined)
+    # Managers per POD (all supervisor tiers combined)
     _mgr_df = active_pods[_mgr_mask]
     mgr_by_pod = (
         _mgr_df.groupby('POD')['Full name'].count().to_dict()
@@ -2285,8 +2357,9 @@ def _process_hc_report(file_bytes: bytes):
     if _hc_total_with_mgr > 0:
         for _rn in ['Accountant I', 'Accountant II', 'General Accountant', 'Sr. Accountant']:
             mix_pct[_rn] = round(by_role.get(_rn, 0) / _hc_total_with_mgr, 6)
-        mix_pct['Asst. Manager'] = round(n_asst_mgr / _hc_total_with_mgr, 6)
-        mix_pct['Acct. Manager'] = round(n_acct_mgr / _hc_total_with_mgr, 6)
+        mix_pct['Principal Accountant'] = round(n_principal_acct / _hc_total_with_mgr, 6)
+        mix_pct['Acct. Manager']        = round(n_acct_mgr / _hc_total_with_mgr, 6)
+        mix_pct['Sr. Acct. Manager']    = round(n_sr_acct_mgr / _hc_total_with_mgr, 6)
 
     # ── Sr. Accountant → direct reports mapping (via Manager email — encoding-safe) ──
     _sr_jt_lower  = active_pods['Job title'].astype(str).str.lower().str.strip()
@@ -2317,10 +2390,8 @@ def _process_hc_report(file_bytes: bytes):
         _dr_roles = _rpts['Capacity Role'].value_counts().to_dict()
         _dr_total = int((_rpts['Capacity Role'] != 'Other').sum())
         # Managers among this Sr.'s direct reports (rare, but counted for display)
-        _rpts_jt  = _rpts['Job title'].astype(str).str.lower().str.strip()
-        _sr_mgrs  = int((
-            _rpts_jt.str.contains('accounting manager', na=False) |
-            _rpts_jt.str.contains('assistant manager',  na=False)
+        _sr_mgrs  = int(_rpts['Capacity Role'].isin(
+            {'Principal Accountant', 'Acct. Manager', 'Sr. Acct. Manager'}
         ).sum())
         # Sr. themselves counts as 1 under 'Sr. Accountant' — total = DRs + 1
         _sr_roles = dict(_dr_roles)
@@ -2346,34 +2417,41 @@ def _process_hc_report(file_bytes: bytes):
         by_sr_norm[_norm_name(_sn)] = _sr_data
         by_sr_email[_email]         = _sr_data
 
-    # ── Assistant Managers → direct reports (parallel structure to Sr.) ────────
-    _am_jt_lower = active_pods['Job title'].astype(str).str.lower().str.strip()
-    _am_staff    = active_pods[_am_jt_lower.str.contains('assistant manager', na=False)]
-    _am_email_map = {
-        str(r['Work Email']).strip().lower(): str(r['Full name']).strip()
-        for _, r in _am_staff.iterrows()
-        if str(r.get('Work Email', '')).strip()
-    }
-    _am_email_set = set(_am_email_map.keys())
-    _am_dr_mask = _all_active_cap['_mgr_email_norm'].isin(_am_email_set)
-    _am_dr_df   = _all_active_cap[_am_dr_mask].copy()
-    by_am_email = {}
-    for _email, _nm in _am_email_map.items():
-        _rpts     = _am_dr_df[_am_dr_df['_mgr_email_norm'] == _email]
-        _dr_total = int((_rpts['Capacity Role'] != 'Other').sum())
-        _own_row  = _am_staff[_am_staff['Work Email'].astype(str).str.strip().str.lower() == _email]
-        _am_start = pd.to_datetime(
-            _own_row['Start Date'].iloc[0] if not _own_row.empty and 'Start Date' in _own_row.columns else pd.NaT,
-            errors='coerce'
-        )
-        _am_pod_v = str(_own_row['POD'].iloc[0]) if not _own_row.empty else ''
-        by_am_email[_email] = {
-            'name':       _nm,
-            'dr_total':   _dr_total,
-            'email':      _email,
-            'start_date': _am_start,
-            'pod':        _am_pod_v,
+    # ── Supervisor tiers (Principal Accountant, Acct. Manager, Sr. Acct.
+    # Manager) → direct reports (parallel structure to Sr., no execution
+    # tasks — span of control only, same Ops Rhythm formula as Sr.) ────────
+    def _build_supervisor_email_map(capacity_role):
+        _staff = active_pods[active_pods['Capacity Role'] == capacity_role]
+        _email_map = {
+            str(r['Work Email']).strip().lower(): str(r['Full name']).strip()
+            for _, r in _staff.iterrows()
+            if str(r.get('Work Email', '')).strip()
         }
+        _email_set = set(_email_map.keys())
+        _dr_mask_x = _all_active_cap['_mgr_email_norm'].isin(_email_set)
+        _dr_df_x   = _all_active_cap[_dr_mask_x].copy()
+        _by_email  = {}
+        for _email, _nm in _email_map.items():
+            _rpts     = _dr_df_x[_dr_df_x['_mgr_email_norm'] == _email]
+            _dr_total = int((_rpts['Capacity Role'] != 'Other').sum())
+            _own_row  = _staff[_staff['Work Email'].astype(str).str.strip().str.lower() == _email]
+            _start    = pd.to_datetime(
+                _own_row['Start Date'].iloc[0] if not _own_row.empty and 'Start Date' in _own_row.columns else pd.NaT,
+                errors='coerce'
+            )
+            _pod_v = str(_own_row['POD'].iloc[0]) if not _own_row.empty else ''
+            _by_email[_email] = {
+                'name':       _nm,
+                'dr_total':   _dr_total,
+                'email':      _email,
+                'start_date': _start,
+                'pod':        _pod_v,
+            }
+        return _by_email
+
+    by_principal_acct_email = _build_supervisor_email_map('Principal Accountant')
+    by_acctmgr_email        = _build_supervisor_email_map('Acct. Manager')
+    by_sracctmgr_email      = _build_supervisor_email_map('Sr. Acct. Manager')
 
     # ── General Accountants → no direct reports, just identity + start date ────
     _ga_jt_lower = active_pods['Job title'].astype(str).str.lower().str.strip()
@@ -2424,11 +2502,16 @@ def _process_hc_report(file_bytes: bytes):
         'by_sr':          by_sr,
         'by_sr_norm':     by_sr_norm,
         'by_sr_email':    by_sr_email,
-        'by_am_email':    by_am_email,    # Assistant Managers (with DR count)
+        'by_am_email':          by_principal_acct_email,  # kept for back-compat — Assistant Manager merged into Principal Accountant
+        'by_principal_acct_email': by_principal_acct_email,
+        'by_acctmgr_email':        by_acctmgr_email,
+        'by_sracctmgr_email':      by_sracctmgr_email,
         'by_ga_email':    by_ga_email,    # General Accountants (dr_total = 0)
         'total':          total,
-        'acct_managers':  n_acct_mgr,
-        'asst_managers':  n_asst_mgr,
+        'acct_managers':        n_acct_mgr,
+        'asst_managers':        n_principal_acct,  # kept for back-compat — now Principal Accountant count
+        'principal_accountants': n_principal_acct,
+        'sr_acct_managers':      n_sr_acct_mgr,
         'mgr_total':      n_mgr_total,
         'mgr_by_pod':     mgr_by_pod,
         'mix_pct':        mix_pct,
@@ -2615,10 +2698,11 @@ if st.session_state.get('_show_glossary', False):
          "HC file: Worker Status == 'Active'"),
         ("Headcount (HC)", "Productive Roles",
          "Roles counted toward billable/productive capacity: Accountant I, II, General Accountant, Sr. Accountant.",
-         "Excludes Assistant Manager and Accounting Manager"),
+         "Excludes Principal Accountant, Accounting Manager and Sr. Accounting Manager"),
         ("Headcount (HC)", "Manager Roles",
-         "Assistant Manager and Accounting Manager — tracked separately, not in productive headcount.",
-         "HC file: Job Title contains 'Manager'"),
+         "Principal Accountant (formerly Assistant Manager), Accounting Manager and Sr. Accounting Manager — pure "
+         "supervisors with span of control, tracked separately, not in productive headcount.",
+         "HC file: Job Title matches a supervisor tier"),
         ("Headcount (HC)", "Direct Reports",
          "Active productive employees whose Manager Email = Sr. Accountant's Work Email.",
          "HC file: COUNT WHERE Manager Email = Sr. Email AND Worker Status = 'Active'"),
@@ -3018,18 +3102,188 @@ def _get_srs_emails_with_clients():
     return set()
 
 
+def _get_srs_rid_email_map():
+    """Return {record_id (clean str): email} from the srs sheet — same 4-source
+    fallback chain as `_get_srs_emails_with_clients`, but keeping the record_id
+    key (needed to cross-reference MRR/client name/status). This matters for
+    clients that have no volume rows yet (e.g. still Onboarding) — they have
+    no 'Sr. Accountant' value in df_clean, so the srs sheet is the ONLY place
+    that knows who they're assigned to."""
+    srs_map = st.session_state.get('_srs_rid_email_map', {}) or {}
+    if srs_map:
+        return {str(k).strip(): str(v).strip().lower() for k, v in srs_map.items() if '@' in str(v)}
+
+    def _extract(srs_df):
+        srs_df = srs_df.copy()
+        srs_df.columns = srs_df.columns.astype(str).str.strip()
+        _scol = {str(c).lower().strip(): c for c in srs_df.columns}
+        _e_c = _scol.get('email')
+        _r_c = next((srs_df.columns[i] for i, c in enumerate(srs_df.columns)
+                     if 'hubspot' in str(c).lower() and 'id' in str(c).lower()), None)
+        if not _e_c or not _r_c:
+            return {}
+        _rid_clean = _clean_record_id(srs_df[_r_c])
+        _out = {}
+        for _rid_v, _email_v in zip(_rid_clean, srs_df[_e_c].astype(str).str.strip().str.lower()):
+            if _rid_v and '@' in _email_v:
+                _out.setdefault(_rid_v, _email_v)
+        return _out
+
+    srs_df = st.session_state.get('_srs_sheet_raw', pd.DataFrame())
+    if hasattr(srs_df, 'empty') and not srs_df.empty:
+        _out = _extract(srs_df)
+        if _out:
+            return _out
+
+    vol_bytes = st.session_state.get('_vol_file_bytes', None)
+    if not vol_bytes:
+        live_up = st.session_state.get('main_data_upload', None)
+        if live_up is not None:
+            try:
+                live_up.seek(0)
+                vol_bytes = live_up.read()
+                live_up.seek(0)
+                st.session_state['_vol_file_bytes'] = vol_bytes
+            except Exception:
+                pass
+    if vol_bytes:
+        try:
+            from io import BytesIO as _BIO_r
+            _xln = pd.ExcelFile(_BIO_r(vol_bytes))
+            if 'srs' in _xln.sheet_names:
+                _srs_now = pd.read_excel(_BIO_r(vol_bytes), sheet_name='srs')
+                return _extract(_srs_now)
+        except Exception:
+            pass
+    return {}
+
+
+def _build_person_client_extras(rid_email_map):
+    """
+    Return {email: {'mrr': float, 'client_names': str, 'status': str}} for the
+    "MRR" / "Client Status" / "Client Names" columns of the Clients Assigned /
+    Sr Ratios table.
+
+    `rid_email_map` (record_id -> email, e.g. the srs-sheet-derived
+    `_srs_rid_email_map`) is used when available, but NOT required: not every
+    upload path runs `_load_volume_aht` (the plain "Generate Baseline" button
+    reads the Excel directly and never populates that map), so this also
+    self-derives record_id -> email from `df_clean`'s own 'Sr. Accountant'
+    column (the assigned-owner email present on every row regardless of
+    upload path — same column the 'Clients Assigned' count already falls
+    back to). The srs-sheet map, when non-empty, takes priority per record_id.
+
+    MRR/client name come from the volume file (`df_clean`, record_id-keyed)
+    by default; if a HubSpot export was uploaded (`hs_parsed`), its MRR/name
+    take priority for any record_id it covers (HubSpot always wins when
+    present, cross-referenced by record_id/HubSpot ID). Client status
+    (Onboarding/On Notice/Termination Notice) only exists in HubSpot data —
+    '—' for everyone if that file isn't loaded.
+    """
+    _df_src = st.session_state.get('df_clean', pd.DataFrame())
+
+    # Self-derived record_id -> email from df_clean (always available)
+    _rid_to_email = {}
+    if (_df_src is not None and not _df_src.empty
+            and 'record_id' in _df_src.columns and 'Sr. Accountant' in _df_src.columns):
+        _own = _df_src.copy()
+        _own['_rid_clean'] = _clean_record_id(_own['record_id'])
+        _own['_email'] = _own['Sr. Accountant'].astype(str).str.strip().str.lower()
+        _own = _own[(_own['_rid_clean'] != '') & _own['_email'].str.contains('@', na=False)]
+        for _rid_v, _email_v in zip(_own['_rid_clean'], _own['_email']):
+            _rid_to_email.setdefault(_rid_v, _email_v)
+    # srs-sheet map (record_id -> email) — robust fallback that re-reads the
+    # srs sheet directly if session state never got it (e.g. the plain
+    # "Generate Baseline" button path). Takes priority: it's the ONLY source
+    # for clients with no volume rows yet (still Onboarding, no 'Sr.
+    # Accountant' value in df_clean to derive from).
+    for _rid_k, _email_k in _get_srs_rid_email_map().items():
+        _rid_to_email[_rid_k] = _email_k
+    for _rid_k, _email_k in (rid_email_map or {}).items():
+        _ek0 = str(_email_k).strip().lower()
+        if '@' in _ek0:
+            _rid_to_email[str(_rid_k).strip()] = _ek0
+
+    _rid_base = {}   # record_id (clean str) -> {'mrr': float, 'client_name': str}
+    if _df_src is not None and not _df_src.empty and 'record_id' in _df_src.columns and 'client_name' in _df_src.columns:
+        _tmp = _df_src.copy()
+        _tmp['_rid_clean'] = _clean_record_id(_tmp['record_id'])
+        _tmp = _tmp[_tmp['_rid_clean'] != '']
+        _mrr_num = pd.to_numeric(_tmp['MRR'], errors='coerce') if 'MRR' in _tmp.columns else None
+        for _rid_v, _idx in _tmp.groupby('_rid_clean').groups.items():
+            _grp = _tmp.loc[_idx]
+            _cname_v = str(_grp['client_name'].iloc[0]).strip()
+            _mrr_v = 0.0
+            if _mrr_num is not None:
+                _mrr_vals = _mrr_num.loc[_idx].dropna()
+                _mrr_v = float(_mrr_vals.iloc[0]) if not _mrr_vals.empty else 0.0
+            _rid_base[_rid_v] = {'mrr': _mrr_v, 'client_name': _cname_v}
+
+    _hs_x = st.session_state.get('hs_parsed')
+    _hs_status_by_rid = {}
+    if _hs_x is not None and hasattr(_hs_x, 'empty') and not _hs_x.empty and 'record_id' in _hs_x.columns:
+        for _, _hr in _hs_x.iterrows():
+            _rid_h = str(_hr.get('record_id', '')).strip()
+            if not _rid_h:
+                continue
+            # HubSpot always wins over the volume file when it covers this record_id
+            _base = _rid_base.setdefault(_rid_h, {'mrr': 0.0, 'client_name': ''})
+            _hs_mrr = pd.to_numeric(_hr.get('_mrr', None), errors='coerce')
+            if pd.notna(_hs_mrr):
+                _base['mrr'] = float(_hs_mrr)
+            _hs_name = str(_hr.get('client_name', '') or '').strip()
+            if _hs_name:
+                _base['client_name'] = _hs_name
+            _lc = str(_hr.get('_lifecycle', '')).strip().lower()
+            if bool(_hr.get('_is_terminating', False)):
+                _hs_status_by_rid[_rid_h] = 'Termination Notice'
+            elif _lc == 'onboarding':
+                _hs_status_by_rid[_rid_h] = 'Onboarding'
+            elif _lc == 'on notice':
+                _hs_status_by_rid[_rid_h] = 'On Notice'
+
+    _agg = {}
+    for _rid_k, _email_k in _rid_to_email.items():
+        _ek = str(_email_k).strip().lower()
+        if not _ek or '@' not in _ek:
+            continue
+        _rid_s = str(_rid_k).strip()
+        _cinfo = _rid_base.get(_rid_s, {}) or {}
+        _d = _agg.setdefault(_ek, {'mrr': 0.0, 'names': [], 'statuses': {}})
+        _d['mrr'] += float(_cinfo.get('mrr', 0) or 0)
+        _cname = str(_cinfo.get('client_name', '') or '').strip()
+        if _cname:
+            _d['names'].append(_cname)
+        _st_v = _hs_status_by_rid.get(_rid_s)
+        if _st_v:
+            _d['statuses'][_st_v] = _d['statuses'].get(_st_v, 0) + 1
+
+    result = {}
+    for _ek, _d in _agg.items():
+        result[_ek] = {
+            'mrr':           _d['mrr'],
+            'client_names':  ', '.join(sorted(set(_d['names']))),
+            'status':        ' · '.join(f"{k}: {v}" for k, v in _d['statuses'].items()) if _d['statuses'] else '—',
+        }
+    return result
+
+
 def _ensure_am_ga_maps(hc_data):
-    """Backfill by_am_email / by_ga_email if HC cache is stale or empty.
+    """Backfill by_am_email (Principal Accountant) / by_acctmgr_email /
+    by_sracctmgr_email / by_ga_email if HC cache is stale or empty.
     Uses detail DataFrame as primary source (job titles direct from HC file),
     employees list as DR-count source.
     ALWAYS rebuilds — does NOT skip if keys exist but are empty."""
     if not hc_data:
         return hc_data
-    # Skip ONLY if both maps are present AND non-empty (truly populated)
-    if hc_data.get('by_am_email') and hc_data.get('by_ga_email'):
+    # Skip ONLY if all maps are present AND non-empty (truly populated)
+    if (hc_data.get('by_am_email') and hc_data.get('by_ga_email')
+            and hc_data.get('by_acctmgr_email') and hc_data.get('by_sracctmgr_email')):
         return hc_data
-    by_am = {}
-    by_ga = {}
+    by_am  = {}   # Principal Accountant (merged w/ former Assistant Manager)
+    by_acctmgr = {}
+    by_sracctmgr = {}
+    by_ga  = {}
     # ── Direct Report counts from employees list ──
     employees = hc_data.get('employees', []) or []
     _prod_roles = {'Accountant I', 'Accountant II', 'General Accountant', 'Sr. Accountant'}
@@ -3038,6 +3292,18 @@ def _ensure_am_ga_maps(hc_data):
         mgr = str(emp.get('manager_email', '') or '').strip().lower()
         if mgr and emp.get('role') in _prod_roles:
             dr_counts[mgr] = dr_counts.get(mgr, 0) + 1
+
+    def _classify_jt(jt):
+        if 'sr. accounting manager' in jt or 'sr accounting manager' in jt:
+            return 'sracctmgr'
+        if 'assistant manager' in jt or 'principal accountant' in jt:
+            return 'principal'
+        if 'accounting manager' in jt:
+            return 'acctmgr'
+        if 'general accountant' in jt:
+            return 'ga'
+        return None
+
     # ── Primary: detail DataFrame (always has Job title for active POD employees) ──
     detail = hc_data.get('detail', pd.DataFrame())
     if not detail.empty and 'Job title' in detail.columns and 'Work Email' in detail.columns:
@@ -3053,14 +3319,21 @@ def _ensure_am_ga_maps(hc_data):
                               if 'Start Date' in detail.columns else pd.NaT,
                 'pod':        str(row.get('POD', '')),
             }
-            if 'assistant manager' in jt:
+            _kind = _classify_jt(jt)
+            if _kind == 'sracctmgr':
+                base['dr_total'] = dr_counts.get(em, 0)
+                by_sracctmgr[em] = base
+            elif _kind == 'principal':
                 base['dr_total'] = dr_counts.get(em, 0)
                 by_am[em] = base
-            elif 'general accountant' in jt:
+            elif _kind == 'acctmgr':
+                base['dr_total'] = dr_counts.get(em, 0)
+                by_acctmgr[em] = base
+            elif _kind == 'ga':
                 base['dr_total'] = 0
                 by_ga[em] = base
     # ── Fallback: employees list (if detail was empty) ──
-    if not by_am and not by_ga:
+    if not by_am and not by_ga and not by_acctmgr and not by_sracctmgr:
         for emp in employees:
             em = str(emp.get('email', '') or '').strip().lower()
             if not em or em in ('nan', 'none'):
@@ -3072,14 +3345,23 @@ def _ensure_am_ga_maps(hc_data):
                 'start_date': emp.get('start_date', pd.NaT),
                 'pod':        emp.get('pod', ''),
             }
-            if role == 'Asst. Manager':
+            if role == 'Principal Accountant':
                 base['dr_total'] = dr_counts.get(em, 0)
                 by_am[em] = base
+            elif role == 'Acct. Manager':
+                base['dr_total'] = dr_counts.get(em, 0)
+                by_acctmgr[em] = base
+            elif role == 'Sr. Acct. Manager':
+                base['dr_total'] = dr_counts.get(em, 0)
+                by_sracctmgr[em] = base
             elif role == 'General Accountant':
                 base['dr_total'] = 0
                 by_ga[em] = base
-    hc_data['by_am_email'] = by_am
-    hc_data['by_ga_email'] = by_ga
+    hc_data['by_am_email']            = by_am
+    hc_data['by_principal_acct_email'] = by_am
+    hc_data['by_acctmgr_email']        = by_acctmgr
+    hc_data['by_sracctmgr_email']      = by_sracctmgr
+    hc_data['by_ga_email']            = by_ga
     return hc_data
 
 
@@ -5037,24 +5319,34 @@ with tab1:
                         f"GAs={len(_hc_l.get('by_ga_email', {}) or {})}")
                     st.session_state['_hc_version'] = st.session_state.get('_hc_version', 0) + 1
                     _hc_loaded = st.session_state.hc_data
-                    _n_mgrs = _hc_loaded.get('acct_managers', 0) + _hc_loaded.get('asst_managers', 0)
+                    _n_mgrs = (_hc_loaded.get('acct_managers', 0)
+                               + _hc_loaded.get('principal_accountants', 0)
+                               + _hc_loaded.get('sr_acct_managers', 0))
                     _hc_mix = _hc_loaded.get('mix_pct', {})
                     def _mpct(k): return f"{_hc_mix.get(k, 0)*100:.1f}%"
+                    _hc_acc1 = _hc_loaded['by_role'].get('Accountant I',0)
+                    _hc_acc2 = _hc_loaded['by_role'].get('Accountant II',0)
+                    _hc_gen  = _hc_loaded['by_role'].get('General Accountant',0)
+                    _hc_subtotal_staff = _hc_acc1 + _hc_acc2 + _hc_gen
                     st.success(
-                        f"HC Loaded: **{_n_mgrs} Managers** (Accounting Managers & Assistant Managers)"
+                        f"HC Loaded: **{_n_mgrs} Managers** (Principal Accountants, Accounting Managers "
+                        f"& Sr. Accounting Managers)"
                         f" + **{_hc_loaded['total']}** Active accounting staff  \n"
-                        f"AccI: {_hc_loaded['by_role'].get('Accountant I',0)} · "
-                        f"AccII: {_hc_loaded['by_role'].get('Accountant II',0)} · "
-                        f"GenAcc: {_hc_loaded['by_role'].get('General Accountant',0)} · "
+                        f"AccI: {_hc_acc1} · "
+                        f"AccII: {_hc_acc2} · "
+                        f"GenAcc: {_hc_gen} · "
                         f"Sr.: {_hc_loaded['by_role'].get('Sr. Accountant',0)} · "
-                        f"Asm: {_hc_loaded.get('asst_managers',0)} · "
-                        f"AM: {_hc_loaded.get('acct_managers',0)}  \n"
+                        f"PA: {_hc_loaded.get('principal_accountants',0)} · "
+                        f"AM: {_hc_loaded.get('acct_managers',0)} · "
+                        f"SrAM: {_hc_loaded.get('sr_acct_managers',0)}  \n"
+                        f"**Subtotal (Accountant I → General Accountant):** {_hc_subtotal_staff}  \n"
                         f"**HC Mix %** — AccI: {_mpct('Accountant I')} · "
                         f"AccII: {_mpct('Accountant II')} · "
                         f"GenAcc: {_mpct('General Accountant')} · "
                         f"Sr.: {_mpct('Sr. Accountant')} · "
-                        f"Asm: {_mpct('Asst. Manager')} · "
-                        f"AM: {_mpct('Acct. Manager')}"
+                        f"PA: {_mpct('Principal Accountant')} · "
+                        f"AM: {_mpct('Acct. Manager')} · "
+                        f"SrAM: {_mpct('Sr. Acct. Manager')}"
                     )
                     # ── Temporary Sr. / Direct-Reports checker ────────────────────
                     with st.expander("🔍 [DEBUG] Sr. Accountant HC Checker", expanded=False):
@@ -5539,6 +5831,18 @@ with tab1:
                         np.where(_ir_fb.isin(_INVALID_ROLES), 'Sr. Accountant', _ir_fb),
                         _ir_pref
                     )
+
+                    # Ideal baseline only: Manager+ has no place in the
+                    # required-role model — reassign its hours to the role
+                    # that historically did that Process/Sub-process the most.
+                    _hist_proc_map_b, _hist_rev_map_b = _build_historical_role_mode_maps(df)
+                    _b_task_keys = list(zip(
+                        df['type'].astype(str).str.strip().values if 'type' in df.columns else [''] * len(df),
+                        df['subtype'].astype(str).str.strip().values if 'subtype' in df.columns else [''] * len(df),
+                    ))
+                    _b_ip = np.array([_reassign_manager_role(v, _hist_proc_map_b, k) for v, k in zip(_b_ip, _b_task_keys)])
+                    _b_ir = np.array([_reassign_manager_role(v, _hist_rev_map_b, k) for v, k in zip(_b_ir, _b_task_keys)])
+
                     _b_up = np.array([utilization_map.get(ip, util_acc1) for ip in _b_ip])
                     _b_ur = np.array([utilization_map.get(ir, util_sr)   for ir in _b_ir])
 
@@ -7344,6 +7648,10 @@ if "calc_data" in st.session_state:
                         _effs.append((min(1.0,_evp), min(1.0,_evr), min(1.0,_eap), min(1.0,_ear)))
                     _auto_cache[(_ck, _tk, _pk, _pmsk)] = _effs
 
+            # Historical role-mode maps: used to reassign Manager+ Ideal Proc/Rev
+            # (no defined owner) to the base role that most often did that task.
+            _hist_proc_map, _hist_rev_map = _build_historical_role_mode_maps(df)
+
             # ── Main loop: rows (outer) × months (inner) ─────────────────────
             _loading_overlay(_s3_ov, "Step 3 · Generating Dashboards", "🔄", 2, 5, "Running cascade & computing FTEs…")
             for _ri, (index, row) in enumerate(df.iterrows()):
@@ -7368,6 +7676,12 @@ if "calc_data" in st.session_state:
                     _ideal_r = str(row.get('Ideal Rev',  row.get('Rev Role',  'Sr. Accountant'))).strip()
                     if _ideal_p in ['nan','None','']: _ideal_p = str(row.get('Proc Role','Accountant I')).strip()
                     if _ideal_r in ['nan','None','']: _ideal_r = str(row.get('Rev Role','Sr. Accountant')).strip()
+                    # Ideal mode only: Manager+ has no place in the required-role
+                    # model — reassign its hours to the role that should actually
+                    # do the task (historically, for this Process/Sub-process).
+                    _task_key = (str(row.get('type', '')).strip(), str(row.get('subtype', '')).strip())
+                    _ideal_p = _reassign_manager_role(_ideal_p, _hist_proc_map, _task_key)
+                    _ideal_r = _reassign_manager_role(_ideal_r, _hist_rev_map, _task_key)
 
                 _util_p = utilization_map.get(_ideal_p, util_acc1)
                 _util_r = utilization_map.get(_ideal_r, util_sr)
@@ -7466,30 +7780,49 @@ if "calc_data" in st.session_state:
 
             df_resumen['Monthly_Cost'] = df_resumen['Required Role'].map(cost_map).fillna(0.0)
 
-            # Map Sr. Accountant — record_id primary, name fallback.
-            # Build client_name → sr lookup from df (which already has record_id-resolved Sr.)
-            # so df_resumen inherits the HubSpot-ID-based Sr. assignment transitively.
-            _rid_map_res = st.session_state.get('_rid_map', {})
-            _sr_lkp_res  = st.session_state.get('_sr_map', {})
-            if _rid_map_res and 'record_id' in df.columns and 'client_name' in df.columns:
-                # Build name→sr via record_id: df already has record_id-resolved Sr. values
-                _sr_src_rid = df.dropna(subset=['client_name']).copy()
-                _sr_src_rid['_key_lower'] = _sr_src_rid['client_name'].astype(str).str.lower().str.strip()
-                _sr_src_rid['_rid_clean'] = _clean_record_id(_sr_src_rid['record_id'])
-                _sr_src_rid['_sr_resolved'] = (
-                    _sr_src_rid['_rid_clean']
-                    .map({r: d['sr_accountant'] for r, d in _rid_map_res.items()})
-                    .fillna(_sr_src_rid['_key_lower'].map(_sr_lkp_res))
-                )
-                _sr_lkp_res = _sr_src_rid.groupby('_key_lower')['_sr_resolved'].first().dropna().to_dict()
-            elif not _sr_lkp_res and 'Sr. Accountant' in df.columns:
+            # Map Record ID + Sr. Accountant — record_id is the SOLE key (HubSpot
+            # ID is the source of truth, per business rule). `df` already carries
+            # record_id-resolved Sr. Accountant values from the srs sheet (see
+            # _load_volume_aht) — use those directly instead of re-deriving from
+            # _rid_map/_sr_map (Master DB only, which can lag behind what the srs
+            # sheet actually resolved for that HubSpot ID).
+            _rid_to_sr   = {}
+            _name_to_rid = {}
+            if 'client_name' in df.columns and 'record_id' in df.columns:
                 _sr_src = df.dropna(subset=['client_name']).copy()
                 _sr_src['_key_lower'] = _sr_src['client_name'].astype(str).str.lower().str.strip()
-                _sr_lkp_res = _sr_src.groupby('_key_lower')['Sr. Accountant'].first().to_dict()
-            df_resumen['Sr. Accountant'] = (
-                df_resumen['Client'].astype(str).str.lower().str.strip()
-                .map(_sr_lkp_res).fillna('')
-            )
+                _sr_src['_rid_clean'] = _clean_record_id(_sr_src['record_id'])
+                _sr_src = _sr_src[_sr_src['_rid_clean'] != '']
+                if 'Sr. Accountant' in _sr_src.columns:
+                    def _first_valid(s):
+                        for v in s:
+                            if str(v).strip() not in ('', 'nan', 'None'):
+                                return v
+                        return None
+                    _rid_to_sr = (_sr_src.groupby('_rid_clean')['Sr. Accountant']
+                                  .agg(_first_valid).dropna().to_dict())
+                _name_to_rid = _sr_src.groupby('_key_lower')['_rid_clean'].first().to_dict()
+
+            # Fallback for record_ids not covered above — clients with no (or
+            # only AI-synthesized) volume rows have no 'Sr. Accountant' value
+            # to derive from, but the srs sheet still knows who owns them.
+            # Only fills gaps; never overrides a value already resolved above.
+            for _rid_k, _email_k in _get_srs_rid_email_map().items():
+                _rid_to_sr.setdefault(_rid_k, _email_k)
+
+            _cli_key_lower = df_resumen['Client'].astype(str).str.lower().str.strip()
+            df_resumen['Record ID']      = _cli_key_lower.map(_name_to_rid).fillna('')
+            df_resumen['Sr. Accountant'] = df_resumen['Record ID'].map(_rid_to_sr).fillna('Pending')
+
+            _dbg_n_rows      = len(df_resumen)
+            _dbg_n_rid_blank = int((df_resumen['Record ID'] == '').sum())
+            _dbg_n_pending   = int((df_resumen['Sr. Accountant'] == 'Pending').sum())
+            _dbg_pending_cli = sorted(df_resumen.loc[df_resumen['Sr. Accountant'] == 'Pending', 'Client'].unique().tolist())[:10]
+            _log_event('info',
+                f"df_resumen Record ID/Sr. Accountant resolved: {_dbg_n_rows} rows · "
+                f"blank Record ID: {_dbg_n_rid_blank} · Pending Sr.: {_dbg_n_pending} "
+                f"(srs map size: {len(_get_srs_rid_email_map())}) "
+                f"· sample Pending clients: {_dbg_pending_cli}")
 
             for i, mes_str in enumerate(meses_proyeccion):
                 df_resumen[f"M{i+1} ({mes_str}) - Adjustments (+) Hrs"] = 0.0
@@ -8040,6 +8373,16 @@ if "calc_data" in st.session_state:
                     _cli_pod_map_mrr['_jk'] = _cli_pod_map_mrr['client_name'].astype(str).str.strip().str.lower()
                     _duc_mrr['_jk'] = _duc_mrr['client_name'].astype(str).str.strip().str.lower()
                     _duc_mrr = _duc_mrr.merge(_cli_pod_map_mrr[['_jk', 'POD']], on='_jk', how='left').drop(columns=['_jk'])
+                # Record ID (HubSpot ID), keyed by client_name — record_id is the
+                # sole source of truth, sourced from the row-level volume data.
+                _cli_rid_map_mrr = {}
+                if 'client_name' in df.columns and 'record_id' in df.columns:
+                    _rid_src_mrr = df.dropna(subset=['client_name']).copy()
+                    _rid_src_mrr['_key_lower'] = _rid_src_mrr['client_name'].astype(str).str.lower().str.strip()
+                    _rid_src_mrr['_rid_clean'] = _clean_record_id(_rid_src_mrr['record_id'])
+                    _rid_src_mrr = _rid_src_mrr[_rid_src_mrr['_rid_clean'] != '']
+                    _cli_rid_map_mrr = _rid_src_mrr.groupby('_key_lower')['_rid_clean'].first().to_dict()
+
                 _cli_mrr_rows = []
                 for _, _crow in _duc_mrr.iterrows():
                     _cm_name = str(_crow.get('client_name', '')).strip()
@@ -8048,7 +8391,8 @@ if "calc_data" in st.session_state:
                     _cm_fsd  = pd.to_datetime(_crow.get('Final Service Date'), errors='coerce')
                     _cm_pod  = str(_crow.get('POD', '')).strip()
                     _cm_key  = _cm_name.lower()
-                    _mrr_row = {'Client': _cm_name, 'POD': _cm_pod, 'MRR (Base)': _cm_mrr}
+                    _cm_rid  = _cli_rid_map_mrr.get(_cm_key, '')
+                    _mrr_row = {'Client': _cm_name, 'Record ID': _cm_rid, 'POD': _cm_pod, 'MRR (Base)': _cm_mrr}
                     for _moi, _msi in enumerate(meses_proyeccion):
                         _mdi  = today + relativedelta(months=_month_offsets[_moi])
                         _smi  = pd.Timestamp(_mdi.replace(day=1).date())
@@ -8218,6 +8562,7 @@ if "calc_data" in st.session_state:
             # "With clients" filter: AM/GA only included if their email appears in srs map
             _srs_rid_map_a = st.session_state.get('_srs_rid_email_map', {}) or {}
             _with_clients_emails_a = _get_srs_emails_with_clients()
+            _person_extras_a = _build_person_client_extras(_srs_rid_map_a)
             # Client count fallback for AM/GA emails not in cli_cnt_by_email
             _all_role_cli_a = dict(_sr_auto_cli_cnt)
             for _hid, _em in _srs_rid_map_a.items():
@@ -8232,9 +8577,11 @@ if "calc_data" in st.session_state:
                 if p >= -_THRESHOLD_PCT_A: return '✅ On Track'
                 return '🔴 Potential Burnout'
             _role_sources_a = [
-                ('Sr. Accountant',     _sr_auto_hc.get('by_sr_email', {}) or {}, True),
-                ('Assistant Manager',  _sr_auto_hc.get('by_am_email', {}) or {}, True),
-                ('General Accountant', _sr_auto_hc.get('by_ga_email', {}) or {}, False),
+                ('Sr. Accountant',         _sr_auto_hc.get('by_sr_email', {}) or {}, True),
+                ('Principal Accountant',   _sr_auto_hc.get('by_principal_acct_email', {}) or {}, True),
+                ('Accounting Manager',     _sr_auto_hc.get('by_acctmgr_email', {}) or {}, True),
+                ('Sr. Accounting Manager', _sr_auto_hc.get('by_sracctmgr_email', {}) or {}, True),
+                ('General Accountant',     _sr_auto_hc.get('by_ga_email', {}) or {}, False),
             ]
             _sr_auto_rows = []
             for _role_lbl_a, _src_map_a, _apply_ops_a in _role_sources_a:
@@ -8259,6 +8606,7 @@ if "calc_data" in st.session_state:
                     _drf  = '✅' if _DR_MIN_A  <= _drc  <= _DR_MAX_A  else ('⬇️' if _drc  < _DR_MIN_A  else '⬆️')
                     _clf  = '✅' if _CLI_MIN_A <= _clic <= _CLI_MAX_A else ('⬇️' if _clic < _CLI_MIN_A else '⬆️')
                     _dr_display_a = '—' if not _apply_ops_a else f"{_drc} {_drf}"
+                    _extras_a = _person_extras_a.get(_eml_n, {})
                     _sr_auto_rows.append({
                         'POD':                               _podv,
                         'Role':                              _role_lbl_a,
@@ -8266,6 +8614,9 @@ if "calc_data" in st.session_state:
                         'Hire Date':                         pd.Timestamp(_sdt).strftime('%Y-%m-%d') if pd.notna(_sdt) else '—',
                         'Direct Reports':                    _dr_display_a,
                         'Clients Assigned':                  f"{_clic} {_clf}",
+                        'MRR ($)':                            round(_extras_a.get('mrr', 0.0), 2),
+                        'Client Status':                      _extras_a.get('status', '—'),
+                        'Client Names':                       _extras_a.get('client_names', ''),
                         'Productive Hrs':                    round(_prh, 1),
                         'Total Work Hours':                  round(_toh, 1),
                         'Ops Rhythm Hrs':                    round(_oph, 1),
@@ -8609,7 +8960,8 @@ if "calc_data" in st.session_state:
                                 hc_sr    = _dyn_hc.get('Sr. Accountant',     0.0)
                                 hc_other = 0.0   # 'Other' excluded from capacity roles
                                 hc_mgr   = (_dyn_hc.get('Acct. Manager', 0.0)
-                                            + _dyn_hc.get('Asst. Manager', 0.0))
+                                            + _dyn_hc.get('Principal Accountant', 0.0)
+                                            + _dyn_hc.get('Sr. Acct. Manager', 0.0))
                                 hc_total = hc_acc1 + hc_acc2 + hc_gen + hc_sr
                             else:
                                 # Fallback: employees list not yet present (older HC file)
@@ -9197,7 +9549,9 @@ if "calc_data" in st.session_state:
                                         hc_p_acc2 = _dyn_p_hc.get('Accountant II',      0.0) or None
                                         hc_p_gen  = _dyn_p_hc.get('General Accountant', 0.0) or None
                                         hc_p_sr   = _dyn_p_hc.get('Sr. Accountant',     0.0) or None
-                                        hc_p_mgr  = (_dyn_p_hc.get('Acct. Manager', 0.0) + _dyn_p_hc.get('Asst. Manager', 0.0))
+                                        hc_p_mgr  = (_dyn_p_hc.get('Acct. Manager', 0.0)
+                                                     + _dyn_p_hc.get('Principal Accountant', 0.0)
+                                                     + _dyn_p_hc.get('Sr. Acct. Manager', 0.0))
                                         hc_p_tot  = (hc_p_acc1 or 0) + (hc_p_acc2 or 0) + (hc_p_gen or 0) + (hc_p_sr or 0) or None
                                     else:
                                         # Fallback to static _pod_hc
@@ -9660,7 +10014,9 @@ if "calc_data" in st.session_state:
                                     hc_sr_acc2 = _dyn_sr_hc.get('Accountant II',      0.0) or None
                                     hc_sr_gen  = _dyn_sr_hc.get('General Accountant', 0.0) or None
                                     hc_sr_sr   = _dyn_sr_hc.get('Sr. Accountant',     0.0) or None
-                                    hc_sr_mgr  = int(_dyn_sr_hc.get('Acct. Manager', 0.0) + _dyn_sr_hc.get('Asst. Manager', 0.0))
+                                    hc_sr_mgr  = int(_dyn_sr_hc.get('Acct. Manager', 0.0)
+                                                     + _dyn_sr_hc.get('Principal Accountant', 0.0)
+                                                     + _dyn_sr_hc.get('Sr. Acct. Manager', 0.0))
                                     hc_sr_tot  = (hc_sr_acc1 or 0) + (hc_sr_acc2 or 0) + (hc_sr_gen or 0) + (hc_sr_sr or 0) or None
                                 # (else: static hc_sr_tot / hc_sr_acc1 / etc. from before loop remain in effect)
 
@@ -10044,12 +10400,13 @@ if "calc_data" in st.session_state:
             st.write("### Client & Ideal Role Level")
             _cli_raw = st.session_state.final_dashboards['cliente'].copy()
             if not _cli_raw.empty:
-                _cli_grp_cols = [c for c in ['POD', 'Sr. Accountant', 'Client', 'Required Role'] if c in _cli_raw.columns]
-                _cli_id_cols  = [c for c in ['POD', 'Sr. Accountant', 'Client'] if c in _cli_raw.columns]
+                _cli_raw = _insert_rid_after_client(_cli_raw)
+                _cli_grp_cols = [c for c in ['POD', 'Sr. Accountant', 'Client', 'Record ID', 'Required Role'] if c in _cli_raw.columns]
+                _cli_id_cols  = [c for c in ['POD', 'Sr. Accountant', 'Client', 'Record ID'] if c in _cli_raw.columns]
                 _cli_num_cols = [c for c in _cli_raw.columns if c not in _cli_grp_cols]
                 # Build display df with a CLIENT TOTAL row after each client's roles
                 _cli_frames = []
-                _group_by = [c for c in ['POD', 'Sr. Accountant', 'Client'] if c in _cli_raw.columns]
+                _group_by = [c for c in ['POD', 'Sr. Accountant', 'Client', 'Record ID'] if c in _cli_raw.columns]
                 for _cli_key, _cli_sub in _cli_raw.groupby(_group_by, sort=False):
                     _cli_frames.append(_cli_sub)
                     _tot_row = {c: '' for c in _cli_raw.columns}
@@ -10816,11 +11173,16 @@ if "calc_data" in st.session_state:
             _cli_pod_sr.to_excel(writer, index=False, sheet_name='POD_x_SrAccountant')
             # Tab 5: Client & Role Summary (Cascade) — full detail with CLIENT TOTAL rows
             _cli_raw_exp = st.session_state.final_dashboards['cliente'].copy()
-            _cli_grp_exp = [c for c in ['POD', 'Sr. Accountant', 'Client', 'Required Role'] if c in _cli_raw_exp.columns]
-            _cli_id_exp  = [c for c in ['POD', 'Sr. Accountant', 'Client'] if c in _cli_raw_exp.columns]
+            _cli_grp_exp = [c for c in ['POD', 'Sr. Accountant', 'Client', 'Record ID', 'Required Role'] if c in _cli_raw_exp.columns]
+            _cli_id_exp  = [c for c in ['POD', 'Sr. Accountant', 'Client', 'Record ID'] if c in _cli_raw_exp.columns]
             _cli_num_exp = [c for c in _cli_raw_exp.columns if c not in _cli_grp_exp]
             _cli_exp_frames = []
-            _cli_grp_by_exp = [c for c in ['POD', 'Sr. Accountant', 'Client'] if c in _cli_raw_exp.columns]
+            _cli_grp_by_exp = [c for c in ['POD', 'Sr. Accountant', 'Client', 'Record ID'] if c in _cli_raw_exp.columns]
+            _log_event('info',
+                f"Client_Role_Detail source has 'Record ID': {'Record ID' in _cli_raw_exp.columns} · "
+                f"blank Record ID rows: {int((_cli_raw_exp.get('Record ID', pd.Series(dtype=str)) == '').sum())}"
+                if 'Record ID' in _cli_raw_exp.columns else
+                "Client_Role_Detail source MISSING 'Record ID' column entirely")
             for _ck_exp, _cs_exp in _cli_raw_exp.groupby(_cli_grp_by_exp, sort=False):
                 _cli_exp_frames.append(_cs_exp)
                 _tot_exp = {c: '' for c in _cli_raw_exp.columns}
@@ -10863,6 +11225,7 @@ if "calc_data" in st.session_state:
                 _srs_rd_x = st.session_state.get('_srs_ratios_data', {})
                 _srs_rid_map_x = st.session_state.get('_srs_rid_email_map', {}) or {}
                 _with_clients_emails = _get_srs_emails_with_clients()
+                _person_extras_x = _build_person_client_extras(_srs_rid_map_x)
                 # ── Client count by email: srs sheet (authoritative) or df_clean FSD fallback ──
                 if _srs_rd_x.get('cli_cnt_by_email'):
                     _sr_cli_x = dict(_srs_rd_x['cli_cnt_by_email'])
@@ -10952,9 +11315,11 @@ if "calc_data" in st.session_state:
                 # Build unified list: (role_label, email, info_dict, ops_formula_apply)
                 # ops_formula_apply=True → uses (35 + 1.5×DR); False → Ops = 0 (GA)
                 _role_sources = [
-                    ('Sr. Accountant',    _sr_hc_exp.get('by_sr_email', {}) or {}, True),
-                    ('Assistant Manager', _sr_hc_exp.get('by_am_email', {}) or {}, True),
-                    ('General Accountant', _sr_hc_exp.get('by_ga_email', {}) or {}, False),
+                    ('Sr. Accountant',         _sr_hc_exp.get('by_sr_email', {}) or {}, True),
+                    ('Principal Accountant',   _sr_hc_exp.get('by_principal_acct_email', {}) or {}, True),
+                    ('Accounting Manager',     _sr_hc_exp.get('by_acctmgr_email', {}) or {}, True),
+                    ('Sr. Accounting Manager', _sr_hc_exp.get('by_sracctmgr_email', {}) or {}, True),
+                    ('General Accountant',     _sr_hc_exp.get('by_ga_email', {}) or {}, False),
                 ]
                 for _role_lbl, _src_map, _apply_ops in _role_sources:
                     for _eml, _info in _src_map.items():
@@ -10979,6 +11344,7 @@ if "calc_data" in st.session_state:
                         _clf_x = '✅' if _CLI_MIN_X <= _cli_c <= _CLI_MAX_X else ('⬇️' if _cli_c < _CLI_MIN_X else '⬆️')
                         # GA has no DR by definition — show '—' instead of '⬇️ 0'
                         _dr_display = '—' if not _apply_ops else f"{_drc_x} {_drf_x}"
+                        _extras_x = _person_extras_x.get(_eml_n, {})
                         _sr_rows_x.append({
                             'POD':                               str(_info.get('pod', '')),
                             'Role':                              _role_lbl,
@@ -10987,6 +11353,9 @@ if "calc_data" in st.session_state:
                             'Hire Date':                         pd.Timestamp(_sdt_x).strftime('%Y-%m-%d') if pd.notna(_sdt_x) else '—',
                             'Direct Reports':                    _dr_display,
                             'Clients Assigned':                  f"{_cli_c} {_clf_x}",
+                            'MRR ($)':                            round(_extras_x.get('mrr', 0.0), 2),
+                            'Client Status':                      _extras_x.get('status', '—'),
+                            'Client Names':                       _extras_x.get('client_names', ''),
                             'Productive Hrs':                    round(_prh_v, 1),
                             'Total Work Hours':                  round(_toh_x, 1),
                             'Ops Rhythm Hrs':                    round(_oph_x, 1),
@@ -11018,7 +11387,10 @@ if "calc_data" in st.session_state:
             _cli_fte_df  = pd.DataFrame()
             _cli_fte_src = st.session_state.final_dashboards.get('cliente', pd.DataFrame())
             if not _cli_fte_src.empty:
-                _fte_id_cols  = [c for c in ['POD', 'Sr. Accountant', 'Client'] if c in _cli_fte_src.columns]
+                _fte_id_cols  = [c for c in ['POD', 'Sr. Accountant', 'Client', 'Record ID'] if c in _cli_fte_src.columns]
+                _log_event('info',
+                    f"Client_FTEs_by_Month source columns: {list(_cli_fte_src.columns)[:8]}... "
+                    f"(has 'Record ID': {'Record ID' in _cli_fte_src.columns}) · id cols used: {_fte_id_cols}")
                 _fte_m_cols   = [c for c in _cli_fte_src.columns if '- Final FTEs' in c]
                 _fte_hrs_cols = [c for c in _cli_fte_src.columns if '- Final Hours' in c]
                 _fte_keep     = _fte_id_cols + _fte_m_cols + _fte_hrs_cols
@@ -11038,8 +11410,9 @@ if "calc_data" in st.session_state:
                             pd.to_numeric(_cmap_exp['mrr'], errors='coerce').fillna(0.0)
                         ))
                     if 'Client' in _cli_fte_df.columns:
+                        _mrr_insert_after = 'Record ID' if 'Record ID' in _cli_fte_df.columns else 'Client'
                         _cli_fte_df.insert(
-                            _cli_fte_df.columns.get_loc('Client') + 1,
+                            _cli_fte_df.columns.get_loc(_mrr_insert_after) + 1,
                             'MRR ($)',
                             _cli_fte_df['Client'].astype(str).str.lower().str.strip().map(_mrr_lkp).fillna(0.0)
                         )
@@ -11253,15 +11626,16 @@ if "calc_data" in st.session_state:
             _meth_ws.set_row(_rc[0], 32); _rc[0] += 2
             _meth_ws.merge_range(_rc[0], 0, _rc[0], 5,
                 'The Client Management Hrs model answers a single question for any person with assigned clients '
-                '— Sr. Accountants, Assistant Managers, and General Accountants: '
-                '"Is this person overloaded, balanced, or has free capacity this month?"', _f_body)
+                '— Sr. Accountants, Principal Accountants, Accounting Managers, Sr. Accounting Managers, and '
+                'General Accountants: "Is this person overloaded, balanced, or has free capacity this month?"', _f_body)
             _meth_ws.set_row(_rc[0], 45); _rc[0] += 2
 
             # ── Roles covered ──
             _write_section('Who is included — "with clients" filter')
             _write_pair('Roles',
                 '• Sr. Accountants  (always included)\n'
-                '• Assistant Managers  (only if they appear as processor/reviewer in the srs sheet)\n'
+                '• Principal Accountants, Accounting Managers, Sr. Accounting Managers  '
+                '(only if they appear as processor/reviewer in the srs sheet)\n'
                 '• General Accountants  (only if they appear as processor/reviewer in the srs sheet)', 60)
             _write_pair('Source of "with clients"',
                 'The srs sheet inside the volume Excel file. Any email that appears there is treated as "with clients".', 28)
@@ -11269,11 +11643,12 @@ if "calc_data" in st.session_state:
 
             # ── Formula by role overview ──
             _write_section('Formula by Role — Quick Reference')
-            _write_formula('Sr. Accountant & Assistant Manager',
+            _write_formula('Sr. Accountant & all supervisor tiers (Principal Accountant, Accounting Manager, Sr. Accounting Manager)',
                 'Total Work Hours = 7.5 × workable_days\n'
                 'Ops Rhythm       = (35 + 1.5 × Direct_Reports) × Day_Scale\n'
                 'Productive Hours = Σ Capacity Processing/Reviewing Hours (weighted, where person = processor/reviewer)\n'
-                'Remaining        = Total Work − Productive − Ops Rhythm', 70)
+                'Remaining        = Total Work − Productive − Ops Rhythm\n'
+                '(Same formula and thresholds for all supervisor tiers — none of them execute tasks, span of control only)', 80)
             _write_formula('General Accountant',
                 'Total Work Hours = 7.5 × workable_days\n'
                 'Ops Rhythm       = 0   (GAs have no management overhead)\n'
@@ -11293,10 +11668,11 @@ if "calc_data" in st.session_state:
             # ── Layer 2 ──
             _write_section('Layer 2 — How much time is "burned" on management overhead?')
             _write_pair('Why',
-                'Sr. Accountants and Assistant Managers don\'t spend 100% of their time on client work. '
+                'Sr. Accountants and every supervisor tier (Principal Accountant, Accounting Manager, Sr. Accounting '
+                'Manager) don\'t spend 100% of their time on client work. '
                 'They lose time to meetings, admin, 1:1s, coaching, and reviewing their direct reports\' work. '
                 'General Accountants do NOT have this overhead — their Ops Rhythm = 0.', 75)
-            _write_formula('Sr / AM Formula',
+            _write_formula('Sr / Supervisor Formula',
                 'Ops Rhythm Hours = (35 + 1.5 × Direct_Reports) × Day_Scale\n'
                 'Day_Scale = workable_days / 20  (20 = reference month)', 42)
             _write_formula('GA Formula', 'Ops Rhythm Hours = 0', 24)
@@ -11391,16 +11767,17 @@ if "calc_data" in st.session_state:
                 '→ Status: 🟢 Available · DRs: ⬇️ (<7)', _f_form)
             _meth_ws.set_row(_rc[0], 75); _rc[0] += 2
 
-            # 4) Patricia — Assistant Manager (same formula as Sr)
-            _meth_ws.write(_rc[0], 0, '🟢 Patricia — Assistant Manager — Light load, mostly oversight', _f_grn); _rc[0] += 1
+            # 4) Patricia — Principal Accountant (same formula as Sr; pure supervisor, no tasks)
+            _meth_ws.write(_rc[0], 0, '🟢 Patricia — Principal Accountant — Light load, mostly oversight', _f_grn); _rc[0] += 1
             _meth_ws.merge_range(_rc[0], 0, _rc[0], 5,
-                'Role = Assistant Manager   ·   Direct Reports = 10   ·   Productive Hours = 40\n'
+                'Role = Principal Accountant   ·   Direct Reports = 10   ·   Productive Hours = 40\n'
                 'Total Work = 7.5 × 22 = 165 · Day Scale = 1.10 · Ops = (35 + 1.5×10) × 1.10 = 55.0\n'
                 'Remaining = 165 − 40 − 55.0 = 70.0 · % = 70.0 / 165 = +42.4%\n'
                 '→ Status: 🟢 Available · DRs: ⬆️ (>9)\n'
-                'Interpretation: typical AM profile — high DRs (manages a large team) but takes only a few clients '
-                'directly. Free capacity here is expected and healthy.', _f_form)
-            _meth_ws.set_row(_rc[0], 100); _rc[0] += 2
+                'Interpretation: typical supervisor profile — high DRs (manages a large team) but takes only a few '
+                'clients directly. Free capacity here is expected and healthy. Same formula applies to Accounting '
+                'Manager and Sr. Accounting Manager — all 3 tiers are pure span-of-control, no execution tasks.', _f_form)
+            _meth_ws.set_row(_rc[0], 110); _rc[0] += 2
 
             # 5) Diego — General Accountant (Ops = 0)
             _meth_ws.write(_rc[0], 0, '✅ Diego — General Accountant — Pure execution, no overhead', _f_blu); _rc[0] += 1
@@ -11607,7 +11984,7 @@ if "calc_data" in st.session_state:
 
         # ── CLIENT MANAGEMENT HRS ───────────────────────────────────────────────
         with t_sr_ratios:
-            st.markdown("### 📊 Client Management Hrs — Sr. Accountants · Assistant Managers · General Accountants")
+            st.markdown("### 📊 Client Management Hrs — Sr. Accountants · Principal Accountants · Accounting Managers · Sr. Accounting Managers · General Accountants")
 
             # ── Ops Rhythm constants (from Srs Ops Rhythm.xlsx) ────────────────
             # Fixed activities total: Daily AM + Daily PM + Weekly early/later +
@@ -11768,6 +12145,7 @@ if "calc_data" in st.session_state:
                 # "With clients" filter for AM/GA: must appear in srs sheet
                 _srs_rid_map_c = st.session_state.get('_srs_rid_email_map', {}) or {}
                 _with_clients_emails_c = _get_srs_emails_with_clients()
+                _person_extras_c = _build_person_client_extras(_srs_rid_map_c)
                 # Client count fallback for AM/GA emails
                 _all_role_cli_c = dict(_sr_cli_count_by_email)
                 for _hid, _em in _srs_rid_map_c.items():
@@ -11779,9 +12157,11 @@ if "calc_data" in st.session_state:
                         )
                 # Iterate over 3 roles: Sr, AM, GA (GA has Ops Rhythm = 0)
                 _role_sources_c = [
-                    ('Sr. Accountant',     _hc_sr.get('by_sr_email', {}) or {}, True),
-                    ('Assistant Manager',  _hc_sr.get('by_am_email', {}) or {}, True),
-                    ('General Accountant', _hc_sr.get('by_ga_email', {}) or {}, False),
+                    ('Sr. Accountant',         _hc_sr.get('by_sr_email', {}) or {}, True),
+                    ('Principal Accountant',   _hc_sr.get('by_principal_acct_email', {}) or {}, True),
+                    ('Accounting Manager',     _hc_sr.get('by_acctmgr_email', {}) or {}, True),
+                    ('Sr. Accounting Manager', _hc_sr.get('by_sracctmgr_email', {}) or {}, True),
+                    ('General Accountant',     _hc_sr.get('by_ga_email', {}) or {}, False),
                 ]
                 _sr_table_rows = []
                 for _role_lbl_c, _src_map_c, _apply_ops_c in _role_sources_c:
@@ -11811,6 +12191,7 @@ if "calc_data" in st.session_state:
                         _dr_flag  = '✅' if _DR_MIN  <= _dr_cnt  <= _DR_MAX  else ('⬇️' if _dr_cnt  < _DR_MIN  else '⬆️')
                         _cli_flag = '✅' if _CLI_MIN <= _cli_cnt <= _CLI_MAX else ('⬇️' if _cli_cnt < _CLI_MIN else '⬆️')
                         _dr_display_c = '—' if not _apply_ops_c else f"{_dr_cnt} {_dr_flag}"
+                        _extras_c = _person_extras_c.get(_eml_n, {})
 
                         _sr_table_rows.append({
                             'POD':                               _pod_v,
@@ -11820,6 +12201,9 @@ if "calc_data" in st.session_state:
                             'Tenure':                            _sr_tenure(_start_dt),
                             'Direct Reports':                    _dr_display_c,
                             'Clients Assigned':                  f"{_cli_cnt} {_cli_flag}",
+                            'MRR ($)':                            round(_extras_c.get('mrr', 0.0), 2),
+                            'Client Status':                      _extras_c.get('status', '—'),
+                            'Client Names':                       _extras_c.get('client_names', ''),
                             'Productive Hrs':                    round(_prod_hrs, 1),
                             'Total Work Hours':                  round(_tot_hrs, 1),
                             'Ops Rhythm Hrs':                    round(_ops_hrs, 1),

@@ -17,6 +17,14 @@
 
 7. **Scope summary sections to active filters:** If a POD filter is active, don't render "Overall" aggregate summaries — they show data the user didn't ask for and contradict the filtered view. Always gate summary sections on filter state.
 
+8. **One FTE convention per report:** All HC/FTE figures must use `capacity hours ÷ (7.5h × working days)` with the role's utilization/absenteeism uplift applied to task hours. Per-person capacities (AC1 134, GA 126, Sr = 7.5h×wd − ops rhythm) only cap individual assignments — never use them as the denominator for required HC.
+
+9. **Hours ≠ headcount in shift models:** Invoice hours are the same whether people do 6h/day or 4h/day; only the number of dedicated people changes. Report hours and dedicated people in separate columns and state the scope (which roles are in/out) on every headline number.
+
+10. **Streamlit cache keys:** Never name a cache-busting argument with a leading `_` — `@st.cache_data` excludes those from the key. Use `cache_stamp=(path, mtime, size)`.
+
+11. **Scale volume by dates, not by hours:** Ticket volume per month comes from the client's active fraction (go-live / final service date). Hour ratios embed the learning curve and produce absurd growth.
+
 ---
 
 ## Error Entries
@@ -136,5 +144,52 @@ if not _el_gen.empty and not _ov_cascade_pods:
 ```
 
 **Prevention Rule:** Gate "Overall" summary sections on filter state. If any scoping filter is active, hide summaries that aggregate beyond that scope.
+
+---
+### [2026-07-27] — Hybrid model: two conventions for the same "FTE" number
+
+**Error:** The manager report showed "358.3 FTEs required today" in the header cards but "353.5 required" in the POD balance, and "384 on payroll" vs "372 on payroll" — with no explanation. Managers could not tell which number to quote.
+
+**Root Cause:** Two different conventions coexisted. (a) The role tables divided *uplifted demand hours* by a nominal FTE (7.5h × working days = 157.5). (b) The POD/client tables divided *productive hours* by each role's real monthly capacity (AC1/AC2 134, GA 126). Since the actual uplift is ~1.37 and 157.5/134 = 1.175, the two lenses differed by ~50 FTEs. On top of that, the POD balance only counted pod × role pairs that hold ticket work, so the 12 above-Sr managers dropped out of the payroll side (384 → 372).
+
+**Fix Applied:** One convention everywhere — `capacity hours ÷ (7.5h × working days)`, with the per-row `uplift` column (role/activity utilization × absenteeism) added in `build_core` and helpers `fte_div_of` / `capacity_hours` / `required_hc` in `hybrid_transition.py`. Per-person capacities now only cap individual assignments. Scope labels added to every headline card, and the net-balance card was scoped to AC1 → Sr (supervision excluded).
+
+**Prevention Rule:** One definition of FTE per report. If a second lens is genuinely needed, label both explicitly and show the bridge between them — never let two conventions sit in the same page unlabeled.
+
+---
+
+### [2026-07-27] — Invoice block: counting people as if they were hours
+
+**Error:** The role table said the AC1 invoice block needed 82 FTEs while the task detail computed 36.7 for the same invoices.
+
+**Root Cause:** `role_scenarios` added `inv_fte` (people dedicated to the invoice shift — a Mixed-AP person occupies a whole slot with only 4h/day of invoices) directly into an FTE total built from hours. The task detail counted only the hours consumed.
+
+**Fix Applied:** The FTE total is now pure hours (`remaining + new_inv_hrs) / fte_div`); the number of dedicated people is reported separately as `inv_people_{scenario}` along with `spare_inv_hrs_{scenario}`. Role table and task detail reconcile within 0.3%.
+
+**Prevention Rule:** Hours and headcount are different units. A shift structure (6h vs 4h per day) changes *people*, not *hours* — report them in separate columns and never sum them.
+
+---
+
+### [2026-07-27] — Streamlit cache served stale data after overwriting an input file
+
+**Error:** Re-running the model after saving a new version of a workbook at the same path returned the previous results.
+
+**Root Cause:** `@st.cache_data` keys on the argument values (the path strings). A cache-busting stamp was added but named `_stamp_key` — Streamlit **excludes** any argument whose name starts with `_` from the cache key, so it had no effect.
+
+**Fix Applied:** Renamed to `cache_stamp=_stamp(export, vol, hc)` (size + mtime of each file) in `load_data` and `build_core`. Verified by overwriting the same path twice and getting different results.
+
+**Prevention Rule:** In Streamlit, never prefix a cache-key argument with `_`. Use `_` only for objects you deliberately want excluded (unhashable handles).
+
+---
+
+### [2026-07-27] — Volume scaled with the month-over-month hours ratio
+
+**Error:** Projected invoice volume exploded (+58% company-wide); HOA West alone jumped from 1,718 to ~28,000 tickets.
+
+**Root Cause:** Monthly scaling used `Client_FTEs_by_Month` hours ratios, which embed the learning curve — a client live from July 13 shows tiny June hours, so the July/June ratio was 16×.
+
+**Fix Applied:** Volume now scales by the client's active fraction of each calendar month, computed from Go Live / Final Service Date (`active_fraction`).
+
+**Prevention Rule:** Hours ratios are not volume ratios. Scale ticket volume by dates (ramp/churn), never by hour columns that include learning-curve or utilization effects.
 
 ---
