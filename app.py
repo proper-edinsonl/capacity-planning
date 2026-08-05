@@ -12,7 +12,19 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 
 # --- APP VERSION ---
-APP_VERSION = "v7.8.2026.8.4.7.09PM"
+APP_VERSION = "v7.9.2026.8.4.7.29PM"
+
+def _canon_pod(v):
+    """Canonicalize a POD label's leading 'pod' token to uppercase ('Pod 6',
+    'pod 6' -> 'POD 6'), leaving everything else untouched. Different sources
+    disagree on case (HC report title-cases 'Department unit' -> 'Pod 6';
+    the volume file/HubSpot use 'POD 6' as-is) — without this, the SAME POD
+    is silently treated as two different PODs everywhere they're joined or
+    grouped (splits totals, and duplicates Excel sheet names case-insensitively,
+    e.g. 'WF_Pod 6' vs 'WF_POD 6' -> xlsxwriter DuplicateWorksheetName)."""
+    import re as _re_pod
+    s = str(v or '').strip()
+    return _re_pod.sub(r'(?i)^(pod)\b', 'POD', s) if s else s
 
 def _lc_short_m0(gl_series):
     """Bool array: True if Go Live month has < 15 working days remaining (< 3 weeks)."""
@@ -1478,9 +1490,9 @@ def _apply_hubspot(df_vol, uploaded_file, log, is_update=False):
     # POD: keep master DB value; only fall back to HubSpot POD when master DB has nothing
     if 'POD' not in df_vol.columns:
         df_vol['POD'] = ''
-    df_vol['POD'] = df_vol['POD'].fillna('').astype(str).str.strip()
+    df_vol['POD'] = df_vol['POD'].fillna('').astype(str).str.strip().apply(_canon_pod)
     _hs_pod_mask = df_vol['POD'].eq('') & df_vol['_hs_pod'].ne('')
-    df_vol.loc[_hs_pod_mask, 'POD'] = df_vol.loc[_hs_pod_mask, '_hs_pod']
+    df_vol.loc[_hs_pod_mask, 'POD'] = df_vol.loc[_hs_pod_mask, '_hs_pod'].apply(_canon_pod)
     df_vol = df_vol.drop(columns=['_hs_pod'], errors='ignore')
 
     # Fill door count gaps from HubSpot
@@ -1598,7 +1610,7 @@ def _build_client_master_map():
 
     def _norm_pod(v):
         s = str(v or '').strip()
-        return 'No POD' if s.lower() in _EMPTY else s
+        return 'No POD' if s.lower() in _EMPTY else _canon_pod(s)
 
     def _norm_str(v):
         s = str(v or '').strip()
@@ -2299,7 +2311,7 @@ def _process_hc_report(file_bytes: bytes):
         _all_pod_df['Job title'].astype(str).str.lower().str.strip()
         .map(_HC_ROLE_MAP).fillna('Other')
     )
-    _all_pod_df['POD'] = _all_pod_df['Department unit'].astype(str).str.strip().str.title()
+    _all_pod_df['POD'] = _all_pod_df['Department unit'].astype(str).str.strip().str.title().apply(_canon_pod)
     _all_pod_df = _all_pod_df[_all_pod_df['Capacity Role'].isin(_cap_roles_dyn)]
     _all_pod_df['_sd']  = pd.to_datetime(
         _all_pod_df['Start Date']       if 'Start Date'       in _all_pod_df.columns else pd.NaT,
@@ -2326,7 +2338,7 @@ def _process_hc_report(file_bytes: bytes):
         active_pods['Job title'].astype(str).str.lower().str.strip()
         .map(_HC_ROLE_MAP).fillna('Other')
     )
-    active_pods['POD'] = active_pods['Department unit'].astype(str).str.strip().str.title()
+    active_pods['POD'] = active_pods['Department unit'].astype(str).str.strip().str.title().apply(_canon_pod)
 
     _jt_lower = active_pods['Job title'].astype(str).str.lower().str.strip()
     _mgr_roles_set = {'Principal Accountant', 'Acct. Manager', 'Sr. Acct. Manager'}
@@ -2485,7 +2497,7 @@ def _process_hc_report(file_bytes: bytes):
             attrited_pods['Job title'].astype(str).str.lower().str.strip()
             .map(_HC_ROLE_MAP).fillna('Other')
         )
-        attrited_pods['POD'] = attrited_pods['Department unit'].astype(str).str.strip().str.title()
+        attrited_pods['POD'] = attrited_pods['Department unit'].astype(str).str.strip().str.title().apply(_canon_pod)
         attrited_pods = attrited_pods[attrited_pods['Capacity Role'].isin(
             ['Accountant I', 'Accountant II', 'General Accountant', 'Sr. Accountant']
         )]
@@ -7489,6 +7501,7 @@ if "calc_data" in st.session_state:
                 df['POD'] = _pod_from_map.fillna(df.get('POD', 'No POD'))
                 df['POD'] = df['POD'].fillna('No POD').astype(str).str.strip()
                 df['POD'] = df['POD'].where(~df['POD'].str.lower().isin({'nan','none',''}), 'No POD')
+                df['POD'] = df['POD'].apply(_canon_pod)
 
                 if 'Sr. Accountant' not in df.columns:
                     df['Sr. Accountant'] = ''
@@ -7740,6 +7753,7 @@ if "calc_data" in st.session_state:
                     df_arg['POD'] = (
                         df_arg['POD'].fillna('No POD').astype(str).str.strip()
                         .where(lambda s: ~s.str.lower().isin({'nan','none',''}), 'No POD')
+                        .apply(_canon_pod)
                     )
                 return df_arg
 
@@ -9455,6 +9469,7 @@ if "calc_data" in st.session_state:
                         _pod_df['POD'] = (
                             _pod_df['POD'].fillna('').astype(str).str.strip()
                             .where(lambda s: ~s.str.lower().isin({'nan', 'none', ''}), 'No POD')
+                            .apply(_canon_pod)
                         )
                     _pod_names = sorted(
                         _pod_df['POD'].unique().tolist() if 'POD' in _pod_df.columns else []
@@ -10364,6 +10379,7 @@ if "calc_data" in st.session_state:
                     _psr_cli['POD'] = (
                         _psr_cli['POD'].fillna('').astype(str).str.strip()
                         .where(lambda s: ~s.str.lower().isin({'nan', 'none', ''}), 'No POD')
+                        .apply(_canon_pod)
                     )
                     _psr_pods = sorted(_psr_cli['POD'].unique().tolist())
                     if not _psr_pods:
@@ -10530,6 +10546,7 @@ if "calc_data" in st.session_state:
                     _bl_df['POD'] = (
                         _bl_df['POD'].fillna('').astype(str).str.strip()
                         .where(lambda s: ~s.str.lower().isin({'nan', 'none', ''}), 'No POD')
+                        .apply(_canon_pod)
                     )
                 # Filters
                 _bl_c1, _bl_c2, _bl_c3 = st.columns(3)
@@ -11865,6 +11882,21 @@ if "calc_data" in st.session_state:
 
             # WF_POD sheets — waterfall + HC + filtered sections per POD
             _wf_pods_exp = st.session_state.get('_wf_pod_all_export', {})
+            # Defense in depth: Excel sheet names collide case-insensitively
+            # ('WF_Pod 6' == 'WF_POD 6'). _canon_pod should already prevent two
+            # different-cased keys for the same POD from ever coexisting, but
+            # if anything upstream still produces one, merge them here instead
+            # of letting xlsxwriter crash with DuplicateWorksheetName.
+            if len({str(k).strip().lower() for k in _wf_pods_exp}) != len(_wf_pods_exp):
+                _merged_wf_pods = {}
+                for _k_wf, _v_wf in _wf_pods_exp.items():
+                    _canon_k = _canon_pod(_k_wf)
+                    if _canon_k in _merged_wf_pods:
+                        _log_event('warn',
+                            f"WF_POD export: merging duplicate-case POD keys "
+                            f"{_k_wf!r} -> {_canon_k!r} (would have crashed the export)")
+                    _merged_wf_pods[_canon_k] = _v_wf
+                _wf_pods_exp = _merged_wf_pods
             _hc_pod_role_df = _hc_xp.get('by_pod_role', pd.DataFrame()) if _hc_xp else pd.DataFrame()
             _hc_detail_df   = _hc_xp.get('detail',      pd.DataFrame()) if _hc_xp else pd.DataFrame()
             _emp_level_df   = st.session_state.get('_s3_emp_level_df', pd.DataFrame())
