@@ -12,7 +12,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 
 # --- APP VERSION ---
-APP_VERSION = "v7.7.2026.8.4.6.58PM"
+APP_VERSION = "v7.8.2026.8.4.7.09PM"
 
 def _lc_short_m0(gl_series):
     """Bool array: True if Go Live month has < 15 working days remaining (< 3 weeks)."""
@@ -8399,7 +8399,9 @@ if "calc_data" in st.session_state:
                     _duc_mrr['_jk'] = _duc_mrr['client_name'].astype(str).str.strip().str.lower()
                     _duc_mrr = _duc_mrr.merge(_cli_pod_map_mrr[['_jk', 'POD']], on='_jk', how='left').drop(columns=['_jk'])
                 # Record ID (HubSpot ID), keyed by client_name — record_id is the
-                # sole source of truth, sourced from the row-level volume data.
+                # sole source of truth. Sourced from the row-level volume data
+                # first; HubSpot (hs_parsed) fills the gap for clients with no
+                # volume rows yet (still Onboarding, or newly added in HubSpot).
                 _cli_rid_map_mrr = {}
                 if 'client_name' in df.columns and 'record_id' in df.columns:
                     _rid_src_mrr = df.dropna(subset=['client_name']).copy()
@@ -8407,6 +8409,14 @@ if "calc_data" in st.session_state:
                     _rid_src_mrr['_rid_clean'] = _clean_record_id(_rid_src_mrr['record_id'])
                     _rid_src_mrr = _rid_src_mrr[_rid_src_mrr['_rid_clean'] != '']
                     _cli_rid_map_mrr = _rid_src_mrr.groupby('_key_lower')['_rid_clean'].first().to_dict()
+                _hs_for_mrr_rid = st.session_state.get('hs_parsed')
+                if (_hs_for_mrr_rid is not None and hasattr(_hs_for_mrr_rid, 'empty') and not _hs_for_mrr_rid.empty
+                        and 'client_name' in _hs_for_mrr_rid.columns and 'record_id' in _hs_for_mrr_rid.columns):
+                    _hs_key_mrr = _hs_for_mrr_rid['client_name'].astype(str).str.lower().str.strip()
+                    _hs_rid_mrr = _clean_record_id(_hs_for_mrr_rid['record_id'])
+                    for _k_hm, _r_hm in zip(_hs_key_mrr, _hs_rid_mrr):
+                        if _r_hm:
+                            _cli_rid_map_mrr.setdefault(_k_hm, _r_hm)
 
                 _cli_mrr_rows = []
                 for _, _crow in _duc_mrr.iterrows():
