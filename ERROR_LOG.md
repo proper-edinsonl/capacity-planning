@@ -25,6 +25,14 @@
 
 11. **Scale volume by dates, not by hours:** Ticket volume per month comes from the client's active fraction (go-live / final service date). Hour ratios embed the learning curve and produce absurd growth.
 
+12. **record_id is the sole key for client → Sr./MRR/name lookups — never derive from a single source.** Clients can exist in the volume file, the `srs` sheet, and HubSpot independently (a brand-new/Onboarding client has no volume rows yet; an unassigned client has no `srs` row). Any lookup keyed only on `df_clean` will silently show blank/'Pending' for clients missing from that one source. Always merge: volume file (primary) → `srs` sheet fallback (owner/Sr.) → HubSpot fallback (MRR/name/record_id) — gap-fill only, never overwrite a value already resolved by a higher-priority source.
+
+13. **session_state survives a code update — Step 3 must be re-run, not just the code.** `st.session_state.final_dashboards` persists across script reruns; editing `app.py` does NOT invalidate already-computed cascade results. Stamp `_cascade_app_version` when the cascade runs and warn if it doesn't match the running `APP_VERSION`, or "fixed" bugs will keep reappearing in exports generated from stale session state.
+
+14. **POD casing must be canonicalized at every ingestion point, not assumed consistent.** `_process_hc_report` produced `'Pod 6'` (via `.str.title()` on "Department unit") while the volume file/HubSpot produce `'POD 6'`. Since Excel sheet names collide case-insensitively, two differently-cased POD values crash the export (`DuplicateWorksheetName`) — and more importantly, silently split one POD's data into two group-by buckets everywhere HC and volume data join on POD. Route every POD value through one canonicalizing helper (e.g. `_canon_pod`) at the point it's read from source data, not just at display time.
+
+15. **A "Generate Baseline" / non-standard upload path can bypass the function that normally parses a sheet.** The plain button-driven Step 1 read (`pd.read_excel(uploaded_file)`) bypasses `_load_volume_aht()` entirely — so anything that function alone populates (`_srs_rid_email_map`, `_vol_file_bytes`, the `srs` sheet's Sr. Accountant resolution) is silently empty on that path. Any downstream helper that depends on those session keys needs its own self-contained fallback (re-derive from `df_clean` directly, or re-parse the raw uploaded file) rather than assuming one ingestion function always ran.
+
 ---
 
 ## Error Entries
@@ -191,5 +199,41 @@ if not _el_gen.empty and not _ov_cascade_pods:
 **Fix Applied:** Volume now scales by the client's active fraction of each calendar month, computed from Go Live / Final Service Date (`active_fraction`).
 
 **Prevention Rule:** Hours ratios are not volume ratios. Scale ticket volume by dates (ramp/churn), never by hour columns that include learning-curve or utilization effects.
+
+---
+
+### [2026-08-04] — Manager-tier roles silently miscounted / lost hours in the Required Role cascade
+
+**Error:** Roles above Sr. Accountant (Assistant Manager, Accounting Manager, and a new "Sr. Accounting Manager" / "Principal Accountant" / "General Accountant II" that appeared in a fresh HC report) either collapsed into Sr. Accountant's hours in the Ideal cascade, or fell into `_HC_ROLE_MAP`'s 'Other' bucket and vanished from HC totals entirely.
+
+**Root Cause:** `_HC_ROLE_MAP`/`ROLE_HIERARCHY` only recognized 4 executor roles + 2 old manager titles. `_apply_ideal_pairs` forced any unrecognized Processor/QA role straight to `'Sr. Accountant'`. Accounting Manager never had its own direct-reports map at all (only Assistant Manager and Sr. Accountant did).
+
+**Fix Applied:** New `_classify_role()` dynamically buckets anything above Sr. Accountant as `'Manager'` instead of guessing a specific title list. In Ideal mode, Manager-classified hours reassign to the `Ideal_Pairs` owner if defined, else the historically most-frequent executor role that month (`_build_historical_role_mode_maps`), capped at Sr. Accountant — Real mode is left untouched (shows ground truth). `_HC_ROLE_MAP` extended for the 3 new titles; Assistant Manager and Principal Accountant merged into one `'Principal Accountant'` capacity role (confirmed with the user — same role). Cloned `by_am_email`'s pattern into `_build_supervisor_email_map()` so Accounting Manager and Sr. Accounting Manager get the same Ops Rhythm/span-of-control treatment as Sr. Accountant.
+
+**Prevention Rule:** Never hardcode a fixed role list for "anything above the base executor tier" — classify dynamically (known base roles vs. everything else = Manager) so a new title in an HC report doesn't need a code change to be counted correctly.
+
+---
+
+### [2026-08-04] — Client MRR / Sr. Accountant / Record ID showing blank or "Pending" despite valid data
+
+**Error:** Across multiple rounds: (1) `df_resumen['Sr. Accountant']` showed "Pending" for clients that clearly had an owner in the `srs` sheet; (2) MRR/Client Names/Client Status columns were empty for every person; (3) two specific clients (new in HubSpot, zero volume rows) had no Record ID anywhere, including in the independently-built `Client_MRR` sheet.
+
+**Root Cause:** Three distinct gaps, all the same shape (see Prevention Rule #12): (1) the Sr. Accountant lookup was built only from `df_clean`'s row-level 'Sr. Accountant' column — clients with no volume rows (Onboarding, or AI-predicted) have nothing there even though `srs` knows the owner; (2) the "Generate Baseline" button path bypasses `_load_volume_aht()` entirely, so `_srs_rid_email_map` — needed by the MRR/Names/Status helper — was always empty on that path; (3) the `Client_MRR` sheet builds its own client_name→record_id map independently from `df_resumen`'s, and was never given the same HubSpot fallback.
+
+**Fix Applied:** `_get_srs_rid_email_map()` — a robust re-reader of the `srs` sheet (session map → cached raw df → cached/live upload bytes, same fallback chain as the existing `_get_srs_emails_with_clients()`) — now backs every one of these lookups: `df_resumen`'s Sr. Accountant/Record ID resolution, `_build_person_client_extras()` (MRR/Names/Status), and the `Client_MRR` sheet's record_id map. HubSpot (`hs_parsed`) is checked as a further fallback for record_id/MRR/name specifically for clients with zero volume rows.
+
+**Prevention Rule:** See Prevention Rules #12, #13, #15. When auditing "why is X blank," check whether the value's source function actually ran on the code path the user used — don't assume `_load_volume_aht()`/similar always executes.
+
+---
+
+### [2026-08-04] — Export crash: `DuplicateWorksheetName` on 'WF_Pod 6'
+
+**Error:** `xlsxwriter.exceptions.DuplicateWorksheetName: Sheetname 'WF_Pod 6', with case ignored, is already in use.`
+
+**Root Cause:** See Prevention Rule #14 — `_process_hc_report` produced `'Pod 6'` (title-cased) while the volume file produced `'POD 6'`, so `_wf_pod_all_export` ended up with two dict keys for the same physical POD, and both generated the same sheet name once Excel's case-insensitive comparison was applied.
+
+**Fix Applied:** `_canon_pod()` applied at every POD ingestion/normalization point (3 sites in `_process_hc_report`, volume ingestion, `_build_client_master_map`, Step 3 cascade POD merge, POD tab/audit/reconciliation views) plus a defense-in-depth merge immediately before the `WF_POD` sheet-generation loop.
+
+**Prevention Rule:** See Prevention Rule #14.
 
 ---
