@@ -12,7 +12,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 
 # --- APP VERSION ---
-APP_VERSION = "v7.6.2026.8.4.1.41PM"
+APP_VERSION = "v7.7.2026.8.4.6.58PM"
 
 def _lc_short_m0(gl_series):
     """Bool array: True if Go Live month has < 15 working days remaining (< 3 weeks)."""
@@ -3249,20 +3249,25 @@ def _build_person_client_extras(rid_email_map):
             continue
         _rid_s = str(_rid_k).strip()
         _cinfo = _rid_base.get(_rid_s, {}) or {}
-        _d = _agg.setdefault(_ek, {'mrr': 0.0, 'names': [], 'statuses': {}})
+        _d = _agg.setdefault(_ek, {'mrr': 0.0, 'names': [], 'rids': [], 'statuses': {}})
         _d['mrr'] += float(_cinfo.get('mrr', 0) or 0)
         _cname = str(_cinfo.get('client_name', '') or '').strip()
         if _cname:
             _d['names'].append(_cname)
+            _d['rids'].append(_rid_s)   # kept parallel to names, same client
         _st_v = _hs_status_by_rid.get(_rid_s)
         if _st_v:
             _d['statuses'][_st_v] = _d['statuses'].get(_st_v, 0) + 1
 
     result = {}
     for _ek, _d in _agg.items():
+        # Sort names/rids together so they stay aligned (client_names and
+        # record_ids must correspond position-for-position for auditing)
+        _pairs = sorted(zip(_d['names'], _d['rids']))
         result[_ek] = {
             'mrr':           _d['mrr'],
-            'client_names':  ', '.join(sorted(set(_d['names']))),
+            'client_names':  ', '.join(n for n, _ in _pairs),
+            'record_ids':    ', '.join(r for _, r in _pairs),
             'status':        ' · '.join(f"{k}: {v}" for k, v in _d['statuses'].items()) if _d['statuses'] else '—',
         }
     return result
@@ -7803,6 +7808,19 @@ if "calc_data" in st.session_state:
                                   .agg(_first_valid).dropna().to_dict())
                 _name_to_rid = _sr_src.groupby('_key_lower')['_rid_clean'].first().to_dict()
 
+            # Fallback for clients with NO volume rows at all (still Onboarding,
+            # or newly added in HubSpot before any ticket data exists) — df has
+            # nothing for them, but HubSpot already knows their record_id. Only
+            # fills gaps; never overrides a record_id already resolved above.
+            _hs_for_rid = st.session_state.get('hs_parsed')
+            if (_hs_for_rid is not None and hasattr(_hs_for_rid, 'empty') and not _hs_for_rid.empty
+                    and 'client_name' in _hs_for_rid.columns and 'record_id' in _hs_for_rid.columns):
+                _hs_name_key = _hs_for_rid['client_name'].astype(str).str.lower().str.strip()
+                _hs_rid_clean = _clean_record_id(_hs_for_rid['record_id'])
+                for _k_hs, _r_hs in zip(_hs_name_key, _hs_rid_clean):
+                    if _r_hs:
+                        _name_to_rid.setdefault(_k_hs, _r_hs)
+
             # Fallback for record_ids not covered above — clients with no (or
             # only AI-synthesized) volume rows have no 'Sr. Accountant' value
             # to derive from, but the srs sheet still knows who owns them.
@@ -8108,10 +8126,12 @@ if "calc_data" in st.session_state:
                     if not _rev_email or _rev_email.lower() in ('nan', 'none'):
                         _rev_email = _n2email.get(_rev_name.lower(), '')
 
+                _audit_rid = _clean_record_id(pd.Series([_row.get('record_id', '')])).iloc[0]
                 _audit_rows.append({
                     'POD':                          _pod,
                     'Sr. Accountant':               _sr,
                     'Client':                       _cli,
+                    'Record ID':                    _audit_rid,
                     'Process':                      str(_row.get('type',    '')).strip(),
                     'Sub-process':                  str(_row.get('subtype', '')).strip(),
                     'Processor':                    _proc_name,
@@ -8350,6 +8370,11 @@ if "calc_data" in st.session_state:
             _mode_tag = 'real' if _s3_use_real_cas else 'ideal'
             st.session_state['_cascade_role_mode'] = _mode_tag
             st.session_state[f'final_dashboards_{_mode_tag}'] = st.session_state.final_dashboards
+            # Stamp the app version that computed this cascade — dashboards/exports
+            # warn if the running code has since changed but Step 3 wasn't re-run
+            # (session_state persists across script reruns, so stale results can
+            # silently survive a code update otherwise).
+            st.session_state['_cascade_app_version'] = APP_VERSION
 
             # ── Build Client MRR per month table ──────────────────────────────────
             _duc_mrr = st.session_state.get('df_clients_unique', pd.DataFrame()).copy()
@@ -8468,6 +8493,17 @@ if "calc_data" in st.session_state:
     # RENDER DASHBOARDS IF AVAILABLE
     # ==========================================
     if "final_dashboards" in st.session_state:
+        # ── Warn if these dashboards were computed by an OLDER app version ──────
+        # session_state persists across script reruns, so a code update alone
+        # does NOT refresh already-computed results — Step 3 must be re-run.
+        _cascade_ver = st.session_state.get('_cascade_app_version')
+        if _cascade_ver and _cascade_ver != APP_VERSION:
+            st.warning(
+                f"⚠️ These dashboards were computed with app **{_cascade_ver}**, but the "
+                f"app is now **{APP_VERSION}**. Click **Generate Baseline** (Step 1) then "
+                f"re-run **Step 3** before exporting — otherwise you'll be exporting stale "
+                f"results that don't include the latest fixes."
+            )
         # ── Always recompute table heights from current data ──────────────────────
         _fd_now = st.session_state['final_dashboards']
         st.session_state['_df_heights'] = {
@@ -8617,6 +8653,7 @@ if "calc_data" in st.session_state:
                         'MRR ($)':                            round(_extras_a.get('mrr', 0.0), 2),
                         'Client Status':                      _extras_a.get('status', '—'),
                         'Client Names':                       _extras_a.get('client_names', ''),
+                        'Record IDs':                         _extras_a.get('record_ids', ''),
                         'Productive Hrs':                    round(_prh, 1),
                         'Total Work Hours':                  round(_toh, 1),
                         'Ops Rhythm Hrs':                    round(_oph, 1),
@@ -11356,6 +11393,7 @@ if "calc_data" in st.session_state:
                             'MRR ($)':                            round(_extras_x.get('mrr', 0.0), 2),
                             'Client Status':                      _extras_x.get('status', '—'),
                             'Client Names':                       _extras_x.get('client_names', ''),
+                            'Record IDs':                         _extras_x.get('record_ids', ''),
                             'Productive Hrs':                    round(_prh_v, 1),
                             'Total Work Hours':                  round(_toh_x, 1),
                             'Ops Rhythm Hrs':                    round(_oph_x, 1),
@@ -12204,6 +12242,7 @@ if "calc_data" in st.session_state:
                             'MRR ($)':                            round(_extras_c.get('mrr', 0.0), 2),
                             'Client Status':                      _extras_c.get('status', '—'),
                             'Client Names':                       _extras_c.get('client_names', ''),
+                            'Record IDs':                         _extras_c.get('record_ids', ''),
                             'Productive Hrs':                    round(_prod_hrs, 1),
                             'Total Work Hours':                  round(_tot_hrs, 1),
                             'Ops Rhythm Hrs':                    round(_ops_hrs, 1),
