@@ -18,6 +18,10 @@ dist/
 scenarios/
 params_configs/
 
+# Local secrets — never commit API tokens
+.hubspot_config.json
+.auto_capacity_report_gui.json
+
 # Streamlit cache
 .streamlit/cache/
 
