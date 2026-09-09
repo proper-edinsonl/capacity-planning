@@ -44,6 +44,7 @@ PROPERTY_TO_COLUMN = {
     "original_contract_mrr": "Original CMRR",
     "go_live_date": "Go Live Date",
     "delivery_confirmed_go_live_date": "Delivery Confirmed Go-Live Date",
+    "target_go_live_date": "Target Go-Live Date",
     "final_service_date": "Final Service Date",
     "property_management_software": "PMS",
 }
@@ -204,17 +205,38 @@ def fetch_companies_dataframe(token: str, log=print) -> pd.DataFrame:
         log(f"HubSpot: dropping {pod_blank.sum()} companies with no POD assigned.")
     df = df[~pod_blank].copy()
 
-    # ── Go Live fallback: today + 45 days if blank ──────────────────────────
-    gl = pd.to_datetime(df["Go Live Date"], errors="coerce")
+    # ── Go Live resolution: HubSpot carries THREE go-live-ish dates —
+    # Go Live Date, Delivery Confirmed Go-Live Date, and Target Go-Live
+    # Date. A company can have a real date sitting in any one of them while
+    # the other two are blank or stale — checking only "Go Live Date" (the
+    # old behavior) missed real dates and fell through to the +45-day
+    # synthetic fallback even when the company clearly already has a known
+    # go-live. Per the user: take the LATEST (max) of whichever of the 3
+    # are populated, not a fixed priority order. ────────────────────────────
+    gl_main    = pd.to_datetime(df["Go Live Date"], errors="coerce")
+    gl_confirm = pd.to_datetime(df["Delivery Confirmed Go-Live Date"], errors="coerce")
+    gl_target  = pd.to_datetime(df["Target Go-Live Date"], errors="coerce")
+    gl_resolved = pd.concat([gl_main, gl_confirm, gl_target], axis=1).max(axis=1, skipna=True)
+
+    today_ts = pd.Timestamp(datetime.now().date())
     fallback_gl = (datetime.now() + timedelta(days=45)).strftime("%Y-%m-%d")
-    n_gl_filled = int(gl.isna().sum())
+    n_gl_filled = int(gl_resolved.isna().sum())
     if n_gl_filled:
-        log(f"HubSpot: filling Go Live Date for {n_gl_filled} companies with today+45 days ({fallback_gl}).")
-    df["Go Live Date"] = gl.fillna(pd.Timestamp(fallback_gl)).dt.strftime("%Y-%m-%d")
-    # Keep this fallback value available under the Delivery-Confirmed column too
-    # (in case a downstream reader prefers that column when Go Live is blank).
-    dcgl = pd.to_datetime(df["Delivery Confirmed Go-Live Date"], errors="coerce")
-    df["Delivery Confirmed Go-Live Date"] = dcgl.dt.strftime("%Y-%m-%d")
+        log(f"HubSpot: {n_gl_filled} companies have no date in any of the 3 Go-Live "
+            f"fields (Go Live / Delivery Confirmed / Target) — filling with today+45 "
+            f"days ({fallback_gl}).")
+
+    # Companies whose date came from a REAL HubSpot field (not the synthetic
+    # +45 fallback), and how many days old that real date is — a client
+    # whose real go-live is already months in the past should have actual
+    # Volume/AHT hours already; if the pipeline still treats them as
+    # brand-new, that's a record-matching problem to flag, not a genuinely
+    # new client to run through the day-1 ramp-up learning curve.
+    df["_go_live_is_real"] = gl_resolved.notna()
+    df["_go_live_age_days"] = (today_ts - gl_resolved).dt.days
+
+    df["Go Live Date"] = gl_resolved.fillna(pd.Timestamp(fallback_gl)).dt.strftime("%Y-%m-%d")
+    df["Delivery Confirmed Go-Live Date"] = gl_resolved.dt.strftime("%Y-%m-%d")
 
     # ── Last Billed MRR: HubSpot stores a literal "0" (not blank/null) for
     # clients that haven't been billed yet — e.g. Onboarding or newly-live

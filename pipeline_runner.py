@@ -113,7 +113,7 @@ def run_pipeline(volume_path: str, hc_path: str, hubspot_token: str, out_dir: st
         import pandas as pd
         import ai_prediction_engine as aipe
 
-        df_new_zero = _find_new_clients(ns, hs_parsed, st.session_state.df_clean)
+        df_new_zero = _find_new_clients(ns, hs_parsed, st.session_state.df_clean, log=log)
         df_new_partial = _find_partial_month_clients(ns, st.session_state.df_clean, hs_parsed, log=log)
 
         if not df_new_partial.empty and not df_new_zero.empty:
@@ -179,13 +179,28 @@ def _dataframe_to_xlsx_bytes(df) -> bytes:
     return buf.getvalue()
 
 
-def _find_new_clients(ns: dict, hs_parsed, df_clean):
+STALE_GO_LIVE_DAYS = 90  # matches the training filter's own "mature client" cutoff
+
+
+def _find_new_clients(ns: dict, hs_parsed, df_clean, log=print):
     """HubSpot companies not yet represented in the volume file — matched by
     record_id (name as fallback), excluding Churn/blank lifecycle. Mirrors
     app.py:6692-6708 (the "Onboarding New Clients" detection used by the
     manual "Queue for AI Prediction" flow). `hs_parsed` is already filtered
     to POD-assigned companies upstream (hubspot_client.py), so no extra POD
     check is needed here.
+
+    Excludes companies whose REAL (non-fallback) Go-Live date — resolved by
+    hubspot_client.py from the max of Go Live / Delivery Confirmed / Target
+    Go-Live Date — is already >90 days in the past. A client live that long
+    should already have real Volume/AHT hours; if it still shows up here
+    with zero volume, that's a record-matching problem (e.g. a duplicate
+    HubSpot company, or a name/record_id mismatch against the Volume file),
+    not a genuinely new client — running it through the day-1 AI ramp-up
+    curve would fabricate hours instead of surfacing the real mismatch.
+    These are logged for manual review and left out of AI Prediction; their
+    hours stay whatever the Volume file already has for them (0, if truly
+    unmatched) rather than a synthetic new-client projection.
 
     Returns a DataFrame shaped for ai_prediction_engine.train_and_predict():
     company_name, record_id, pod, go_live_date, mrr, pms, res_doors,
@@ -215,14 +230,35 @@ def _find_new_clients(ns: dict, hs_parsed, df_clean):
     hs_name_in_vol = hs["client_name"].astype(str).apply(_norm_name).isin(baseline_names)
     in_vol = hs_rids.isin(vol_rids) | ((hs_rids == "") & hs_name_in_vol)
 
-    lc_blank = {"—", "", "none", "nan"}
+    # "Lead" means the company hasn't actually converted to a client yet —
+    # confirmed with the user (2026-09-09): not an active client with an
+    # assigned POD, so it's garbage regardless of what dates/MRR it carries
+    # (a couple of these are stale duplicates of a real "Client"-stage
+    # record for the same company; one has a real go-live from years ago
+    # sitting in a Lead-stage record that never got its stage updated).
+    lc_non_client = {"—", "", "none", "nan", "lead"}
     candidates = hs[
         ~in_vol
         & ~lifecycle_norm.str.startswith("churn")
-        & ~lifecycle_norm.isin(lc_blank)
+        & ~lifecycle_norm.isin(lc_non_client)
     ].copy()
     if candidates.empty:
         return candidates
+
+    if "_go_live_is_real" in candidates.columns and "_go_live_age_days" in candidates.columns:
+        is_real = candidates["_go_live_is_real"].astype(str).str.lower().isin(("true", "1", "1.0"))
+        age_days = pd.to_numeric(candidates["_go_live_age_days"], errors="coerce")
+        stale_mask = is_real & (age_days > STALE_GO_LIVE_DAYS)
+        if stale_mask.any():
+            stale_names = candidates.loc[stale_mask, "client_name"].tolist()
+            log(f"  WARNING: {stale_mask.sum()} candidate(s) have a REAL Go-Live date "
+                f"already >{STALE_GO_LIVE_DAYS} days old but zero Volume hours — "
+                f"likely a duplicate/mismatched HubSpot record, not a genuinely new "
+                f"client. Excluded from AI Prediction (kept at their real Volume "
+                f"hours — 0, if truly unmatched). Review manually: {stale_names}")
+            candidates = candidates[~stale_mask].copy()
+        if candidates.empty:
+            return candidates
 
     return pd.DataFrame({
         "company_name": candidates["client_name"],
