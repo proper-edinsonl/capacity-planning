@@ -22,6 +22,7 @@ anywhere except HubSpot's own API.
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -57,6 +58,12 @@ EXCLUDED_COMPANY_NAMES = {
 
 # Lifecycle Stage labels for which the Final Service Date should be honored.
 FSD_HONORED_LIFECYCLE_STAGES = {"churn", "pending termination"}
+
+# Placeholder/dummy company records that shadow a POD bucket instead of a
+# real client (e.g. a company literally named "POD 6") — confirmed with the
+# user as garbage records to always exclude, regardless of lifecycle stage
+# or POD assignment.
+_POD_PLACEHOLDER_RE = re.compile(r"^pod\s*\d+$", re.IGNORECASE)
 
 
 def load_token() -> str | None:
@@ -182,6 +189,14 @@ def fetch_companies_dataframe(token: str, log=print) -> pd.DataFrame:
         log(f"HubSpot: excluding {excl_mask.sum()} test/internal account(s): "
             f"{df.loc[excl_mask, 'Company name'].tolist()}")
     df = df[~excl_mask].copy()
+
+    # ── Exclude placeholder/dummy records (company name IS a POD label,
+    # e.g. "POD 6") — these are not real clients. ───────────────────────────
+    placeholder_mask = df["Company name"].astype(str).str.strip().str.match(_POD_PLACEHOLDER_RE)
+    if placeholder_mask.any():
+        log(f"HubSpot: excluding {placeholder_mask.sum()} placeholder/dummy record(s) "
+            f"(company name is a POD label): {df.loc[placeholder_mask, 'Company name'].tolist()}")
+    df = df[~placeholder_mask].copy()
 
     # ── POD required — drop companies with no POD assigned ─────────────────
     pod_blank = df["POD"].isna() | (df["POD"].astype(str).str.strip() == "")
