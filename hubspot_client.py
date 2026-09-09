@@ -201,6 +201,21 @@ def fetch_companies_dataframe(token: str, log=print) -> pd.DataFrame:
     dcgl = pd.to_datetime(df["Delivery Confirmed Go-Live Date"], errors="coerce")
     df["Delivery Confirmed Go-Live Date"] = dcgl.dt.strftime("%Y-%m-%d")
 
+    # ── Last Billed MRR: HubSpot stores a literal "0" (not blank/null) for
+    # clients that haven't been billed yet — e.g. Onboarding or newly-live
+    # clients — which is NOT the same as "no last billed value". Treat 0 as
+    # missing so downstream MRR resolution (_parse_hubspot_file's own
+    # "Last Billed MRR" -> "Original CMRR" fallback) actually fires the way
+    # the user's rule intends ("si no tiene last billed, usar Original/
+    # Contracted CMRR"). Without this, a real .fillna(NaN-only) fallback
+    # never triggers because 0 is a present, non-null value.
+    lb_num = pd.to_numeric(df["Last Billed MRR"], errors="coerce")
+    n_lb_zeroed = int((lb_num == 0).sum())
+    if n_lb_zeroed:
+        log(f"HubSpot: {n_lb_zeroed} companies show Last Billed MRR = 0 (not yet "
+            f"billed) — falling back to Original CMRR for these.")
+    df["Last Billed MRR"] = lb_num.replace(0, pd.NA)
+
     # ── Final Service Date: only honored for Churn / Pending Termination ───
     lifecycle_norm = df["Lifecycle Stage"].astype(str).str.strip().str.lower()
     fsd_keep_mask = lifecycle_norm.isin(FSD_HONORED_LIFECYCLE_STAGES)
