@@ -12,7 +12,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 
 # --- APP VERSION ---
-APP_VERSION = "v7.9.2026.8.4.7.29PM"
+APP_VERSION = "v8.0.2026.9.9.2.38PM"
 
 def _canon_pod(v):
     """Canonicalize a POD label's leading 'pod' token to uppercase ('Pod 6',
@@ -3884,6 +3884,34 @@ def _apply_pro_formatting(xlsx_bytes: bytes) -> bytes:
             if any(m in h for m in MONTH_NAMES): return '$#,##0'
         return detect_format(header)
 
+    import re
+
+    def _detect_wf_row_format(label):
+        """Number format for one row of a Waterfall-style sheet (metric per row,
+        month per column — every column header is just a month name, so the
+        column-based `detect_format` above can't tell hours from dollars from
+        FTEs). Inferred from the row label text in column A instead.
+        The underlying values here are stored on a 0-100 scale (e.g. 77.51 for
+        "77.51%"), not Excel's native 0-1 fraction — hence the literal `"%"`
+        suffix format instead of a true `%` format, which would multiply by 100.
+
+        Keywords are matched with a word boundary (`\\b`), not plain substring
+        containment — "count" as a bare substring also matches inside
+        "Accountant"/"Sr. Accountant", which are row labels here, not metrics."""
+        if not label:
+            return None
+        l = label.lower()
+        if 'productivity' in l or '(%)' in l or l.rstrip().endswith('%'):
+            return '0.00"%"'
+        if '($)' in l or re.search(r'\b(mrr|cost|margin|saving|budget|revenue)\b', l):
+            return '$#,##0'
+        if re.search(r'\b(fte|hc)\b', l):
+            return '0.00'
+        if re.search(r'\b(hrs|hours|churn|clients|tickets|doors|reports|count|days|'
+                     r'automations|adjustments|property)\b', l):
+            return '#,##0'
+        return None
+
     FREEZE_MAP = {
         'Capacity_Overview_Waterfall': 'B2', 'MRR_Forecast': 'A2',
         'MRR_Growth_Settings': 'A2', 'Sr_Accountant_Waterfalls': 'B2',
@@ -3994,8 +4022,14 @@ def _apply_pro_formatting(xlsx_bytes: bytes) -> bytes:
                     formula=['MOD(ROW(),2)=0'], fill=band_fill
                 ))
 
-            # 5. Section row highlights — skip on huge sheets (no ━/▶/=== rows there anyway)
+            # 5. Section row highlights + row-based number formats — skip on huge
+            # sheets (no ━/▶/=== rows there anyway). Waterfall-style sheets have a
+            # metric per ROW and a month per COLUMN, so the column-header-based
+            # number formatting in step 2 never applies here (every header is just
+            # a month name) — infer the format from the row label instead, and let
+            # bullet/blank sub-rows inherit the enclosing section's format.
             if (sn in SECTION_HIGHLIGHT_SHEETS or sn.startswith('WF_')) and not is_huge:
+                _wf_row_fmt = None
                 for r in range(2, n_rows + 1):
                     v = ws.cell(r, 1).value
                     s = str(v).strip() if v is not None else ''
@@ -4017,6 +4051,19 @@ def _apply_pro_formatting(xlsx_bytes: bytes) -> bytes:
                             cell = ws.cell(r, c)
                             cell.fill = target_fill
                             cell.font = target_font
+
+                    _detected_fmt = _detect_wf_row_format(s.lstrip('━▶='))
+                    if _detected_fmt:
+                        _wf_row_fmt = _detected_fmt
+                    elif not s or s.startswith('·'):
+                        pass  # blank / bullet sub-row — inherit the section's format
+                    else:
+                        _wf_row_fmt = None  # unrecognized label — don't misformat other rows
+                    if _wf_row_fmt:
+                        for c in range(2, n_cols + 1):
+                            cell = ws.cell(r, c)
+                            if cell.value is not None and not isinstance(cell.value, str):
+                                cell.number_format = _wf_row_fmt
             # 6. Conditional formatting (Δ and margin %)
             for c in range(1, n_cols + 1):
                 hv = ws.cell(1, c).value
@@ -8941,17 +8988,20 @@ if "calc_data" in st.session_state:
                             }
 
                 # ── Helper to format by metric type ─────────────────────────────────
+                # Returns the RAW numeric value (not a baked string like "$1,234.00")
+                # so Excel can store it as a real number and apply its own cell
+                # number_format — see _detect_wf_row_format() in _apply_pro_formatting,
+                # which infers the right format from this row's label text (column A)
+                # since every column here is just a month name, not a metric name.
+                # `kind` is kept as a no-op parameter so every call site (~200 of them
+                # across this function and the WF_POD block) stays unchanged.
                 def _fmt(val, kind):
                     if val is None: return "—"
                     try:
                         v = float(val)
                     except (TypeError, ValueError):
                         return str(val)
-                    if kind == '$':   return f"${v:,.2f}"
-                    if kind == '%':   return f"{v:.2f}%"
-                    if kind == 'fte': return f"{v:.2f}"
-                    if kind == 'dec': return f"{v:.2f}"
-                    return f"{v:,.0f}"
+                    return v
 
                 # ── Build the waterfall rows ─────────────────────────────────────────
                 def _build_overall_wf():
