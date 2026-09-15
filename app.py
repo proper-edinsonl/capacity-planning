@@ -12,7 +12,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 
 # --- APP VERSION ---
-APP_VERSION = "v8.0.2026.9.9.2.38PM"
+APP_VERSION = "v8.1.2026.9.14.8.05PM"
 
 def _canon_pod(v):
     """Canonicalize a POD label's leading 'pod' token to uppercase ('Pod 6',
@@ -2508,6 +2508,51 @@ def _process_hc_report(file_bytes: bytes):
             'Full name', 'Work Email', 'Job title', 'Capacity Role', 'POD', 'Worker Status'
         ])
 
+    # ── Super Pod groups — the PODs in each Sr. Accounting Manager's full
+    # downline (direct + indirect reports via Manager email chain). SAMs
+    # themselves are tagged under a non-POD department (e.g. "Delivery"), so
+    # this must walk the FULL active roster (not the pod-only subset) —
+    # confirmed with the user (2026-09-14): "Super Pod" = all PODs under one
+    # SAM, not a lettered POD split. ─────────────────────────────────────────
+    sam_pod_groups = {}
+    _all_active_roles = (
+        active['Job title'].astype(str).str.lower().str.strip()
+        .map(_HC_ROLE_MAP).fillna('Other')
+    )
+    _sam_rows_idx = active.index[_all_active_roles == 'Sr. Acct. Manager']
+    if len(_sam_rows_idx):
+        _email_norm_all = active['Work Email'].astype(str).str.strip().str.lower()
+        _mgr_norm_all    = active['Manager email'].astype(str).str.strip().str.lower()
+        _by_mgr_children = {}
+        for _idx in active.index:
+            _by_mgr_children.setdefault(_mgr_norm_all.loc[_idx], []).append(_idx)
+
+        def _downline_indices(root_email):
+            seen, stack, out = set(), [root_email], []
+            while stack:
+                e = stack.pop()
+                for _ci in _by_mgr_children.get(e, []):
+                    if _ci in seen:
+                        continue
+                    seen.add(_ci)
+                    out.append(_ci)
+                    stack.append(_email_norm_all.loc[_ci])
+            return out
+
+        for _idx in _sam_rows_idx:
+            _sam_name  = str(active.loc[_idx, 'Full name']).strip()
+            _sam_email = _email_norm_all.loc[_idx]
+            if not _sam_email or _sam_name.lower() in ('', 'nan'):
+                continue
+            _dl_idx  = _downline_indices(_sam_email)
+            _dl_pods = {
+                _canon_pod(str(active.loc[_di, 'Department unit']).strip())
+                for _di in _dl_idx
+                if str(active.loc[_di, 'Department unit']).strip().lower().startswith('pod')
+            }
+            if _dl_pods:
+                sam_pod_groups[_sam_name] = sorted(_dl_pods)
+
     return {
         'by_role':        by_role,
         'by_pod_role':    by_pod_role,
@@ -2534,6 +2579,7 @@ def _process_hc_report(file_bytes: bytes):
         ],
         'attrited_detail': attrited_detail,
         'employees':       employees,   # [{email,name,role,pod,start_date,last_working_day}] — all pods, all statuses
+        'sam_pod_groups':  sam_pod_groups,  # {SAM full name: sorted[POD labels in their full downline]}
     }
 
 
@@ -9559,12 +9605,51 @@ if "calc_data" in st.session_state:
                             )
                         st.divider()
 
+                    # ── Super Pod groups — all PODs in one Sr. Accounting Manager's
+                    # full downline (direct + indirect reports). Computed inside
+                    # `_process_hc_report` (`sam_pod_groups`) since that's where the
+                    # Manager-email org chain lives. Confirmed with the user
+                    # (2026-09-14): "Super Pod" = a SAM's PODs, NOT a lettered POD
+                    # split (POD 6A/6B etc. are unrelated to this). Only SAMs with
+                    # 2+ distinct PODs in their downline get a Super Pod tab/sheet —
+                    # a SAM with a single POD adds nothing beyond that POD's own tab.
+                    _sam_pod_groups = _hc.get('sam_pod_groups', {}) if _hc else {}
+                    _super_pod_groups = {}   # SAM name -> {'client': {...}, 'hc': {...}}
+                    for _sam_name_sp, _sam_pods_sp in _sam_pod_groups.items():
+                        _members_hc_sp = set(_sam_pods_sp)
+                        if len(_members_hc_sp) < 2:
+                            continue   # single-POD SAM — no Super Pod needed
+                        _members_client_sp = {p for p in _pod_names if p in _members_hc_sp}
+                        _super_pod_groups[_sam_name_sp] = {'client': _members_client_sp, 'hc': _members_hc_sp}
+
                     if _pod_names:
-                        _pod_tab_labels = _pod_names
+                        # Tab list = regular PODs + qualifying Super Pod (SAM) keys.
+                        # Kept separate from `_pod_names` (still used unchanged by the
+                        # FTE Summary table above) so this is additive and low-risk.
+                        _tab_pod_names = _pod_names + sorted(_super_pod_groups.keys())
+                        _pod_tab_labels = [
+                            f"🔗 {_n} (Super Pod)" if _n in _super_pod_groups else _n
+                            for _n in _tab_pod_names
+                        ]
                         _pod_tabs = st.tabs(_pod_tab_labels)
                         _wf_pod_all = {}   # accumulate {pod_name: df_pod_wf} for export
-                        for _pt, _pod_name in zip(_pod_tabs, _pod_names):
+                        for _pt, _pod_name in zip(_pod_tabs, _tab_pod_names):
                             with _pt:
+                                _is_super_pod = _pod_name in _super_pod_groups
+                                if _is_super_pod:
+                                    _pod_members = _super_pod_groups[_pod_name]['client'] or {_pod_name}
+                                    _pod_members_hc_norm = {
+                                        str(m).lower().replace(' ', '').strip()
+                                        for m in _super_pod_groups[_pod_name]['hc']
+                                    }
+                                    st.caption(
+                                        f"🔗 **Super Pod** — every POD in **{_pod_name}**'s full downline "
+                                        f"(direct + indirect reports): {', '.join(sorted(_super_pod_groups[_pod_name]['hc']))}. "
+                                        f"Each POD keeps its own separate tab too."
+                                    )
+                                else:
+                                    _pod_members = {_pod_name}
+                                    _pod_members_hc_norm = {str(_pod_name).lower().replace(' ', '').strip()}
                                 _pod_rows = {}
                                 _pod_hc   = {}
                                 if _hc:
@@ -9572,11 +9657,12 @@ if "calc_data" in st.session_state:
                                     # Normalize both sides: lowercase + strip spaces for matching
                                     def _norm_hc_pod(s):
                                         return str(s).lower().replace(' ', '').strip()
-                                    _hbp_norm   = _hbp['POD'].apply(_norm_hc_pod)
-                                    _pod_nm_norm = _norm_hc_pod(_pod_name)
-                                    _mask_p = _hbp_norm == _pod_nm_norm
+                                    _hbp_norm = _hbp['POD'].apply(_norm_hc_pod)
+                                    _mask_p = _hbp_norm.isin(_pod_members_hc_norm)
+                                    # Accumulate (not overwrite) — a Super Pod's mask can match
+                                    # several rows for the SAME role (one per sub-pod member).
                                     for _, _hr in _hbp[_mask_p].iterrows():
-                                        _pod_hc[_hr['Capacity Role']] = int(_hr['HC'])
+                                        _pod_hc[_hr['Capacity Role']] = _pod_hc.get(_hr['Capacity Role'], 0) + int(_hr['HC'])
 
                                 # Pre-compute POD clients for MRR and property lookups
                                 _duc = st.session_state.get('df_clients_unique', pd.DataFrame())
@@ -9586,7 +9672,7 @@ if "calc_data" in st.session_state:
                                         .where(lambda s: ~s.str.lower().isin({'nan', 'none', ''}), 'No POD')
                                     )
                                     _pod_clients_lower = set(
-                                        _cli_df[_cli_pod_norm_p == _pod_name]['Client']
+                                        _cli_df[_cli_pod_norm_p.isin(_pod_members)]['Client']
                                         .dropna().astype(str).str.strip().str.lower().unique()
                                     )
                                 else:
@@ -9600,7 +9686,7 @@ if "calc_data" in st.session_state:
                                     _raw_pod_norm = _raw_pod_norm.where(
                                         ~_raw_pod_norm.str.lower().isin({'nan', 'none', ''}), 'No POD'
                                     )
-                                    _pdf_raw = _df_raw[_raw_pod_norm == _pod_name]
+                                    _pdf_raw = _df_raw[_raw_pod_norm.isin(_pod_members)]
                                 else:
                                     _pdf_raw = pd.DataFrame()
                                 if not _pdf_raw.empty:
@@ -9619,8 +9705,8 @@ if "calc_data" in st.session_state:
                                     _p_res_prop_count = _p_comm_prop_count = _p_prop_count = 0
                                     _p_res_door_count = _p_comm_door_count = _p_door_count = _p_sqft_count = 0
 
-                                _pm_all  = _pod_df[(_pod_df['POD'] == _pod_name) & (_pod_df['Required Role'] == '>>> POD TOTAL')]
-                                _proles_all = _pod_df[(_pod_df['POD'] == _pod_name) & (_pod_df['Required Role'] != '>>> POD TOTAL')]
+                                _pm_all  = _pod_df[_pod_df['POD'].isin(_pod_members) & (_pod_df['Required Role'] == '>>> POD TOTAL')]
+                                _proles_all = _pod_df[_pod_df['POD'].isin(_pod_members) & (_pod_df['Required Role'] != '>>> POD TOTAL')]
 
                                 for i, mes_str in enumerate(meses_proyeccion):
                                     if i >= len(_exec): break
@@ -9653,7 +9739,7 @@ if "calc_data" in st.session_state:
                                     _pd_m_end    = pd.Timestamp((_pd_m_start + relativedelta(months=1) - relativedelta(days=1)).date())
                                     _dyn_pod_emp = [
                                         e for e in (_hc.get('employees') or [])
-                                        if str(e['pod']).lower().replace(' ', '').strip() == _pod_nm_norm
+                                        if str(e['pod']).lower().replace(' ', '').strip() in _pod_members_hc_norm
                                     ] if _hc else []
                                     if _dyn_pod_emp:
                                         _dyn_p_hc = _compute_dynamic_hc(_dyn_pod_emp, _pd_m_start, _pd_m_end)
@@ -9679,9 +9765,9 @@ if "calc_data" in st.session_state:
                                             str(k).lower().replace(' ', '').strip(): int(v)
                                             for k, v in _p_mgr_by_pod.items()
                                         }
-                                        hc_p_mgr  = _p_mgr_norm.get(
-                                            str(_pod_name).lower().replace(' ', '').strip(), 0
-                                        )
+                                        # Sum across members — a Super Pod's mgr count is split
+                                        # across its sub-pod keys in mgr_by_pod.
+                                        hc_p_mgr = sum(_p_mgr_norm.get(_n, 0) for _n in _pod_members_hc_norm)
                                     d_pod     = round(hc_p_tot - p_fte, 2) if hc_p_tot is not None else None
                                     d_p_acc1  = round(hc_p_acc1 - _prole_fte('Accountant I'),       2) if hc_p_acc1 is not None else None
                                     d_p_acc2  = round(hc_p_acc2 - _prole_fte('Accountant II'),      2) if hc_p_acc2 is not None else None
@@ -9723,29 +9809,40 @@ if "calc_data" in st.session_state:
                                     else:
                                         _p_exp_cost = _p_exp_margin = _p_exp_margin_pct = None
 
-                                    # New/churn hours and MRR from pre-computed stores
-                                    _p_churn_hrs  = st.session_state.final_dashboards.get('pod_churn',   {}).get(mes_str, {}).get(_pod_name, 0.0)
-                                    _p_new_hrs    = st.session_state.final_dashboards.get('pod_new_hrs', {}).get(mes_str, {}).get(_pod_name, 0.0)
-                                    _p_new_mrr    = st.session_state.final_dashboards.get('pod_new_mrr',   {}).get(mes_str, {}).get(_pod_name, 0.0)
-                                    _p_churn_mrr  = st.session_state.final_dashboards.get('pod_churn_mrr', {}).get(mes_str, {}).get(_pod_name, 0.0)
+                                    # New/churn hours and MRR from pre-computed stores — summed
+                                    # across all members (these stores are keyed by the client-side
+                                    # POD name, one entry per real sub-pod).
+                                    _pod_churn_st  = st.session_state.final_dashboards.get('pod_churn',   {}).get(mes_str, {})
+                                    _pod_newh_st   = st.session_state.final_dashboards.get('pod_new_hrs', {}).get(mes_str, {})
+                                    _pod_newmrr_st = st.session_state.final_dashboards.get('pod_new_mrr',   {}).get(mes_str, {})
+                                    _pod_chmrr_st  = st.session_state.final_dashboards.get('pod_churn_mrr', {}).get(mes_str, {})
+                                    _p_churn_hrs  = sum(_pod_churn_st.get(_m, 0.0)  for _m in _pod_members)
+                                    _p_new_hrs    = sum(_pod_newh_st.get(_m, 0.0)   for _m in _pod_members)
+                                    _p_new_mrr    = sum(_pod_newmrr_st.get(_m, 0.0) for _m in _pod_members)
+                                    _p_churn_mrr  = sum(_pod_chmrr_st.get(_m, 0.0)  for _m in _pod_members)
 
                                     # Productive hours for this POD — use cascade-accumulated
-                                    # per-POD data (covers AI-only PODs not in df_resumen_base)
+                                    # per-POD data (covers AI-only PODs not in df_resumen_base),
+                                    # falling back to df_resumen_base per member and summing —
+                                    # a Super Pod's members can be a mix of both sources.
                                     _pod_prod_store = st.session_state.get('calc_data', {}).get('pod_prod_hrs', {})
-                                    if _pod_prod_store and _pod_name in _pod_prod_store:
-                                        p_prod_hrs = float(_pod_prod_store[_pod_name].get(i, 0.0))
-                                    else:
-                                        # Fallback: read from df_resumen_base (baseline-only clients)
-                                        _c_prod_pod = f"M{i+1} ({mes_str}) - Productive Hours"
-                                        _rb_pod = st.session_state.get('calc_data', {}).get('df_resumen_base', pd.DataFrame())
-                                        if not _rb_pod.empty and 'POD' in _rb_pod.columns and _c_prod_pod in _rb_pod.columns:
-                                            _rb_pod_norm = (
-                                                _rb_pod['POD'].fillna('').astype(str).str.strip()
-                                                .where(lambda s: ~s.str.lower().isin({'nan', 'none', ''}), 'No POD')
-                                            )
-                                            p_prod_hrs = float(_rb_pod[_rb_pod_norm == _pod_name][_c_prod_pod].sum())
-                                        else:
-                                            p_prod_hrs = p_fin  # last resort: no shrinkage shown
+                                    _c_prod_pod = f"M{i+1} ({mes_str}) - Productive Hours"
+                                    _rb_pod = st.session_state.get('calc_data', {}).get('df_resumen_base', pd.DataFrame())
+                                    _rb_pod_norm = (
+                                        _rb_pod['POD'].fillna('').astype(str).str.strip()
+                                        .where(lambda s: ~s.str.lower().isin({'nan', 'none', ''}), 'No POD')
+                                    ) if (not _rb_pod.empty and 'POD' in _rb_pod.columns) else None
+                                    _found_any_prod_src = False
+                                    p_prod_hrs = 0.0
+                                    for _m in _pod_members:
+                                        if _pod_prod_store and _m in _pod_prod_store:
+                                            p_prod_hrs += float(_pod_prod_store[_m].get(i, 0.0))
+                                            _found_any_prod_src = True
+                                        elif _rb_pod_norm is not None and _c_prod_pod in _rb_pod.columns:
+                                            p_prod_hrs += float(_rb_pod[_rb_pod_norm == _m][_c_prod_pod].sum())
+                                            _found_any_prod_src = True
+                                    if not _found_any_prod_src:
+                                        p_prod_hrs = p_fin  # last resort: no shrinkage shown
 
                                     # Use p_fin (Final Hours) as the total so shrinkage is correct
                                     # for both baseline clients (p_fin ≈ p_base) and AI-only PODs
