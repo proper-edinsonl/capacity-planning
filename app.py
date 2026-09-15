@@ -3947,7 +3947,14 @@ def _apply_pro_formatting(xlsx_bytes: bytes) -> bytes:
         if not label:
             return None
         l = label.lower()
-        if 'productivity' in l or '(%)' in l or l.rstrip().endswith('%'):
+        # Exact-match override: a group HEADER row whose own text never says
+        # "%" (its detail rows do — "Capacity Margin (%)" etc.) but whose
+        # stored value always IS a percentage (exp_margin_pct at every one of
+        # its call sites) — label-keyword inference alone can't tell, since
+        # "cost"/"margin" would otherwise route it to the $ branch below.
+        if l.strip('━ ').strip() == 'cost & margin':
+            return '0.00"%"'
+        if 'productivity' in l or '%' in l:
             return '0.00"%"'
         if '($)' in l or re.search(r'\b(mrr|cost|margin|saving|budget|revenue)\b', l):
             return '$#,##0'
