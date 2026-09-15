@@ -8,7 +8,7 @@ around a manual HubSpot export) needs zero changes.
 
 Also applies the business rules the user specified for this automated run:
   - Only companies with a POD assigned are kept.
-  - Go Live Date, if blank, is filled with (today + 45 days).
+  - Go Live Date, if blank, is filled with (today + 30 days).
   - Final Service Date is only kept for Lifecycle Stage in {Churn, Pending
     Termination} — for every other stage (Client, Onboarding, On Notice,
     Retention, or anything else) it's blanked out, so a stale/incorrect FSD
@@ -209,7 +209,7 @@ def fetch_companies_dataframe(token: str, log=print) -> pd.DataFrame:
     # Go Live Date, Delivery Confirmed Go-Live Date, and Target Go-Live
     # Date. A company can have a real date sitting in any one of them while
     # the other two are blank or stale — checking only "Go Live Date" (the
-    # old behavior) missed real dates and fell through to the +45-day
+    # old behavior) missed real dates and fell through to the +30-day
     # synthetic fallback even when the company clearly already has a known
     # go-live. Per the user: take the LATEST (max) of whichever of the 3
     # are populated, not a fixed priority order. ────────────────────────────
@@ -219,15 +219,15 @@ def fetch_companies_dataframe(token: str, log=print) -> pd.DataFrame:
     gl_resolved = pd.concat([gl_main, gl_confirm, gl_target], axis=1).max(axis=1, skipna=True)
 
     today_ts = pd.Timestamp(datetime.now().date())
-    fallback_gl = (datetime.now() + timedelta(days=45)).strftime("%Y-%m-%d")
+    fallback_gl = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
     n_gl_filled = int(gl_resolved.isna().sum())
     if n_gl_filled:
         log(f"HubSpot: {n_gl_filled} companies have no date in any of the 3 Go-Live "
-            f"fields (Go Live / Delivery Confirmed / Target) — filling with today+45 "
+            f"fields (Go Live / Delivery Confirmed / Target) — filling with today+30 "
             f"days ({fallback_gl}).")
 
     # Companies whose date came from a REAL HubSpot field (not the synthetic
-    # +45 fallback), and how many days old that real date is — a client
+    # +30 fallback), and how many days old that real date is — a client
     # whose real go-live is already months in the past should have actual
     # Volume/AHT hours already; if the pipeline still treats them as
     # brand-new, that's a record-matching problem to flag, not a genuinely
