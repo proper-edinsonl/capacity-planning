@@ -238,20 +238,35 @@ def fetch_companies_dataframe(token: str, log=print) -> pd.DataFrame:
     df["Go Live Date"] = gl_resolved.fillna(pd.Timestamp(fallback_gl)).dt.strftime("%Y-%m-%d")
     df["Delivery Confirmed Go-Live Date"] = gl_resolved.dt.strftime("%Y-%m-%d")
 
-    # ── Last Billed MRR: HubSpot stores a literal "0" (not blank/null) for
-    # clients that haven't been billed yet — e.g. Onboarding or newly-live
-    # clients — which is NOT the same as "no last billed value". Treat 0 as
-    # missing so downstream MRR resolution (_parse_hubspot_file's own
-    # "Last Billed MRR" -> "Original CMRR" fallback) actually fires the way
-    # the user's rule intends ("si no tiene last billed, usar Original/
-    # Contracted CMRR"). Without this, a real .fillna(NaN-only) fallback
-    # never triggers because 0 is a present, non-null value.
+    # ── Last Billed MRR: two cases where it's unreliable and we should defer
+    # to Original/Contracted CMRR instead:
+    #   1. Literal "0" — HubSpot stores this (not blank/null) for clients
+    #      that haven't been billed yet (Onboarding/newly-live), which is
+    #      NOT the same as "no last billed value".
+    #   2. Below $1,000 AND the Contracted CMRR is higher — a Last Billed
+    #      that low is usually a partial/prorated first invoice, not the
+    #      client's real steady-state rate. Confirmed with the user
+    #      (2026-09-14): only override when Contracted is actually higher;
+    #      a Last Billed >= $1,000 is trusted as-is even if Contracted is
+    #      higher too.
+    # Both cases are normalized to NaN here so downstream MRR resolution
+    # (_parse_hubspot_file's own "Last Billed MRR" -> "Original CMRR"
+    # fallback) fires the way the user's rule intends. Without this, a real
+    # .fillna(NaN-only) fallback never triggers because a present, non-null
+    # (if low) Last Billed value blocks it.
     lb_num = pd.to_numeric(df["Last Billed MRR"], errors="coerce")
-    n_lb_zeroed = int((lb_num == 0).sum())
+    oc_num = pd.to_numeric(df["Original CMRR"], errors="coerce")
+    zero_mask = lb_num == 0
+    low_mask  = (lb_num > 0) & (lb_num < 1000) & (oc_num > lb_num)
+    n_lb_zeroed = int(zero_mask.sum())
+    n_lb_low    = int(low_mask.sum())
     if n_lb_zeroed:
         log(f"HubSpot: {n_lb_zeroed} companies show Last Billed MRR = 0 (not yet "
             f"billed) — falling back to Original CMRR for these.")
-    df["Last Billed MRR"] = lb_num.replace(0, pd.NA)
+    if n_lb_low:
+        log(f"HubSpot: {n_lb_low} companies show Last Billed MRR < $1,000 with a "
+            f"higher Original CMRR — using Original CMRR for these.")
+    df["Last Billed MRR"] = lb_num.mask(zero_mask | low_mask, pd.NA)
 
     # ── Final Service Date: only honored for Churn / Pending Termination ───
     lifecycle_norm = df["Lifecycle Stage"].astype(str).str.strip().str.lower()
