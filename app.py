@@ -12,7 +12,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 
 # --- APP VERSION ---
-APP_VERSION = "v8.1.2026.9.14.8.05PM"
+APP_VERSION = "v8.1.2026.10.19.1.17PM"
 
 def _canon_pod(v):
     """Canonicalize a POD label's leading 'pod' token to uppercase ('Pod 6',
@@ -230,6 +230,312 @@ def _build_vol_aht_task_df(pms_filter=None):
             'QC %':         100.0,
         })
     return pd.DataFrame(rows)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INITIAL EXPECTED — parse / compare / baseline override
+# ══════════════════════════════════════════════════════════════════════════════
+_IE_SRC_HIST, _IE_SRC_INIT, _IE_SRC_PROJ = "Historical", "Initial Expected", "Projection"
+
+
+def _parse_initial_expected(file_bytes):
+    """Parse the 'Initial Expected' workbook (volume-file-shaped, one row per
+    client × Process × Task) into a normalized task-level DataFrame.
+    Repeated header rows inside the sheet are dropped."""
+    raw = pd.read_excel(BytesIO(file_bytes))
+    raw.columns = raw.columns.astype(str).str.strip()
+    if 'client_name' not in raw.columns:
+        raise ValueError("Initial Expected file needs a 'client_name' column.")
+    raw = raw[raw['client_name'].notna() & (raw['client_name'].astype(str).str.strip() != 'client_name')].copy()
+
+    def _num(col):
+        return pd.to_numeric(raw[col], errors='coerce').fillna(0.0) if col in raw.columns else pd.Series(0.0, index=raw.index)
+
+    def _txt(col, default=''):
+        if col not in raw.columns:
+            return pd.Series(default, index=raw.index)
+        s = raw[col].astype(str).str.strip()
+        return s.where(~s.str.lower().isin({'nan', 'none', ''}), default)
+
+    out = pd.DataFrame({
+        'client_name': raw['client_name'].astype(str).str.strip(),
+        'type':        _txt('Process'),
+        'subtype':     _txt('Task'),
+        'vol_proc':    _num('Expected Volume To Process').where(_num('Expected Volume To Process') > 0, _num('Volume')),
+        'vol_rev':     _num('Expected Volume To Review'),
+        'proc_aht':    _num('Proc AHT (Mins)'),
+        'rev_aht':     _num('Rev AHT (Mins)'),
+        'proc_hours':  _num('Expected Processing Hours'),
+        'rev_hours':   _num('Expected Reviewing Hours'),
+        'proc_role':   _txt('Processor', 'Accountant I'),
+        'rev_role':    _txt('Reviewer', 'Sr. Accountant'),
+        'MRR':         _num('MRR'),
+        'PMS':         _txt('PMS'),
+        'record_id':   _clean_record_id(raw[next((c for c in raw.columns if c.lower().replace(' ', '') in ('recordid', 'hubspotid')), None)])
+                       if any(c.lower().replace(' ', '') in ('recordid', 'hubspotid') for c in raw.columns)
+                       else pd.Series('', index=raw.index),
+        'pod':         _txt('Pod') if 'Pod' in raw.columns else _txt('POD'),
+    })
+    out['pod'] = out['pod'].apply(_canon_pod)
+    # a client's Record ID / Pod may be filled only on some rows -> propagate within the client
+    for _c in ('record_id', 'pod'):
+        out[_c] = out.groupby('client_name')[_c].transform(lambda x: next((v for v in x if str(v).strip()), ''))
+    return out.reset_index(drop=True)
+
+
+def _ie_align_names(ie_df, df_hist):
+    """If an Initial Expected client has the same Record ID as a historical client but a
+    different name, rename it to the historical name so both land on one comparison row."""
+    if ie_df is None or ie_df.empty or df_hist is None or df_hist.empty:
+        return ie_df
+    rid_col = next((c for c in df_hist.columns if str(c).lower().replace(' ', '') in ('recordid', 'hubspotid')), None)
+    if rid_col is None or 'client_name' not in df_hist.columns:
+        return ie_df
+    h = pd.DataFrame({'rid': _clean_record_id(df_hist[rid_col]), 'name': df_hist['client_name'].astype(str)})
+    h = h[h['rid'] != ''].drop_duplicates('rid')
+    rid2name = dict(zip(h['rid'], h['name']))
+    out = ie_df.copy()
+    mapped = out['record_id'].map(rid2name)
+    out['client_name'] = mapped.where(mapped.notna(), out['client_name'])
+    return out
+
+
+def _ie_client_totals(ie_df):
+    """Per-client totals of the Initial Expected data."""
+    if ie_df is None or ie_df.empty:
+        return pd.DataFrame(columns=['client', 'ie_vol', 'ie_hours', 'ie_aht', 'ie_mrr'])
+    g = ie_df.groupby('client_name').agg(
+        ie_vol=('vol_proc', 'sum'), ie_proc_h=('proc_hours', 'sum'),
+        ie_rev_h=('rev_hours', 'sum'), ie_mrr=('MRR', 'max')).reset_index()
+    g['ie_hours'] = g['ie_proc_h'] + g['ie_rev_h']
+    g['ie_aht'] = np.where(g['ie_vol'] > 0, g['ie_proc_h'] * 60.0 / g['ie_vol'], 0.0)
+    return g.rename(columns={'client_name': 'client'})[['client', 'ie_vol', 'ie_hours', 'ie_aht', 'ie_mrr']]
+
+
+def _hist_client_totals(df_hist):
+    """Per-client totals of the historical Volume/AHT base (vol_merged)."""
+    cols = ['client_name', 'Capacity Processing Hours', 'Capacity reviewing hours', 'Closed tickets with Proc time']
+    if df_hist is None or df_hist.empty or any(c not in df_hist.columns for c in cols):
+        return pd.DataFrame(columns=['client', 'h_vol', 'h_hours', 'h_aht', 'h_mrr'])
+    d = df_hist.copy()
+    for c in cols[1:]:
+        d[c] = pd.to_numeric(d[c], errors='coerce').fillna(0.0)
+    d['_mrr'] = pd.to_numeric(d['MRR'].astype(str).str.replace(r'[$, ]', '', regex=True), errors='coerce').fillna(0.0) if 'MRR' in d.columns else 0.0
+    g = d.groupby('client_name').agg(
+        h_vol=('Closed tickets with Proc time', 'sum'), h_proc=('Capacity Processing Hours', 'sum'),
+        h_rev=('Capacity reviewing hours', 'sum'), h_mrr=('_mrr', 'max')).reset_index()
+    g['h_hours'] = g['h_proc'] + g['h_rev']
+    g['h_aht'] = np.where(g['h_vol'] > 0, g['h_proc'] * 60.0 / g['h_vol'], 0.0)
+    return g.rename(columns={'client_name': 'client'})[['client', 'h_vol', 'h_hours', 'h_aht', 'h_mrr']]
+
+
+def _df_clean_hours_by_client():
+    """Monthly hours per client computed from df_clean rows (tickets x AHT / 60).
+    Covers clients injected by the forecast (AI Prediction / HubSpot) that are not in the Step 1 base."""
+    d = st.session_state.get('df_clean')
+    need = ['client_name', 'Closed tickets with Proc time', '>>> FINAL Capacity Proc AHT']
+    if d is None or d.empty or any(c not in d.columns for c in need):
+        return pd.DataFrame(columns=['client', 'p_hours'])
+    t = pd.to_numeric(d['Closed tickets with Proc time'], errors='coerce').fillna(0.0)
+    a_ = pd.to_numeric(d['>>> FINAL Capacity Proc AHT'], errors='coerce').fillna(0.0)
+    hrs = t * a_ / 60.0
+    if 'Closed tickets with rev time' in d.columns and '>>> FINAL Capacity Rev AHT' in d.columns:
+        hrs = hrs + (pd.to_numeric(d['Closed tickets with rev time'], errors='coerce').fillna(0.0)
+                     * pd.to_numeric(d['>>> FINAL Capacity Rev AHT'], errors='coerce').fillna(0.0) / 60.0)
+    g = hrs.groupby(d['client_name'].astype(str)).sum().reset_index()
+    g.columns = ['client', 'p_hours']
+    return g
+
+
+def _proj_client_totals():
+    """Per-client projected monthly hours: Step 1 base hours (first projected month) when the
+    client is in the base, else hours of its df_clean rows (forecast-added clients).
+    Returns (DataFrame[client, p_hours], month_label)."""
+    fb = _df_clean_hours_by_client()
+    cd = st.session_state.get('calc_data')
+    base = cd.get('df_resumen_base_ideal') if cd else None
+    hcols = [c for c in base.columns if c.endswith(' - Base Hours')] if base is not None and not base.empty else []
+    if not hcols:
+        return fb, ''
+    col = hcols[1] if len(hcols) > 1 else hcols[0]
+    g = base.groupby('Client')[col].sum().reset_index().rename(columns={'Client': 'client', col: 'p_hours'})
+    extra = fb[~fb['client'].isin(g['client'])]
+    return pd.concat([g, extra], ignore_index=True), col.replace(' - Base Hours', '')
+
+
+def _build_ie_comparison(df_hist, ie_df):
+    """One row per client. A client enters the summary if it has Historical AND
+    Projection data, or if it has Initial Expected data."""
+    h = _hist_client_totals(df_hist)
+    i = _ie_client_totals(ie_df)
+    p, p_label = _proj_client_totals()
+    m = h.merge(p, on='client', how='outer').merge(i, on='client', how='outer')
+    if m.empty:
+        return m, p_label
+    # empty frames (e.g. no Step 1 yet) come through the merge as object dtype
+    for _c in m.columns:
+        if _c != 'client':
+            m[_c] = pd.to_numeric(m[_c], errors='coerce')
+    has_h, has_p, has_i = m['h_hours'].notna(), m['p_hours'].notna(), m['ie_hours'].notna()
+    m = m[(has_h & has_p) | has_i].copy()
+    m['Δ Init vs Hist (h)'] = m['ie_hours'] - m['h_hours']
+    m['Δ Proj vs Hist (h)'] = m['p_hours'] - m['h_hours']
+    return m.sort_values('client').reset_index(drop=True), p_label
+
+
+def _build_ie_comparison_ai(df_hist, ie_df, df_pred):
+    """Comparison for the clients of the AI forecast: Historical vs Initial Expected vs the
+    AI-predicted hours (productive proc + rev) that 'Add to Baseline' is about to inject."""
+    p = df_pred.copy()
+    p['_h'] = pd.to_numeric(p.get('_prod_p_hrs'), errors='coerce').fillna(0.0) + \
+              pd.to_numeric(p.get('_prod_r_hrs'), errors='coerce').fillna(0.0)
+    p = p.groupby('_client')['_h'].sum().reset_index().rename(columns={'_client': 'client', '_h': 'p_hours'})
+    h = _hist_client_totals(df_hist)
+    i = _ie_client_totals(ie_df)
+    m = p.merge(h, on='client', how='left').merge(i, on='client', how='left')
+    for _c in m.columns:
+        if _c != 'client':
+            m[_c] = pd.to_numeric(m[_c], errors='coerce')
+    m['Δ Init vs Hist (h)'] = m['ie_hours'] - m['h_hours']
+    m['Δ Proj vs Hist (h)'] = m['p_hours'] - m['h_hours']
+    return m.sort_values('client').reset_index(drop=True), 'AI forecast'
+
+
+def _ie_default_choice(row):
+    if pd.notna(row.get('h_hours')):
+        return _IE_SRC_HIST
+    if pd.notna(row.get('ie_hours')):
+        return _IE_SRC_INIT
+    return _IE_SRC_PROJ
+
+
+def _apply_initial_expected_to_df(df, filt_clients=None):
+    """Step 1 hook: clients whose chosen data base is 'Initial Expected' have their
+    historical rows replaced by synthetic task rows built from the Initial Expected
+    file. POD / Sr. / Go Live / PMS are carried over from the historical rows when the
+    client already exists. Returns (df, list_of_applied_clients)."""
+    ie_df = st.session_state.get('_ie_df')
+    choices = st.session_state.get('_ie_choice', {})
+    if ie_df is None or ie_df.empty or not choices:
+        return df, []
+    sel = [c for c, v in choices.items() if v == _IE_SRC_INIT]
+    if not sel:
+        return df, []
+    applied, rows = [], []
+    for cn in sel:
+        ie_c = ie_df[ie_df['client_name'] == cn]
+        if ie_c.empty:
+            continue
+        if filt_clients and cn not in filt_clients and not (df['client_name'] == cn).any():
+            continue   # client excluded by the active client filter
+        old = df[df['client_name'] == cn]
+        keep = {}
+        for k in ['POD', 'Sr. Accountant', 'Go Live', 'Final Service Date', 'PMS', 'Record ID', 'record_id',
+                  'Res doors', 'Res Prop', 'Commercial Properties', 'Commercial Doors', 'SQFT Commercial', 'Corp Books']:
+            if k in old.columns and old[k].notna().any():
+                keep[k] = old[k].dropna().iloc[0]
+        ie_pod = next((v for v in ie_c['pod'] if str(v).strip()), '')
+        ie_rid = next((v for v in ie_c['record_id'] if str(v).strip()), '')
+        if ie_pod:
+            keep['POD'] = ie_pod
+        if ie_rid:
+            keep['Record ID'] = ie_rid
+            keep['record_id'] = ie_rid
+        for _, r in ie_c.iterrows():
+            row = {
+                'client_name': cn, 'type': r['type'], 'subtype': r['subtype'],
+                'Closed tickets with Proc time': float(r['vol_proc']),
+                'Closed tickets with rev time':  float(r['vol_rev']),
+                '>>> FINAL Capacity Proc AHT':   float(r['proc_aht']),
+                '>>> FINAL Capacity Rev AHT':    float(r['rev_aht']),
+                'Capacity Processing Hours':     float(r['proc_hours']),
+                'Capacity reviewing hours':      float(r['rev_hours']),
+                'Proc Role': r['proc_role'], 'Rev Role': r['rev_role'],
+                'Ideal Proc': r['proc_role'], 'Ideal Rev': r['rev_role'],
+                'MRR': float(r['MRR']), 'Status': 'Client', 'status': 'client',
+                'POD': keep.get('POD', ''),
+                'Go Live': pd.NaT, 'Final Service Date': pd.NaT,
+            }
+            row['PMS'] = keep.get('PMS', r['PMS'])
+            for k, v in keep.items():
+                row[k] = v
+            rows.append(row)
+        applied.append(cn)
+    if not applied:
+        return df, []
+    df = df[~df['client_name'].isin(applied)]
+    return pd.concat([df, pd.DataFrame(rows)], ignore_index=True), applied
+
+
+def _render_ie_comparison(ai_pred=None, key_sfx=''):
+    """Hours-only comparison (Historical vs Initial Expected vs Projection) with a per-client
+    checkbox to use the Initial Expected hours. Rendered right before 'Apply Cascade', i.e. after
+    the forecast (AI Prediction / HubSpot) has run, or before the waterfalls when no forecast is used.
+    The choice is applied to the cascade input (a copy of df_clean); Step 1 is not re-run."""
+    ie_loaded = st.session_state.get('_ie_df')
+    if ie_loaded is None or ie_loaded.empty:
+        return
+    hist_raw = st.session_state.get('_ie_hist_raw')
+    if hist_raw is None and 'pipeline_vol_merged' in st.session_state:
+        hist_raw = st.session_state.pipeline_vol_merged
+    if ai_pred is not None and not ai_pred.empty:
+        # align Initial Expected names to the forecast's client names (case / spacing)
+        _ai_names = {str(n).lower().strip(): str(n) for n in ai_pred['_client'].dropna().unique()}
+        _re = ie_loaded.copy()
+        _re['client_name'] = _re['client_name'].map(lambda n: _ai_names.get(str(n).lower().strip(), n))
+        if not _re.equals(ie_loaded):
+            st.session_state['_ie_df'] = _re
+            ie_loaded = _re
+    _aligned = _ie_align_names(ie_loaded, hist_raw)
+    if _aligned is not None and not _aligned.equals(ie_loaded):
+        # the choice dict is keyed by client name: carry old keys over to the new names
+        st.session_state['_ie_df'] = _aligned
+        ie_loaded = _aligned
+    with st.container(border=True):
+        st.markdown("**📊 Which hours to use? — Historical vs Initial Expected vs Projection**")
+        if ai_pred is not None and not ai_pred.empty:
+            cmp, p_lbl = _build_ie_comparison_ai(hist_raw, ie_loaded, ai_pred)
+        else:
+            cmp, p_lbl = _build_ie_comparison(hist_raw, ie_loaded)
+        if cmp.empty:
+            st.info("No clients with Historical + Projection, or with Initial Expected.")
+            return
+        st.caption(
+            "Monthly hours (Processing + Reviewing)"
+            + (" · Projection = AI-predicted hours (productive)" if p_lbl == "AI forecast" else (f" · Projection = Step 1 base hours for {p_lbl}, or forecast rows for added clients" if p_lbl else ""))
+            + ". Check **Use Initial Expected** to replace that client's hours when the cascade runs."
+        )
+        prev = st.session_state.get('_ie_choice', {})
+        has_ie = cmp['ie_hours'].notna().values
+        use_default = [
+            (prev[r['client']] == _IE_SRC_INIT) if r['client'] in prev
+            else bool(pd.isna(r['h_hours']) and pd.isna(r['p_hours']) and pd.notna(r['ie_hours']))
+            for _, r in cmp.iterrows()
+        ]
+        view = pd.DataFrame({
+            'Client':     cmp['client'],
+            'Historical': cmp['h_hours'].round(1),
+            'Initial Expected': cmp['ie_hours'].round(1),
+            'Projection': cmp['p_hours'].round(1),
+            'Use Initial Expected': use_default,
+        })
+        edited = st.data_editor(
+            view, hide_index=True, use_container_width=True, key=f"ie_cmp_editor{key_sfx}",
+            height=min(38 + 35 * len(view), 380),
+            disabled=[c for c in view.columns if c != 'Use Initial Expected'],
+            column_config={'Use Initial Expected': st.column_config.CheckboxColumn('Use Initial Expected')},
+        )
+        new_choice = {}
+        for i, (cl, chk) in enumerate(zip(edited['Client'], edited['Use Initial Expected'])):
+            new_choice[cl] = _IE_SRC_INIT if (bool(chk) and has_ie[i]) else _IE_SRC_HIST
+        if any(bool(c) and not has_ie[i] for i, c in enumerate(edited['Use Initial Expected'])):
+            st.warning("Some checked clients have no Initial Expected data; they are ignored.")
+        changed = any(prev.get(k, _IE_SRC_HIST) != v for k, v in new_choice.items())
+        st.session_state['_ie_choice'] = {**prev, **new_choice}
+        n_init = sum(1 for v in new_choice.values() if v == _IE_SRC_INIT)
+        st.caption(f"{n_init} client(s) will use Initial Expected hours instead of the prediction/historical when the cascade runs.")
+        if changed and 'final_dashboards' in st.session_state:
+            st.info("Selection changed. Click **Apply Cascade & Generate Dashboards** to refresh the waterfalls.")
 
 
 def _make_ai_prediction_fragment(pfx, add_to_scenario, add_to_baseline=False):
@@ -838,6 +1144,7 @@ def _make_ai_prediction_fragment(pfx, add_to_scenario, add_to_baseline=False):
 
             # ── Add to Baseline (early section — before Step 2) ────────────────
             if add_to_baseline:
+                _render_ie_comparison(ai_pred=_dfp, key_sfx='_ai')
                 st.divider()
                 st.markdown("**Add new clients to the capacity baseline:**")
                 st.caption(
@@ -1081,6 +1388,26 @@ def _detect_file_type(uploaded_file):
     except Exception:
         pass
     return 'unknown'
+
+
+def _r2(df):
+    """Display-only: floats rounded to 2 decimals; rows whose label is a dollar metric
+    ('($)' in the label, or the MRR Forecast header) shown as $1,234.56.
+    The underlying frames keep full precision for Excel export."""
+    def _is_money(label):
+        lab = str(label).lstrip('━▶= ').strip()
+        return '($)' in lab or lab == 'MRR Forecast'
+    try:
+        out = df.copy().astype(object)
+        for idx in out.index:
+            money = _is_money(idx)
+            out.loc[idx] = [
+                (f"${v:,.2f}" if money else round(v, 2)) if isinstance(v, (float, int, np.floating, np.integer)) and not isinstance(v, bool) else v
+                for v in out.loc[idx]
+            ]
+        return out
+    except Exception:
+        return df
 
 
 def _clean_record_id(series):
@@ -5496,6 +5823,46 @@ with tab1:
                 except Exception as _hc_err:
                     st.error(f"HC error: {_hc_err}")
 
+            # ── Initial Expected (below HC Weekly Report) ─────────────────────
+            st.markdown("**📑 Initial Expected**")
+            _ie_upload = st.file_uploader(
+                "Upload Initial Expected to compare against Historical and Projection",
+                type=["xlsx", "xls"],
+                key="ie_file_upload"
+            )
+            if _ie_upload:
+                try:
+                    _ie_parsed = _parse_initial_expected(_ie_upload.getvalue())
+                    st.session_state['_ie_df'] = _ie_parsed
+                    st.session_state['_ie_name'] = _ie_upload.name
+                    st.success(
+                        f"Initial Expected loaded: **{_ie_parsed['client_name'].nunique()}** clients · "
+                        f"{len(_ie_parsed)} task rows"
+                    )
+                except Exception as _ie_err:
+                    st.session_state.pop('_ie_df', None)
+                    st.error(f"Initial Expected error: {_ie_err}")
+            elif 'ie_file_upload' in st.session_state and st.session_state.get('ie_file_upload') is None:
+                st.session_state.pop('_ie_df', None)   # uploader cleared → drop data
+
+        # ── Cache the historical base for the Initial Expected comparison (shown after Step 1) ──
+        _ie_hist_raw = None
+        if uploaded_file is not None and st.session_state.get('_ie_df') is not None:
+            _ie_key = (uploaded_file.name, uploaded_file.size)
+            if st.session_state.get('_ie_hist_key') != _ie_key:
+                try:
+                    _xl_ie = pd.ExcelFile(BytesIO(uploaded_file.getvalue()))
+                    _sh_ie = 'vol_merged' if 'vol_merged' in _xl_ie.sheet_names else _xl_ie.sheet_names[0]
+                    _h_df = _xl_ie.parse(_sh_ie)
+                    _h_df.columns = _h_df.columns.astype(str).str.strip()
+                    st.session_state['_ie_hist_raw'] = _h_df
+                    st.session_state['_ie_hist_key'] = _ie_key
+                except Exception:
+                    st.session_state['_ie_hist_raw'] = None
+            _ie_hist_raw = st.session_state.get('_ie_hist_raw')
+        elif 'pipeline_vol_merged' in st.session_state:
+            _ie_hist_raw = st.session_state.pipeline_vol_merged
+
         if uploaded_file:
             try:
                 df_temp = pd.read_excel(uploaded_file, sheet_name="vol_merged")
@@ -7548,6 +7915,8 @@ if "calc_data" in st.session_state:
         )
         _s3_use_real = _s3_role_mode.startswith("👥")
 
+        if 'hs_pre_ai_results' not in st.session_state:
+            _render_ie_comparison()
         _auto_cascade = st.session_state.pop('_auto_run_cascade', False)
         _s3_ov = st.empty()
         if st.button("🔄 Apply Cascade & Generate Dashboards", type="primary", use_container_width=True) or _auto_cascade:
@@ -7558,6 +7927,17 @@ if "calc_data" in st.session_state:
 
             df               = st.session_state.df_clean.copy()
             df_clients_unique = st.session_state.df_clients_unique.copy()
+            # -- Initial Expected override: clients checked in the comparison use IE hours --
+            df, _ie_applied = _apply_initial_expected_to_df(df, None)
+            if _ie_applied:
+                _ie_tot = _ie_client_totals(st.session_state.get('_ie_df'))
+                _have = set(df_clients_unique['client_name'].astype(str)) if 'client_name' in df_clients_unique.columns else set()
+                _add = _ie_tot[_ie_tot['client'].isin(_ie_applied) & ~_ie_tot['client'].isin(_have)]
+                if not _add.empty:
+                    df_clients_unique = pd.concat([df_clients_unique, pd.DataFrame({
+                        'client_name': _add['client'].values, 'MRR': _add['ie_mrr'].values,
+                        'Go Live': pd.NaT, 'Final Service Date': pd.NaT})], ignore_index=True)
+                _log_event('info', f"Initial Expected applied to {len(_ie_applied)} client(s): {', '.join(_ie_applied)}")
             _loading_overlay(_s3_ov, "Step 3 · Generating Dashboards", "🔄", 1, 5, "Applying data map & client assignments…")
 
             # ── Apply master map: overwrite POD / Sr. / Go Live / FSD from
@@ -9558,7 +9938,7 @@ if "calc_data" in st.session_state:
                     # Height fitted to content — no large minimum so empty space
                     # doesn't trap mouse-wheel scroll events.
                     _h = min(800, len(_visible) * 35 + 42)
-                    st.dataframe(_df_wf_overall.loc[_visible], use_container_width=True, height=_h)
+                    st.dataframe(_r2(_df_wf_overall.loc[_visible]), use_container_width=True, height=_h)
 
                 if _dash_level in ('overall', 'client', 'multi_pod'):
                     st.markdown("#### Overall")
@@ -10042,7 +10422,7 @@ if "calc_data" in st.session_state:
                                         else:
                                             _visible.append(_r)
                                     _h = min(700, len(_visible) * 35 + 42)
-                                    st.dataframe(df_pod_wf.loc[_visible], use_container_width=True, height=_h)
+                                    st.dataframe(_r2(df_pod_wf.loc[_visible]), use_container_width=True, height=_h)
 
                                 _pod_table_fragment()
                     else:
@@ -10475,7 +10855,7 @@ if "calc_data" in st.session_state:
                                         else:
                                             _visible.append(_r)
                                     _h = min(800, len(_visible) * 35 + 42)
-                                    st.dataframe(df_sr_wf.loc[_visible], use_container_width=True, height=_h)
+                                    st.dataframe(_r2(df_sr_wf.loc[_visible]), use_container_width=True, height=_h)
 
                                 _sr_table_fragment()
 
@@ -10611,7 +10991,7 @@ if "calc_data" in st.session_state:
                                         if '_wf_sr_all_export' not in st.session_state or not isinstance(st.session_state.get('_wf_sr_all_export'), dict):
                                             st.session_state['_wf_sr_all_export'] = {}
                                         st.session_state['_wf_sr_all_export'][_psr_sr] = df_psr_wf
-                                        st.dataframe(df_psr_wf, use_container_width=True)
+                                        st.dataframe(_r2(df_psr_wf), use_container_width=True)
 
         with t_cli:
             st.write("### Client & Ideal Role Level")
