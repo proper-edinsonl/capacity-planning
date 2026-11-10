@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import os
+import re
 import pickle
 import glob
 import json
@@ -12,7 +13,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 
 # --- APP VERSION ---
-APP_VERSION = "v8.1.2026.10.19.1.17PM"
+APP_VERSION = "v8.1.2026.10.20.11.51AM"
 
 def _canon_pod(v):
     """Canonicalize a POD label's leading 'pod' token to uppercase ('Pod 6',
@@ -51,8 +52,17 @@ ROLE_HIERARCHY = {
     'Accountant I':       'Accountant II',
     'Accountant II':      'General Accountant',
     'General Accountant': 'Sr. Accountant',
+    'General Accountant II': 'Sr. Accountant',
     'Sr. Accountant':     'Sr. Accountant',
 }
+
+# General Accountant II work 6 h/day (75% of an 8 h day): HC = hours / (GA2_DAILY_HOURS x workable days)
+GA2_DAILY_HOURS = 6.0
+GA2_ROLE        = 'General Accountant II'
+# Roles that exist in the required-role model (AC1 ... Sr.). Anything else is re-mapped:
+#   above Sr. (Manager / Principal / Director ...)  -> Sr. Accountant
+#   any other unlisted role                         -> its ideal role, or Sr. Accountant when it has none
+_REQ_ROLES = ('Accountant I', 'Accountant II', 'General Accountant', GA2_ROLE, 'Sr. Accountant')
 
 # Dynamic role classification: any title that isn't one of the 4 base
 # executor roles counts as 'Manager' (Acct. Manager, Sr. Manager, Director,
@@ -66,15 +76,23 @@ _BASE_ROLE_ALIASES = {
     'sr. accountant':       'Sr. Accountant',
     'sr accountant':        'Sr. Accountant',
     'principal accountant': 'Sr. Accountant',
+    'general accountant ii': GA2_ROLE,
+    'ga ii':                GA2_ROLE,
 }
+_ABOVE_SR_RE = re.compile(r'manager|principal|director|head|partner|chief|president|vp', re.I)
 
 def _classify_role(raw) -> str:
-    """Normalize a role/title string to one of the 4 base roles, 'Manager'
-    for anything else, or '' for blank/NaN (left for callers' own defaults)."""
+    """Normalize a role/title string to one of the required roles (AC1..Sr., incl. GA II),
+    'Sr. Accountant' for roles above Sr., 'Manager' for any other unlisted role (sentinel:
+    resolve via the ideal role), or '' for blank/NaN (left for callers' own defaults)."""
     s = str(raw).strip().lower()
     if s in ('nan', 'none', ''):
         return ''
-    return _BASE_ROLE_ALIASES.get(s, 'Manager')
+    if s in _BASE_ROLE_ALIASES:
+        return _BASE_ROLE_ALIASES[s]
+    if _ABOVE_SR_RE.search(s):
+        return 'Sr. Accountant'      # anything above Sr. is loaded as Sr. Accountant
+    return 'Manager'                 # unlisted role -> resolved to its ideal role (or Sr.) by _reassign_manager_role
 
 BASELINE_NETWORK_DAYS = 21.0
 
@@ -150,11 +168,20 @@ def _finalize_required_role(role, hist_map, task_key, default='Sr. Accountant'):
     return hist_map.get(task_key, default)
 
 
-def _reassign_manager_role(role, hist_map, task_key):
-    """Classify `role`; if it resolves to Manager, reassign via
-    `_finalize_required_role`, otherwise return the original value unchanged
-    (avoids re-normalizing casing/formatting of already-valid base roles)."""
-    return _finalize_required_role('Manager', hist_map, task_key) if _classify_role(role) == 'Manager' else role
+def _reassign_manager_role(role, hist_map, task_key, ideal=None):
+    """Normalize `role` into the required-role model (AC1 ... Sr., incl. GA II):
+      * a listed role (AC1/AC2/GA/GA II/Sr) is kept;
+      * a role above Sr. (Manager, Principal, ...) becomes Sr. Accountant;
+      * any other unlisted role is loaded as its ideal role (`ideal`), and as
+        Sr. Accountant when it has no valid ideal role.
+    `hist_map` / `task_key` are kept for call-site compatibility (history is no longer used)."""
+    c = _classify_role(role)
+    if c == '':
+        return role
+    if c == 'Manager':
+        ic = _classify_role(ideal) if ideal is not None else ''
+        return ic if ic in _REQ_ROLES else 'Sr. Accountant'
+    return c
 
 
 def _build_vol_aht_task_df(pms_filter=None):
@@ -268,7 +295,7 @@ def _parse_initial_expected(file_bytes):
         'proc_hours':  _num('Expected Processing Hours'),
         'rev_hours':   _num('Expected Reviewing Hours'),
         'proc_role':   _txt('Processor', 'Accountant I'),
-        'rev_role':    _txt('Reviewer', 'Sr. Accountant'),
+        'rev_role':    _txt('Reviewer', ''),
         'MRR':         _num('MRR'),
         'PMS':         _txt('PMS'),
         'record_id':   _clean_record_id(raw[next((c for c in raw.columns if c.lower().replace(' ', '') in ('recordid', 'hubspotid')), None)])
@@ -421,6 +448,14 @@ def _apply_initial_expected_to_df(df, filt_clients=None):
     sel = [c for c, v in choices.items() if v == _IE_SRC_INIT]
     if not sel:
         return df, []
+    # Ideal Rev per task (mode of the Ideal Rev column in the data) — used when the
+    # Initial Expected row has no Reviewer (e.g. Pre-Work tasks have no review step)
+    _ir_mode = {}
+    if 'Ideal Rev' in df.columns and 'type' in df.columns and 'subtype' in df.columns:
+        _tmp = df[['type', 'subtype', 'Ideal Rev']].dropna()
+        _tmp = _tmp[~_tmp['Ideal Rev'].astype(str).str.strip().str.lower().isin({'', 'nan', 'none'})]
+        _ir_mode = {k: g['Ideal Rev'].astype(str).str.strip().mode().iloc[0]
+                    for k, g in _tmp.groupby([_tmp['type'].astype(str).str.strip(), _tmp['subtype'].astype(str).str.strip()])}
     applied, rows = [], []
     for cn in sel:
         ie_c = ie_df[ie_df['client_name'] == cn]
@@ -442,6 +477,7 @@ def _apply_initial_expected_to_df(df, filt_clients=None):
             keep['Record ID'] = ie_rid
             keep['record_id'] = ie_rid
         for _, r in ie_c.iterrows():
+            _rev_role = r['rev_role'] or _ir_mode.get((str(r['type']).strip(), str(r['subtype']).strip())) or r['proc_role']
             row = {
                 'client_name': cn, 'type': r['type'], 'subtype': r['subtype'],
                 'Closed tickets with Proc time': float(r['vol_proc']),
@@ -450,8 +486,8 @@ def _apply_initial_expected_to_df(df, filt_clients=None):
                 '>>> FINAL Capacity Rev AHT':    float(r['rev_aht']),
                 'Capacity Processing Hours':     float(r['proc_hours']),
                 'Capacity reviewing hours':      float(r['rev_hours']),
-                'Proc Role': r['proc_role'], 'Rev Role': r['rev_role'],
-                'Ideal Proc': r['proc_role'], 'Ideal Rev': r['rev_role'],
+                'Proc Role': r['proc_role'], 'Rev Role': _rev_role,
+                'Ideal Proc': r['proc_role'], 'Ideal Rev': _rev_role,
                 'MRR': float(r['MRR']), 'Status': 'Client', 'status': 'client',
                 'POD': keep.get('POD', ''),
                 'Go Live': pd.NaT, 'Final Service Date': pd.NaT,
@@ -2655,6 +2691,7 @@ def _process_hc_report(file_bytes: bytes):
             'name':             str(row.get('Full name',     '')).strip(),
             'role':             row['Capacity Role'],
             'pod':              row['POD'],
+            'country':          str(row.get('Country', '') or '').strip(),
             'start_date':       row['_sd'],
             'last_working_day': row['_lwd'],
         }
@@ -2796,6 +2833,7 @@ def _process_hc_report(file_bytes: bytes):
     _ga_jt_lower = active_pods['Job title'].astype(str).str.lower().str.strip()
     _ga_staff    = active_pods[_ga_jt_lower.str.contains('general accountant', na=False)]
     by_ga_email = {}
+    by_lead_email = {}   # GA / GA II who DO have direct reports -> Sr-style HC (own role + reports), used by the Sr waterfall
     for _, _r in _ga_staff.iterrows():
         _email = str(_r.get('Work Email', '')).strip().lower()
         if not _email or _email in ('nan', 'none'):
@@ -2803,13 +2841,28 @@ def _process_hc_report(file_bytes: bytes):
         _nm = str(_r.get('Full name', '')).strip()
         _ga_start = pd.to_datetime(_r.get('Start Date', pd.NaT), errors='coerce')
         _ga_pod   = str(_r.get('POD', '')).strip()
+        _ga_rpts  = _all_active_cap[_all_active_cap['_mgr_email_norm'] == _email]
+        _ga_dr    = int((_ga_rpts['Capacity Role'] != 'Other').sum())
         by_ga_email[_email] = {
             'name':       _nm,
-            'dr_total':   0,           # GAs do not manage anyone
+            'dr_total':   _ga_dr,      # most GAs manage nobody; a lead GA / GA II can have reports
             'email':      _email,
             'start_date': _ga_start,
             'pod':        _ga_pod,
         }
+        if _ga_dr > 0:
+            _lead_roles = _ga_rpts['Capacity Role'].value_counts().to_dict()
+            _lead_roles['General Accountant'] = _lead_roles.get('General Accountant', 0) + 1   # the lead themselves
+            by_lead_email[_email] = {
+                'total':      _ga_dr + 1,
+                'dr_total':   _ga_dr,
+                'by_role':    _lead_roles,
+                'managers':   int(_ga_rpts['Capacity Role'].isin({'Principal Accountant', 'Acct. Manager', 'Sr. Acct. Manager'}).sum()),
+                'email':      _email,
+                'start_date': _ga_start,
+                'pod':        _ga_pod,
+                'name':       _nm,
+            }
 
     # ── Attrited (non-active) employees — kept so the Employee Level tab
     # can surface them with a "<role> Att" suffix, indicating they are no
@@ -2890,7 +2943,8 @@ def _process_hc_report(file_bytes: bytes):
         'by_principal_acct_email': by_principal_acct_email,
         'by_acctmgr_email':        by_acctmgr_email,
         'by_sracctmgr_email':      by_sracctmgr_email,
-        'by_ga_email':    by_ga_email,    # General Accountants (dr_total = 0)
+        'by_ga_email':    by_ga_email,    # General Accountants (dr_total > 0 only for lead GAs)
+        'by_lead_email':  by_lead_email,  # lead GA / GA II with direct reports (Sr-style HC)
         'total':          total,
         'acct_managers':        n_acct_mgr,
         'asst_managers':        n_principal_acct,  # kept for back-compat — now Principal Accountant count
@@ -3343,6 +3397,64 @@ _month_offsets   = list(range(-1, 6))   # -1=base month, 0=month after base, 1..
 meses_proyeccion = [(today + relativedelta(months=off)).strftime("%B %Y") for off in _month_offsets]
 roles_permitidos = ["Accountant I", "Accountant II", "General Accountant", "Sr. Accountant"]
 
+_APPROVED_COUNTRIES = {'backfill', 'incremental'}   # HC-report placeholders: approved positions, not hired yet
+
+
+def _build_exec_summary(exec_df, hc, sel_pods, meses, month_offsets, today_ref):
+    """Copy-paste executive summary (English): current month -> last projected month."""
+    if exec_df is None or exec_df.empty or not meses:
+        return None
+    cur_label = datetime.now().strftime("%B %Y")
+    i0 = meses.index(cur_label) if cur_label in meses else min(1, len(meses) - 1)
+    i1 = len(meses) - 1
+    sub = exec_df.iloc[i0:i1 + 1]
+
+    def _m(col):
+        return float(pd.to_numeric(sub[col], errors='coerce').fillna(0).sum()) if col in sub.columns else 0.0
+
+    new_n, new_mrr = int(round(_m("New Clients (Go Live)"))), _m("New MRR ($)")
+    out_n, out_mrr = int(round(_m("Clients Ending (#)"))), _m("Lost MRR (Churn) ($)")
+    req0 = float(exec_df.iloc[i0].get("Total FTEs", 0) or 0)
+    req1 = float(exec_df.iloc[i1].get("Total FTEs", 0) or 0)
+    mon0, mon1 = meses[i0].split()[0][:3], meses[i1].split()[0][:3]
+    yr0, yr1 = meses[i0].split()[-1], meses[i1].split()[-1]
+
+    hired = approved = None
+    emps = list((hc or {}).get('employees') or [])
+    if emps and 'country' in emps[0]:
+        if sel_pods:
+            _sel = {str(p).lower().replace(' ', '').strip() for p in sel_pods}
+            emps = [e for e in emps if str(e['pod']).lower().replace(' ', '').strip() in _sel]
+        m_start = pd.Timestamp((today_ref + relativedelta(months=month_offsets[i1])).replace(day=1).date())
+        m_end   = pd.Timestamp((m_start + relativedelta(months=1) - relativedelta(days=1)).date())
+        _roles  = ('Accountant I', 'Accountant II', 'General Accountant', 'Sr. Accountant')
+        _is_appr = lambda e: str(e.get('country', '')).strip().lower() in _APPROVED_COUNTRIES
+        _h = _compute_dynamic_hc([e for e in emps if not _is_appr(e)], m_start, m_end)
+        _a = _compute_dynamic_hc([e for e in emps if _is_appr(e)], m_start, m_end)
+        hired    = sum(float(_h.get(r, 0) or 0) for r in _roles)
+        approved = sum(float(_a.get(r, 0) or 0) for r in _roles)
+
+    lines = [
+        f"{mon0} {yr0} - {mon1} {yr1}",
+        f"We have {new_n} new clients with ${new_mrr:,.0f} MRR and {out_n} clients leaving the company, representing ${out_mrr:,.0f} MRR.",
+        f"Our required headcount goes from {req0:,.0f} heads in {mon0} to {req1:,.0f} in {mon1}.",
+    ]
+    if hired is not None:
+        lines.append(f"We have {hired:,.0f} hired and {approved:,.0f} approved for {mon1}.")
+    return "\n".join(lines)
+
+
+def _render_exec_summary(exec_df, hc, sel_pods):
+    _txt = _build_exec_summary(exec_df, hc, sel_pods, meses_proyeccion, _month_offsets, today)
+    if not _txt:
+        return
+    st.markdown("#### 📝 Executive Summary")
+    try:
+        st.code(_txt, language=None, wrap_lines=True)
+    except TypeError:
+        st.code(_txt, language=None)
+
+
 def _compute_dynamic_hc(emp_list, m_start, m_end):
     """
     Compute fractional FTE per Capacity Role for month [m_start, m_end].
@@ -3745,7 +3857,7 @@ def _ensure_am_ga_maps(hc_data):
                 base['dr_total'] = dr_counts.get(em, 0)
                 by_sracctmgr[em] = base
             elif role == 'General Accountant':
-                base['dr_total'] = 0
+                base['dr_total'] = dr_counts.get(em, 0)
                 by_ga[em] = base
     hc_data['by_am_email']            = by_am
     hc_data['by_principal_acct_email'] = by_am
@@ -5063,13 +5175,13 @@ if "s4v2_ai_hrs" not in st.session_state:
 # ── Defaults so variables are always defined (overwritten by widgets in tab1 ⚙️ expander) ──
 mrr_growth_pct    = 0.05   # 5%  — overwritten by gp_mrr_growth widget
 growth_budget_pct = 0.40   # 40% — overwritten by gp_growth_budget widget
-cost_acc1 = 1140.0; cost_acc2 = 1369.0; cost_gen = 1900.0; cost_sr = 2536.0
+cost_acc1 = 1140.0; cost_acc2 = 1369.0; cost_gen = 1900.0; cost_ga2 = 2350.0; cost_sr = 2536.0
 cost_map  = {'Accountant I': cost_acc1, 'Accountant II': cost_acc2,
-             'General Accountant': cost_gen, 'Sr. Accountant': cost_sr}
+             'General Accountant': cost_gen, 'General Accountant II': cost_ga2, 'Sr. Accountant': cost_sr}
 absenteeism = 0.10; attrition = 0.03
 util_acc1 = 0.85;  util_gen  = 0.80;  util_sr = 0.50
 utilization_map = {'Accountant I': util_acc1, 'Accountant II': util_acc1,
-                   'General Accountant': util_gen, 'Sr. Accountant': util_sr}
+                   'General Accountant': util_gen, 'General Accountant II': util_gen, 'Sr. Accountant': util_sr}
 calc_mode  = "Fixed days per month"; fixed_days = 22
 holidays_per_month = {mes: 0 for mes in meses_proyeccion}
 
@@ -5461,11 +5573,13 @@ with tab1:
             cost_acc1 = st.number_input("Accountant I",       value=1140.0, key="gp_cost_acc1")
             cost_acc2 = st.number_input("Accountant II",      value=1369.0, key="gp_cost_acc2")
             cost_gen  = st.number_input("General Accountant", value=1900.0, key="gp_cost_gen")
+            cost_ga2  = st.number_input("General Accountant II", value=2350.0, key="gp_cost_ga2")
             cost_sr   = st.number_input("Sr. Accountant",     value=2536.0, key="gp_cost_sr")
             cost_map  = {
                 'Accountant I':       cost_acc1,
                 'Accountant II':      cost_acc2,
                 'General Accountant': cost_gen,
+                'General Accountant II': cost_ga2,
                 'Sr. Accountant':     cost_sr,
             }
 
@@ -5482,6 +5596,7 @@ with tab1:
                 'Accountant I':       util_acc1,
                 'Accountant II':      util_acc1,
                 'General Accountant': util_gen,
+                'General Accountant II': util_gen,
                 'Sr. Accountant':     util_sr,
             }
 
@@ -5550,6 +5665,7 @@ with tab1:
                             'gp_cost_acc1':  _pc_vals.get('cost_acc1', 1140.0),
                             'gp_cost_acc2':  _pc_vals.get('cost_acc2', 1369.0),
                             'gp_cost_gen':   _pc_vals.get('cost_gen',  1900.0),
+                            'gp_cost_ga2':   _pc_vals.get('cost_ga2',  2350.0),
                             'gp_cost_sr':    _pc_vals.get('cost_sr',   2536.0),
                             'gp_abs':        _pc_vals.get('absenteeism_pct', 10.0),
                             'gp_att':        _pc_vals.get('attrition_pct',   3.0),
@@ -5581,6 +5697,7 @@ with tab1:
                         'cost_acc1':        cost_acc1,
                         'cost_acc2':        cost_acc2,
                         'cost_gen':         cost_gen,
+                        'cost_ga2':         cost_ga2,
                         'cost_sr':          cost_sr,
                         'absenteeism_pct':  round(absenteeism * 100, 4),
                         'attrition_pct':    round(attrition   * 100, 4),
@@ -6333,6 +6450,9 @@ with tab1:
                     # Real: use Proc/Rev Role directly (no ideal fallback)
                     _b_ip_real = np.where(_ip_fb.isin(_INVALID_ROLES), 'Accountant I',   _ip_fb)
                     _b_ir_real = np.where(_ir_fb.isin(_INVALID_ROLES), 'Sr. Accountant', _ir_fb)
+                    # Above-Sr. roles load as Sr. Accountant; any other unlisted role loads as its ideal role (Sr. if none)
+                    _b_ip_real = np.array([_reassign_manager_role(v, None, k, ideal=i) for v, k, i in zip(_b_ip_real, _b_task_keys, _ip_pref.values)])
+                    _b_ir_real = np.array([_reassign_manager_role(v, None, k, ideal=i) for v, k, i in zip(_b_ir_real, _b_task_keys, _ir_pref.values)])
                     _b_up_real = np.array([utilization_map.get(ip, util_acc1) for ip in _b_ip_real])
                     _b_ur_real = np.array([utilization_map.get(ir, util_sr)   for ir in _b_ir_real])
                     _b_month_frames_real = []
@@ -8169,6 +8289,10 @@ if "calc_data" in st.session_state:
                         _ideal_r = str(row.get('Ideal Rev', row.get('Rev Role', 'Sr. Accountant'))).strip()
                     if _ideal_p in ['nan', 'None', '']: _ideal_p = 'Accountant I'
                     if _ideal_r in ['nan', 'None', '']: _ideal_r = 'Sr. Accountant'
+                    # Above-Sr. roles load as Sr. Accountant; any other unlisted role loads as its ideal role (Sr. if none)
+                    _tk_real = (str(row.get('type', '')).strip(), str(row.get('subtype', '')).strip())
+                    _ideal_p = _reassign_manager_role(_ideal_p, None, _tk_real, ideal=row.get('Ideal Proc'))
+                    _ideal_r = _reassign_manager_role(_ideal_r, None, _tk_real, ideal=row.get('Ideal Rev'))
                 else:
                     _ideal_p = str(row.get('Ideal Proc', row.get('Proc Role', 'Accountant I'))).strip()
                     _ideal_r = str(row.get('Ideal Rev',  row.get('Rev Role',  'Sr. Accountant'))).strip()
@@ -8496,7 +8620,9 @@ if "calc_data" in st.session_state:
 
                 df_resumen[c_minus] = np.minimum(df_resumen[c_minus], df_resumen[c_post] + df_resumen[c_plus])
                 df_resumen[c_final] = df_resumen[c_post] + df_resumen[c_plus] - df_resumen[c_minus]
-                df_resumen[c_fte]   = (df_resumen[c_final] / hrs_fte).round(4) if hrs_fte > 0 else 0.0
+                # GA II work GA2_DAILY_HOURS h/day -> fewer hours per FTE than every other role
+                _hrs_fte_role = np.where(df_resumen['Required Role'] == GA2_ROLE, hrs_fte * GA2_DAILY_HOURS / 7.5, hrs_fte)
+                df_resumen[c_fte]   = (df_resumen[c_final] / _hrs_fte_role).round(4) if hrs_fte > 0 else 0.0
 
                 for col in [c_base, c_save_hrs, c_post, c_plus, c_minus, c_final]:
                     df_resumen[col] = df_resumen[col].round(2)
@@ -8715,6 +8841,7 @@ if "calc_data" in st.session_state:
                 fte_acc1 = df_resumen[df_resumen['Required Role'] == 'Accountant I'][c_fte].sum()
                 fte_acc2 = df_resumen[df_resumen['Required Role'] == 'Accountant II'][c_fte].sum()
                 fte_gen  = df_resumen[df_resumen['Required Role'] == 'General Accountant'][c_fte].sum()
+                fte_ga2  = df_resumen[df_resumen['Required Role'] == GA2_ROLE][c_fte].sum()
                 fte_sr   = df_resumen[df_resumen['Required Role'] == 'Sr. Accountant'][c_fte].sum()
 
                 mes_date = today + relativedelta(months=_month_offsets[i])
@@ -8835,6 +8962,7 @@ if "calc_data" in st.session_state:
                     "FTEs Accountant I":                 round(fte_acc1, 2),
                     "FTEs Accountant II":                round(fte_acc2, 2),
                     "FTEs General Acc.":                 round(fte_gen, 2),
+                    "FTEs General Accountant II":        round(fte_ga2, 2),
                     "FTEs Sr. Accountant":               round(fte_sr, 2),
                     "New MRR ($)":                       round(new_mrr, 2),
                     "New Clients (Go Live)":             new_count,
@@ -9345,6 +9473,12 @@ if "calc_data" in st.session_state:
                 else:
                     st.info("⏳ Quick Overview builds on first load — switch to **Complete View** once, then return here.")
 
+            # ── Executive summary (copy-paste) — shown right before the waterfall ────
+            try:
+                _render_exec_summary(st.session_state.final_dashboards['general'], st.session_state.get('hc_data'), _dash_sel_pods)
+            except Exception as _es_err:
+                st.caption(f"Executive summary unavailable: {_es_err}")
+
             # ── Full waterfall expander ──────────────────────────────────────────────
             _show_full = _view_mode in ["📊 Complete View", "🎮 Complete + Playground"]
             with st.expander("📋 Capacity Overview — Waterfall", expanded=_show_full):
@@ -9465,6 +9599,7 @@ if "calc_data" in st.session_state:
                         fte_acc1     = r.get("FTEs Accountant I", 0)
                         fte_acc2     = r.get("FTEs Accountant II", 0)
                         fte_gen      = r.get("FTEs General Acc.", 0)
+                        fte_ga2      = r.get("FTEs General Accountant II", 0)
                         fte_sr       = r.get("FTEs Sr. Accountant", 0)
                         mrr          = r.get("Total MRR ($)", 0)
                         workdays_val = r.get("Working Days (Used)", wdays)
@@ -9530,7 +9665,8 @@ if "calc_data" in st.session_state:
                         d_total  = round(hc_total - fte_total, 2) if hc_total is not None else None
                         d_acc1   = round(hc_acc1  - fte_acc1,  2) if hc_acc1  is not None else None
                         d_acc2   = round(hc_acc2  - fte_acc2,  2) if hc_acc2  is not None else None
-                        d_gen    = round(hc_gen   - fte_gen,   2) if hc_gen   is not None else None
+                        # actual HC counts GA II inside General Accountant -> compare against GA + GA II required
+                        d_gen    = round(hc_gen   - (fte_gen + fte_ga2), 2) if hc_gen   is not None else None
                         d_sr     = round(hc_sr    - fte_sr,    2) if hc_sr    is not None else None
 
                         # Revenue / HC uses accounting staff only (Acc I–Sr.), excluding managers
@@ -9544,6 +9680,7 @@ if "calc_data" in st.session_state:
                             float(fte_acc1 or 0) * cost_acc1 +
                             float(fte_acc2 or 0) * cost_acc2 +
                             float(fte_gen  or 0) * cost_gen  +
+                            float(fte_ga2  or 0) * cost_ga2  +
                             float(fte_sr   or 0) * cost_sr
                         )
                         cap_margin     = float(mrr or 0) - cap_cost
@@ -9577,6 +9714,7 @@ if "calc_data" in st.session_state:
                         rows.setdefault("  · Accountant I",               {})[col] = _fmt(fte_acc1, 'fte')
                         rows.setdefault("  · Accountant II",              {})[col] = _fmt(fte_acc2, 'fte')
                         rows.setdefault("  · General Accountant",         {})[col] = _fmt(fte_gen, 'fte')
+                        rows.setdefault("  · General Accountant II",      {})[col] = _fmt(fte_ga2, 'fte')
                         rows.setdefault("  · Sr. Accountant",             {})[col] = _fmt(fte_sr, 'fte')
                         rows.setdefault("━ Actual HC (Report)",           {})[col] = _fmt(hc_total, 'fte')
                         rows.setdefault("  · Accountant I (actual)",      {})[col] = _fmt(hc_acc1, 'fte')
@@ -9590,7 +9728,7 @@ if "calc_data" in st.session_state:
                         rows.setdefault("  · Δ General Accountant",       {})[col] = _fmt(d_gen, 'dec')
                         rows.setdefault("  · Δ Sr. Accountant",           {})[col] = _fmt(d_sr, 'dec')
                         # Tasks HC delta — excludes Sr. and Managers (executor roles only)
-                        _tasks_req_v   = (fte_acc1 or 0) + (fte_acc2 or 0) + (fte_gen or 0)
+                        _tasks_req_v   = (fte_acc1 or 0) + (fte_acc2 or 0) + (fte_gen or 0) + (fte_ga2 or 0)
                         _tasks_hired_v = ((hc_acc1 or 0) + (hc_acc2 or 0) + (hc_gen or 0)) if hc_acc1 is not None else None
                         _tasks_delta_v = (_tasks_hired_v - _tasks_req_v) if _tasks_hired_v is not None else None
                         rows.setdefault("━ Tasks HC Required",            {})[col] = _fmt(_tasks_req_v, 'fte')
@@ -9869,7 +10007,7 @@ if "calc_data" in st.session_state:
                 # Collapsible row groups (pivot-style)
                 _ov_groups_full = {
                     "━ Required Hours":           ["  Current Customer Hours", "  Shrinkage (Hrs)", "  (+) New Customer Hours", "  (-) Confirmed Churn (Hrs)", "  (-) Automations", "  (+) Manual Adjustments"],
-                    "━ Required HC (FTEs)":       ["  · Accountant I", "  · Accountant II", "  · General Accountant", "  · Sr. Accountant"],
+                    "━ Required HC (FTEs)":       ["  · Accountant I", "  · Accountant II", "  · General Accountant", "  · General Accountant II", "  · Sr. Accountant"],
                     "━ Actual HC (Report)":       ["  · Accountant I (actual)", "  · Accountant II (actual)", "  · General Acc. (actual)", "  · Sr. Accountant (actual)", "  · Managers (actual)"],
                     "━ HC Δ (Actual − Required)": ["  · Δ Accountant I", "  · Δ Accountant II", "  · Δ General Accountant", "  · Δ Sr. Accountant"],
                     "━ MRR ($)":                  ["  (+) New MRR ($)", "  (-) Churn MRR ($)", "  Revenue / HC ($)"],
@@ -9887,7 +10025,7 @@ if "calc_data" in st.session_state:
                 }
                 _ov_groups_nohc = {
                     "━ Required Hours":           ["  Current Customer Hours", "  Shrinkage (Hrs)", "  (+) New Customer Hours", "  (-) Confirmed Churn (Hrs)", "  (-) Automations", "  (+) Manual Adjustments"],
-                    "━ Required HC (FTEs)":       ["  · Accountant I", "  · Accountant II", "  · General Accountant", "  · Sr. Accountant"],
+                    "━ Required HC (FTEs)":       ["  · Accountant I", "  · Accountant II", "  · General Accountant", "  · General Accountant II", "  · Sr. Accountant"],
                     "━ MRR ($)":                  ["  (+) New MRR ($)", "  (-) Churn MRR ($)"],
                     "━ Cost & Margin":            ["  Capacity Cost ($)", "  Capacity Margin ($)", "  Capacity Margin (%)"],
                     "━ MRR Forecast":             ["  Real MRR % Movement", "  Forecasted MRR Growth ($)",
@@ -10158,7 +10296,8 @@ if "calc_data" in st.session_state:
                                     d_pod     = round(hc_p_tot - p_fte, 2) if hc_p_tot is not None else None
                                     d_p_acc1  = round(hc_p_acc1 - _prole_fte('Accountant I'),       2) if hc_p_acc1 is not None else None
                                     d_p_acc2  = round(hc_p_acc2 - _prole_fte('Accountant II'),      2) if hc_p_acc2 is not None else None
-                                    d_p_gen   = round(hc_p_gen  - _prole_fte('General Accountant'), 2) if hc_p_gen  is not None else None
+                                    # actual HC counts GA II inside General Accountant -> compare against GA + GA II required
+                                    d_p_gen   = round(hc_p_gen  - (_prole_fte('General Accountant') + _prole_fte(GA2_ROLE)), 2) if hc_p_gen  is not None else None
                                     d_p_sr    = round(hc_p_sr   - _prole_fte('Sr. Accountant'),     2) if hc_p_sr   is not None else None
 
                                     # POD MRR: sum active clients belonging to this POD (with door count variation applied)
@@ -10180,6 +10319,7 @@ if "calc_data" in st.session_state:
                                         float(_prole_fte('Accountant I')       or 0) * cost_acc1 +
                                         float(_prole_fte('Accountant II')      or 0) * cost_acc2 +
                                         float(_prole_fte('General Accountant') or 0) * cost_gen  +
+                                        float(_prole_fte(GA2_ROLE)             or 0) * cost_ga2  +
                                         float(_prole_fte('Sr. Accountant')     or 0) * cost_sr
                                     )
                                     _p_cap_margin     = float(_pod_mrr or 0) - _p_cap_cost
@@ -10259,6 +10399,7 @@ if "calc_data" in st.session_state:
                                     _pod_rows.setdefault("  · Accountant I",               {})[col] = _fmt(_prole_fte('Accountant I'), 'fte')
                                     _pod_rows.setdefault("  · Accountant II",              {})[col] = _fmt(_prole_fte('Accountant II'), 'fte')
                                     _pod_rows.setdefault("  · General Accountant",         {})[col] = _fmt(_prole_fte('General Accountant'), 'fte')
+                                    _pod_rows.setdefault("  · General Accountant II",      {})[col] = _fmt(_prole_fte(GA2_ROLE), 'fte')
                                     _pod_rows.setdefault("  · Sr. Accountant",             {})[col] = _fmt(_prole_fte('Sr. Accountant'), 'fte')
                                     _pod_rows.setdefault("━ Actual HC (Report)",           {})[col] = _fmt(hc_p_tot, 'fte')
                                     _pod_rows.setdefault("  · Accountant I (actual)",      {})[col] = _fmt(hc_p_acc1, 'fte')
@@ -10272,7 +10413,7 @@ if "calc_data" in st.session_state:
                                     _pod_rows.setdefault("  · Δ General Accountant",       {})[col] = _fmt(d_p_gen, 'dec')
                                     _pod_rows.setdefault("  · Δ Sr. Accountant",           {})[col] = _fmt(d_p_sr, 'dec')
                                     # Tasks HC delta — executor roles only (AC1 + AC2 + GA)
-                                    _p_tasks_req_v   = (_prole_fte('Accountant I') or 0) + (_prole_fte('Accountant II') or 0) + (_prole_fte('General Accountant') or 0)
+                                    _p_tasks_req_v   = (_prole_fte('Accountant I') or 0) + (_prole_fte('Accountant II') or 0) + (_prole_fte('General Accountant') or 0) + (_prole_fte(GA2_ROLE) or 0)
                                     _p_tasks_hired_v = ((hc_p_acc1 or 0) + (hc_p_acc2 or 0) + (hc_p_gen or 0)) if hc_p_acc1 is not None else None
                                     _p_tasks_delta_v = (_p_tasks_hired_v - _p_tasks_req_v) if _p_tasks_hired_v is not None else None
                                     _pod_rows.setdefault("━ Tasks HC Required",            {})[col] = _fmt(_p_tasks_req_v, 'fte')
@@ -10380,7 +10521,7 @@ if "calc_data" in st.session_state:
                                 # Collapsible groups for POD table (mirrors Overall)
                                 _pod_grp_defs = {
                                     "━ Required Hours":           ["  Current Customer Hours", "  Shrinkage (Hrs)", "  (+) New Customer Hours", "  (-) Confirmed Churn (Hrs)", "  (-) Automations", "  (+) Manual Adjustments"],
-                                    "━ Required HC (FTEs)":       ["  · Accountant I", "  · Accountant II", "  · General Accountant", "  · Sr. Accountant"],
+                                    "━ Required HC (FTEs)":       ["  · Accountant I", "  · Accountant II", "  · General Accountant", "  · General Accountant II", "  · Sr. Accountant"],
                                     "━ Actual HC (Report)":       ["  · Accountant I (actual)", "  · Accountant II (actual)", "  · General Acc. (actual)", "  · Sr. Accountant (actual)", "  · Managers (actual)"],
                                     "━ HC Δ (Actual − Required)": ["  · Δ Accountant I", "  · Δ Accountant II", "  · Δ General Accountant", "  · Δ Sr. Accountant"],
                                     "━ MRR ($)":                  ["  (+) New MRR ($)", "  (-) Churn MRR ($)", "  Revenue / HC ($)"],
@@ -10462,6 +10603,7 @@ if "calc_data" in st.session_state:
                             if _hc:
                                 _sr_hc_data = (
                                     _hc.get('by_sr_email', {}).get(str(_sel_sr).strip().lower())   # email match (primary)
+                                    or _hc.get('by_lead_email', {}).get(str(_sel_sr).strip().lower())  # lead GA / GA II with reports
                                     or _hc.get('by_sr',      {}).get(_sel_sr)                       # exact name match
                                     or _hc.get('by_sr_norm', {}).get(_norm_name(_sel_sr))           # normalized name match
                                     or {}
@@ -10619,7 +10761,7 @@ if "calc_data" in st.session_state:
                                 d_sr_tot  = round(hc_sr_tot  - _srv(c_fte_col),          2) if hc_sr_tot  is not None else None
                                 d_sr_acc1 = round(hc_sr_acc1 - _srole_fte('Accountant I'),       2) if hc_sr_acc1 is not None else None
                                 d_sr_acc2 = round(hc_sr_acc2 - _srole_fte('Accountant II'),      2) if hc_sr_acc2 is not None else None
-                                d_sr_gen  = round(hc_sr_gen  - _srole_fte('General Accountant'), 2) if hc_sr_gen  is not None else None
+                                d_sr_gen  = round(hc_sr_gen  - (_srole_fte('General Accountant') + _srole_fte(GA2_ROLE)), 2) if hc_sr_gen  is not None else None
                                 d_sr_sr   = round(hc_sr_sr   - _srole_fte('Sr. Accountant'),     2) if hc_sr_sr   is not None else None
 
                                 _rev_sr   = _sr_mrr / hc_sr_tot if (hc_sr_tot and hc_sr_tot > 0) else None
@@ -10627,6 +10769,7 @@ if "calc_data" in st.session_state:
                                     float(_srole_fte('Accountant I')       or 0) * cost_acc1 +
                                     float(_srole_fte('Accountant II')      or 0) * cost_acc2 +
                                     float(_srole_fte('General Accountant') or 0) * cost_gen  +
+                                    float(_srole_fte(GA2_ROLE)             or 0) * cost_ga2  +
                                     float(_srole_fte('Sr. Accountant')     or 0) * cost_sr
                                 )
                                 _sr_cap_margin     = float(_sr_mrr or 0) - _sr_cap_cost
@@ -10679,6 +10822,7 @@ if "calc_data" in st.session_state:
                                 _sr_rows.setdefault("  · Accountant I",               {})[col] = _fmt(_srole_fte('Accountant I'), 'fte')
                                 _sr_rows.setdefault("  · Accountant II",              {})[col] = _fmt(_srole_fte('Accountant II'), 'fte')
                                 _sr_rows.setdefault("  · General Accountant",         {})[col] = _fmt(_srole_fte('General Accountant'), 'fte')
+                                _sr_rows.setdefault("  · General Accountant II",      {})[col] = _fmt(_srole_fte(GA2_ROLE), 'fte')
                                 _sr_rows.setdefault("  · Sr. Accountant",             {})[col] = _fmt(_srole_fte('Sr. Accountant'), 'fte')
                                 _sr_rows.setdefault("━ Actual HC (Report)",           {})[col] = _fmt(hc_sr_tot, 'fte')
                                 _sr_rows.setdefault("  · Accountant I (actual)",      {})[col] = _fmt(hc_sr_acc1, 'fte')
@@ -10807,7 +10951,7 @@ if "calc_data" in st.session_state:
                                 # Collapsible groups matching the POD / Overall pattern
                                 _sr_grp_defs = {
                                     "━ Required Hours":           ["  Current Customer Hours", "  Shrinkage (Hrs)", "  (+) New Customer Hours", "  (-) Confirmed Churn (Hrs)", "  (-) Automations", "  (+) Manual Adjustments"],
-                                    "━ Required HC (FTEs)":       ["  · Accountant I", "  · Accountant II", "  · General Accountant", "  · Sr. Accountant"],
+                                    "━ Required HC (FTEs)":       ["  · Accountant I", "  · Accountant II", "  · General Accountant", "  · General Accountant II", "  · Sr. Accountant"],
                                     "━ Actual HC (Report)":       ["  · Accountant I (actual)", "  · Accountant II (actual)", "  · General Acc. (actual)", "  · Sr. Accountant (actual)", "  · Managers (actual)"],
                                     "━ HC Δ (Actual − Required)": ["  · Δ Accountant I", "  · Δ Accountant II", "  · Δ General Accountant", "  · Δ Sr. Accountant"],
                                     "━ MRR ($)":                  ["  (+) New MRR ($)", "  (-) Churn MRR ($)", "  Revenue / HC ($)"],
@@ -10973,6 +11117,7 @@ if "calc_data" in st.session_state:
                                         _psr_rows.setdefault("  · Accountant I",        {})[col] = _fmt(_psrole('Accountant I'), 'fte')
                                         _psr_rows.setdefault("  · Accountant II",       {})[col] = _fmt(_psrole('Accountant II'), 'fte')
                                         _psr_rows.setdefault("  · General Accountant",  {})[col] = _fmt(_psrole('General Accountant'), 'fte')
+                                        _psr_rows.setdefault("  · General Accountant II", {})[col] = _fmt(_psrole(GA2_ROLE), 'fte')
                                         _psr_rows.setdefault("  · Sr. Accountant",      {})[col] = _fmt(_psrole('Sr. Accountant'), 'fte')
                                         _psr_rows.setdefault("━ MRR ($)",               {})[col] = _fmt(_psr_mrr, '$')
 
@@ -11612,6 +11757,7 @@ if "calc_data" in st.session_state:
                     if _hc_xp:
                         _sr_hcd = (
                             _hc_xp.get('by_sr_email', {}).get(str(_sr_nm).strip().lower()) or
+                            _hc_xp.get('by_lead_email', {}).get(str(_sr_nm).strip().lower()) or
                             _hc_xp.get('by_sr', {}).get(_sr_nm) or {}
                         )
                     _hcx_tot  = _sr_hcd.get('total', None)
@@ -11684,7 +11830,7 @@ if "calc_data" in st.session_state:
                         _dx_tot  = round(_hcx_tot  - _fte_t,                                   2) if _hcx_tot  is not None else None
                         _dx_acc1 = round(_hcx_acc1 - _srole_x(_sr_df,'Accountant I',       _c_fte), 2) if _hcx_acc1 is not None else None
                         _dx_acc2 = round(_hcx_acc2 - _srole_x(_sr_df,'Accountant II',      _c_fte), 2) if _hcx_acc2 is not None else None
-                        _dx_gen  = round(_hcx_gen  - _srole_x(_sr_df,'General Accountant', _c_fte), 2) if _hcx_gen  is not None else None
+                        _dx_gen  = round(_hcx_gen  - (_srole_x(_sr_df,'General Accountant', _c_fte) + _srole_x(_sr_df, GA2_ROLE, _c_fte)), 2) if _hcx_gen  is not None else None
                         _dx_sr   = round(_hcx_sr1  - _srole_x(_sr_df,'Sr. Accountant',     _c_fte), 2) if _hcx_sr1  is not None else None
                         # Tickets / AHT (active clients this month)
                         _s_m2 = pd.Timestamp((today + relativedelta(months=_month_offsets[_ii])).replace(day=1).date())
@@ -11715,6 +11861,7 @@ if "calc_data" in st.session_state:
                         _rows_x.setdefault("  · Accountant I",               {})[_col_x] = round(_srole_x(_sr_df,'Accountant I',       _c_fte), 2)
                         _rows_x.setdefault("  · Accountant II",              {})[_col_x] = round(_srole_x(_sr_df,'Accountant II',      _c_fte), 2)
                         _rows_x.setdefault("  · General Accountant",         {})[_col_x] = round(_srole_x(_sr_df,'General Accountant', _c_fte), 2)
+                        _rows_x.setdefault("  · General Accountant II",      {})[_col_x] = round(_srole_x(_sr_df, GA2_ROLE, _c_fte), 2)
                         _rows_x.setdefault("  · Sr. Accountant",             {})[_col_x] = round(_srole_x(_sr_df,'Sr. Accountant',     _c_fte), 2)
                         _rows_x.setdefault("━ Actual HC (Report)",           {})[_col_x] = _hcx_tot
                         _rows_x.setdefault("  · Accountant I (actual)",      {})[_col_x] = _hcx_acc1
@@ -11729,7 +11876,8 @@ if "calc_data" in st.session_state:
                         # Tasks HC delta — executor roles only (AC1 + AC2 + GA)
                         _s_tasks_req_v   = (round(_srole_x(_sr_df,'Accountant I',       _c_fte), 2)
                                           + round(_srole_x(_sr_df,'Accountant II',      _c_fte), 2)
-                                          + round(_srole_x(_sr_df,'General Accountant', _c_fte), 2))
+                                          + round(_srole_x(_sr_df,'General Accountant', _c_fte), 2)
+                                          + round(_srole_x(_sr_df, GA2_ROLE, _c_fte), 2))
                         _s_tasks_hired_v = ((_hcx_acc1 or 0) + (_hcx_acc2 or 0) + (_hcx_gen or 0)) if _hcx_acc1 is not None else None
                         _s_tasks_delta_v = round(_s_tasks_hired_v - _s_tasks_req_v, 2) if _s_tasks_hired_v is not None else None
                         _rows_x.setdefault("━ Tasks HC Required",            {})[_col_x] = round(_s_tasks_req_v, 2)
@@ -13039,6 +13187,7 @@ if (
             _sr_hc_s4 = (
                 (
                     _hc.get('by_sr_email', {}).get(str(_scope).strip().lower())
+                    or _hc.get('by_lead_email', {}).get(str(_scope).strip().lower())
                     or _hc.get('by_sr', {}).get(_scope)
                     or _hc.get('by_sr_norm', {}).get(_norm_name(_scope))
                 )
@@ -13216,7 +13365,8 @@ if (
                     if _bcol in _rb_scope.columns:
                         for _brl in roles_permitidos:
                             _s4_base_hrs_role[_brl][_bi] = float(
-                                _rb_scope[_rb_scope['Required Role'] == _brl][_bcol].sum())
+                                _rb_scope[_rb_scope['Required Role'].isin(
+                                    [_brl] + ([GA2_ROLE] if _brl == 'General Accountant' else []))][_bcol].sum())
 
             # 2. Automation cascade (same logic as Step 3, using s4v2_auto_df)
             if not _s4a_src.empty and not _src_raw.empty and \
@@ -13915,7 +14065,7 @@ if (
         # ── Collapsible groups (same structure as Capacity Overview) ─────────
         _s4_groups = {
             "━ Required Hours":           ["  Current Customer Hours", "  Shrinkage (Hrs)", "  (+) New Customer Hours", "  (-) Confirmed Churn (Hrs)", "  (-) Automations", "  (+) Manual Adjustments"],
-            "━ Required HC (FTEs)":       ["  · Accountant I", "  · Accountant II", "  · General Accountant", "  · Sr. Accountant"],
+            "━ Required HC (FTEs)":       ["  · Accountant I", "  · Accountant II", "  · General Accountant", "  · General Accountant II", "  · Sr. Accountant"],
             "━ Actual HC (Report)":       ["  · Accountant I (actual)", "  · Accountant II (actual)", "  · General Acc. (actual)", "  · Sr. Accountant (actual)", "  · Managers (actual)"],
             "━ HC Δ (Actual − Required)": ["  · Δ Accountant I", "  · Δ Accountant II", "  · Δ General Accountant", "  · Δ Sr. Accountant"],
             "━ MRR ($)":                  ["  (+) New MRR ($)", "  (-) Churn MRR ($)", "  Revenue / HC ($)"],
