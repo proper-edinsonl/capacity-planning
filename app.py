@@ -419,7 +419,8 @@ def _build_ie_comparison_ai(df_hist, ie_df, df_pred):
     p = p.groupby('_client')['_h'].sum().reset_index().rename(columns={'_client': 'client', '_h': 'p_hours'})
     h = _hist_client_totals(df_hist)
     i = _ie_client_totals(ie_df)
-    m = p.merge(h, on='client', how='left').merge(i, on='client', how='left')
+    # every client in the Initial Expected file shows up, even if the forecast has no row for it
+    m = p.merge(i, on='client', how='outer').merge(h, on='client', how='left')
     for _c in m.columns:
         if _c != 'client':
             m[_c] = pd.to_numeric(m[_c], errors='coerce')
